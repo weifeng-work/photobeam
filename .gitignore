@@ -1,0 +1,42 @@
+# ── 构建产物 ───────────────────────────────────────────────────────────────
+/PhotoBeam.apk
+/dist/
+/android/build/
+/pc/PhotoBeam.exe
+*.exe
+!tools/*.exe
+
+# ── 本地工具链（大体积二进制，不入库；获取方式见 tools/README.md）─────────
+/tools/kotlinc/
+/tools/kotlinc.zip
+/tools/bcprov.jar
+
+# ── 原始测试证据与产物（本地保留，不随仓库分发）────────────────────────────
+#   实机截图 / 录屏 / 逐帧哈希 / 探测图：含本机桌面与设备信息、体积 123 MB。
+#   仓库内只保留 docs/images/ 下人工筛过的关键图（已脱敏、可公开）。
+/docs/stage4-screenshots/
+/docs/_local-evidence/
+/probeimgs*/
+**/probeimgs*/
+**/frames/
+**/anim9_video/
+
+# ── 多智能体编排内部件（handoff / receipt / review 状态，非项目源码）──────
+/.lam/
+
+# ── 历史阶段过程截图（stage2/3 遗留，见 docs/stage2-evidence.md 引用）──────
+/delivery_*.png
+/nodialog_check.png
+/pc_sas.png
+/popup_final9.png
+/v_popup*.png
+/v_tray*.png
+
+# ── 杂项 ───────────────────────────────────────────────────────────────────
+*.log
+*.err
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+.DS_Store
