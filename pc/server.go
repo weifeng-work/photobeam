@@ -91,6 +91,13 @@ func writeEncFrame(conn net.Conn, key []byte, frameType byte, payload []byte) er
 
 // ---------- TCP 服务 ----------
 
+// tcpListener 全局保存：托盘「重启 PhotoBeam」需要**先释放端口**，
+// 否则新进程一起来就撞上「5416-5436 全部被占」而弹框退出。
+var (
+	tcpLnMu sync.Mutex
+	tcpLn   net.Listener
+)
+
 func startTCPServer() error {
 	var ln net.Listener
 	var err error
@@ -106,6 +113,9 @@ func startTCPServer() error {
 	if err != nil {
 		return errors.New("TCP 端口 5416-5436 全部被占")
 	}
+	tcpLnMu.Lock()
+	tcpLn = ln
+	tcpLnMu.Unlock()
 	go func() {
 		for {
 			conn, e := ln.Accept()
@@ -117,6 +127,18 @@ func startTCPServer() error {
 		}
 	}()
 	return nil
+}
+
+// stopTCPServer：关闭 TCP 监听（重启前调用，释放端口）
+func stopTCPServer() {
+	tcpLnMu.Lock()
+	ln := tcpLn
+	tcpLn = nil
+	tcpLnMu.Unlock()
+	if ln != nil {
+		_ = ln.Close()
+		logf("TCP 监听已释放（准备重启）")
+	}
 }
 
 func handleConn(conn net.Conn) {

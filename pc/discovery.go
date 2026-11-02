@@ -4,6 +4,14 @@ package main
 
 import (
 	"net"
+	"sync"
+)
+
+// udpConn 全局保存：托盘「重启 PhotoBeam」需要先释放 5416/udp，
+// 否则新进程一起来就撞上「UDP 发现端口被占」而弹框退出。
+var (
+	udpConnMu sync.Mutex
+	udpConn   *net.UDPConn
 )
 
 func startDiscoveryResponder() error {
@@ -12,6 +20,9 @@ func startDiscoveryResponder() error {
 	if err != nil {
 		return err
 	}
+	udpConnMu.Lock()
+	udpConn = conn
+	udpConnMu.Unlock()
 	go goroutineSafe("discovery", func() {
 		buf := make([]byte, 2048)
 		for {
@@ -39,4 +50,16 @@ func startDiscoveryResponder() error {
 	})
 	logf("UDP 发现应答 :%d", cfg.UDPPort)
 	return nil
+}
+
+// stopDiscoveryResponder：关闭 UDP 发现应答（重启前调用，释放 5416/udp）
+func stopDiscoveryResponder() {
+	udpConnMu.Lock()
+	c := udpConn
+	udpConn = nil
+	udpConnMu.Unlock()
+	if c != nil {
+		_ = c.Close()
+		logf("UDP 发现应答已释放（准备重启）")
+	}
 }

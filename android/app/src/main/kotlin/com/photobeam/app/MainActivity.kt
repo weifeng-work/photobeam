@@ -123,7 +123,9 @@ class MainActivity : Activity() {
             }
 
         // [A5] 按钮编号连续、文案统一
-        val bPerm = btn("① 授权照片与通知访问")
+        // [A4] ① 不是「首次授权」而是「再要一次」——应用启动时已经自动申请过，
+        //      用户被拒过之后系统不会再弹窗，所以文案要说清它到底能干什么。
+        val bPerm = btn("① 重新申请照片与通知权限（被拒过请用下一项）")
         val bPermSys = btn("打开系统权限页（改为「允许所有照片」）")
         val bPair = btn("② 配对电脑（核对 6 位数字）")
         val bSync = btn("③ 立即同步")
@@ -284,6 +286,8 @@ class MainActivity : Activity() {
                 append("⚠ 通知权限未授予（点 ①）\n")
             }
             append(lastSyncLine())
+            append(arrivalLine())   // [B3] 逐张「已到电脑」回执
+            append(failedLine())    // [B3] 最近一次失败
             val diag = prefs.getString("last_diag_path", null)
             if (diag != null) append("最近诊断：$diag\n")
         }
@@ -304,6 +308,61 @@ class MainActivity : Activity() {
         val res = try { prefs.getString("last_sync_result", "") ?: "" } catch (e: Exception) { "" }
         val ok = try { prefs.getBoolean("last_sync_ok", false) } catch (e: Exception) { false }
         return "最近同步：$hh $res${if (ok) "（成功）" else "（未成功）"}\n"
+    }
+
+    /** [B3] 逐张到达回执：已到电脑 N 张（最近 <文件名> <时间>）。
+     *  之前只有「最近同步：…（成功）」这种汇总，用户看不出「这一张到底到没到电脑」。 */
+    private fun arrivalLine(): String {
+        val n = try { prefs.getInt("arrived_count", 0) } catch (e: Exception) { 0 }
+        if (n <= 0) return ""
+        val name = try { prefs.getString("arrived_last_name", "") ?: "" } catch (e: Exception) { "" }
+        val at = try { prefs.getLong("arrived_last_at", 0L) } catch (e: Exception) { 0L }
+        val hh = if (at > 0L) SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(at)) else ""
+        val tail = if (name.isEmpty()) "" else "（最近 $name${if (hh.isNotEmpty()) " $hh" else ""}）"
+        return "已到电脑：$n 张$tail\n"
+    }
+
+    /** [B3] 最近一次失败的图片与原因（成功一张后自动清除） */
+    private fun failedLine(): String {
+        val name = try { prefs.getString("failed_last_name", null) } catch (e: Exception) { null }
+            ?: return ""
+        val reason = try { prefs.getString("failed_last_reason", "") ?: "" } catch (e: Exception) { "" }
+        val at = try { prefs.getLong("failed_last_at", 0L) } catch (e: Exception) { 0L }
+        val hh = if (at > 0L) SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(at)) else ""
+        val r = if (reason.isEmpty()) "" else "（$reason）"
+        return "⚠ 最近失败：$name$r${if (hh.isNotEmpty()) " $hh" else ""}\n"
+    }
+
+    /** [A10] 配对失败文案：原始异常可能是英文/技术串 → 映射成用户能看懂的中文。
+     *  映射不到时保留原始信息（放中文标题下面），但不把英文技术串当标题甩给用户。 */
+    private fun friendlyPairError(e: Exception): String {
+        val raw = (e.message ?: e.javaClass.simpleName)
+        return when {
+            e is java.net.ConnectException ->
+                "连不上电脑。\n请确认电脑上的 PhotoBeam 正在运行，且手机和电脑连的是同一个 WiFi。"
+            e is java.net.SocketTimeoutException ->
+                "连接电脑超时（等不到回应）。\n请确认电脑上的 PhotoBeam 正在运行，且手机和电脑连的是同一个 WiFi。"
+            // PC 端发了 pair_reject（PC 上点了「不一致」）→ 手机端读到的是 pair_reject 而非 pair_ok
+            raw.contains("配对流程异常") ->
+                "电脑端拒绝了本次配对。\n多半是两端显示的 6 位数字不一致（或电脑上点过「重新配对」）。\n请确认两边数字一样后，再点一次 ②。"
+            raw.contains("用户拒绝配对") ->
+                "配对被拒绝：两端显示的 6 位数字不一致。\n请确认两边数字一样后重新配对。"
+            raw.contains("配对核对超时") ->
+                "配对核对超时（60 秒内没有点确认）。\n请重新点一次 ② 配对电脑。"
+            raw.contains("电脑签名校验失败") || raw.contains("认证流程异常") ->
+                "电脑的身份密钥变了（电脑重装过、或换过机器）。\n请在电脑上点「重新配对」，再点一次 ②。"
+            raw.contains("对端要求重新配对") || raw.contains("身份已变化") ->
+                "电脑端不认识这台手机了（电脑可能重装过，或在电脑上点过「重新配对」）。\n请在电脑上重新配对后，再点一次 ②。"
+            raw.contains("后台发送路径") ->
+                "这条连接是后台自动同步发起的，不能用来配对。\n请在手机上点 ② 配对电脑。"
+            raw.contains("Connection reset") || raw.contains("Connection aborted") ||
+                raw.contains("Software caused connection") ->
+                "连接被电脑端断开了。\n请重试（②）。"
+            raw.contains("timeout") || raw.contains("timed out") ->
+                "连接电脑超时。\n请确认电脑上的 PhotoBeam 正在运行。"
+            else ->
+                "配对失败。\n原因：$raw\n请重试（②）。"
+        }
     }
 
     /** [A2] 照片授权三态：全量 / 部分 / 无 */
@@ -446,7 +505,8 @@ class MainActivity : Activity() {
                     statusView.text = if (sasTimedOut) {
                         "配对超时：60 秒内没有完成核对。\n请确认电脑上的配对窗口还在，再点一次 ②。"
                     } else {
-                        "配对失败：${e.message}\n请重试（②）"
+                        // [A10] 原始异常可能是英文/技术串 → 换成中文说明
+                        friendlyPairError(e)
                     }
                 }
             }

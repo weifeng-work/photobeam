@@ -66,8 +66,13 @@ var (
 	fmtPNG        uint16
 	fmtCanHistory uint16
 	fmtCanUpload  uint16
-	fmtOnce       sync.Once
-	fmtInitErr    string
+	// fmtPhotoBeamMarker：本程序专属的归属标记格式。
+	// 作用 = 识别「剪贴板当前内容是我们自己刚写进去的图片」——
+	// 否则连续写两张图时，第二张的快照会把**第一张 PhotoBeam 图**当成「用户原内容」，
+	// 60 秒后还原回去的是上一张图，而不是用户原本复制的东西（B8 的真因）。
+	fmtPhotoBeamMarker uint16
+	fmtOnce            sync.Once
+	fmtInitErr         string
 )
 
 func initClipboardFormats() {
@@ -75,9 +80,11 @@ func initClipboardFormats() {
 		fmtPNG = regFmt("PNG")
 		fmtCanHistory = regFmt("CanIncludeInClipboardHistory")
 		fmtCanUpload = regFmt("CanUploadToCloudClipboard")
-		if fmtPNG == 0 || fmtCanHistory == 0 || fmtCanUpload == 0 {
+		fmtPhotoBeamMarker = regFmt("PhotoBeam.Image.Marker")
+		if fmtPNG == 0 || fmtCanHistory == 0 || fmtCanUpload == 0 || fmtPhotoBeamMarker == 0 {
 			fmtInitErr = "RegisterClipboardFormat 失败"
-			logf("剪贴板格式注册失败: PNG=%d hist=%d up=%d", fmtPNG, fmtCanHistory, fmtCanUpload)
+			logf("剪贴板格式注册失败: PNG=%d hist=%d up=%d marker=%d",
+				fmtPNG, fmtCanHistory, fmtCanUpload, fmtPhotoBeamMarker)
 		}
 	})
 }
@@ -150,6 +157,30 @@ func setExclusionMarkers() bool {
 	return ok
 }
 
+// 写入我们的归属标记（PhotoBeam.Image.Marker）：
+// 剪贴板里带上这个专属格式，之后就能认出「当前内容是我们自己写的图」。
+func setOwnerMarker(gen uint64) {
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], gen)
+	h := globalAllocCopy(b[:])
+	if h == 0 {
+		return
+	}
+	if r, _, _ := procSetClipboardData.Call(uintptr(fmtPhotoBeamMarker), h); r == 0 {
+		logf("归属标记写入失败 fmt=%d", fmtPhotoBeamMarker)
+	}
+}
+
+// clipboardHasOurMarker：剪贴板当前内容是否是 PhotoBeam 自己写的图。
+// 前提：调用方已 OpenClipboard 持有打开态。
+func clipboardHasOurMarker() bool {
+	if fmtPhotoBeamMarker == 0 {
+		return false
+	}
+	h, _, _ := procGetClipboardData.Call(uintptr(fmtPhotoBeamMarker))
+	return h != 0
+}
+
 // ---------- 快照与还原（60 秒还原 [协议 §5.2]） ----------
 
 func clipFmtName(fmt uint32) string {
@@ -191,6 +222,12 @@ func snapshotClipboard() *clipSnap {
 	}
 	for _, fmt := range fmts {
 		if fmt == uint32(fmtCanHistory) || fmt == uint32(fmtCanUpload) {
+			continue
+		}
+		// 归属标记是我们自己的元数据，**不能进快照**：
+		// 否则还原之后剪贴板还带着「这是 PhotoBeam 写的」的标记，
+		// 下一次写入会误判成「当前是我们自己的图」而复用旧快照。
+		if fmt == uint32(fmtPhotoBeamMarker) {
 			continue
 		}
 		switch fmt {
@@ -296,6 +333,23 @@ func prepareImageData(path string) (dib []byte, pngData []byte, w, h int, err er
 
 var cbMu sync.Mutex
 
+// [Stage 5 收尾 · B8] 剪贴板写入的「代际号」与「用户原内容快照」
+//
+// B8 的真因不是「旧定时器把新图还原掉了」（序号比对已经挡住了），
+// 而是：**第二张图的快照抓到的是第一张 PhotoBeam 图** ——
+// 它被当成了「用户原本复制的内容」，60 秒后还原回去的是上一张图，而不是用户的原内容。
+//
+// 修法：
+//   · 每次写入带上归属标记（PhotoBeam.Image.Marker）；
+//   · 写入前先看剪贴板是不是「我们自己的图」：
+//       - 是 → 复用第一次写入前捕获的 clipOrigSnap（用户的真正原内容），不覆盖它；
+//       - 否 → 重新捕获并存进 clipOrigSnap（用户在这期间换过内容，以新的为准）。
+//   · clipGen 代际号：旧写入的还原定时器发现自己已被更新的一代取代 → 跳过（由新写入负责还原）。
+var (
+	clipGen     uint64     // 每次写入 +1
+	clipOrigSnap *clipSnap // 用户真正原内容（跨连续多次写入保留）
+)
+
 // 写入图片到剪贴板（附排除标记），快照原内容，60 秒后还原。
 // 由 flushQueue 落盘成功后异步调用 [MiniMax 坑 6：不阻塞消息循环]。
 // 剪贴板打开态绑定 OS 线程——goroutine 会被调度器迁移，
@@ -317,13 +371,38 @@ func writeClipboardWithRestore(dib, pngData []byte, seconds int, onRestore func(
 		logf("剪贴板写入失败: OpenClipboard 三次重试均被占用")
 		return false, true
 	}
-	snap := snapshotClipboard() // 无主剪贴板 → nil（不还原，规避 AV [C-04]）
+	var snap *clipSnap
+	ours := clipboardHasOurMarker()
+	if ours {
+		// 是 → 复用「用户真正的原内容」，**不要**把上一张 PhotoBeam 图当成原内容
+		// （注意：这里根本不去 snapshotClipboard —— 对自己的图做快照没有意义，
+		//  还会打出一条「无主剪贴板，跳过快照」的误导日志）
+		if clipOrigSnap != nil {
+			snap = clipOrigSnap
+			logf("剪贴板快照：当前是本程序上一张图 → 复用用户原内容快照（不把上一张图当原内容）")
+		} else {
+			snap = nil // 没有原内容快照 → 本轮不还原
+			logf("剪贴板快照：当前是本程序上一张图，但首次写入时没有可还原的用户原内容 → 本轮不还原")
+		}
+	} else {
+		// 否 → 用户当前剪贴板就是原内容，记下来（后续连续写入都还原回它）
+		snap = snapshotClipboard()
+		clipOrigSnap = snap
+		if snap != nil {
+			logf("剪贴板快照：已捕获用户原内容（%d 个格式）", len(snap.fmts))
+		} else {
+			logf("剪贴板快照：无用户原内容可捕获（无主剪贴板）")
+		}
+	}
+	clipGen++
+	myGen := clipGen
 	if r, _, e := procEmptyClipboard.Call(); r == 0 {
 		procCloseClipboard.Call()
 		logf("剪贴板写入失败: EmptyClipboard err=%v", e)
 		return false, true
 	}
 	markersOK := setExclusionMarkers()
+	setOwnerMarker(myGen) // [B8] 归属标记：让下一次写入能认出「这是我们写的」
 	h := globalAllocCopy(dib)
 	if h == 0 {
 		procCloseClipboard.Call()
@@ -365,22 +444,31 @@ func writeClipboardWithRestore(dib, pngData []byte, seconds int, onRestore func(
 		logf("剪贴板写入完成（排除标记失败：本次将进 Win+V 历史）dib=%dB png=%dB", len(dib), len(pngData)) // [S3-7]
 	}
 
-	// 60 秒后：序号未变（用户没复制过别的）→ 还原原内容
+	// 60 秒后：序号未变（用户没复制过别的）→ 还原**用户原本的内容**
 	time.AfterFunc(time.Duration(seconds)*time.Second, func() {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 		cbMu.Lock()
 		defer cbMu.Unlock()
+		// [B8] 代际号检查：本次写入之后又写入了更新的图 → 本次还原作废
+		// （由最新那次写入的定时器负责还原，避免旧定时器动到新图）。
+		if clipGen != myGen {
+			logf("剪贴板还原跳过：本次写入已被更新的一张图取代（代际 %d → %d），由最新写入负责还原", myGen, clipGen)
+			return
+		}
 		r2, _, _ := procGetSeqNumber.Call()
 		if uint32(r2) != seqAfterWrite {
-			// 用户中途复制了别的内容 → 不还原（尊重用户操作）
-			logf("剪贴板已被外部更新，跳过还原")
+			// [B7] 两种「跳过」必须能区分开：
+			//   · 用户自己复制了别的内容 → 尊重用户，不还原
+			//   · （被本程序后续写入取代的情况上面已单独处理）
+			logf("剪贴板还原跳过：剪贴板已被外部更新（用户复制了其他内容，序号 %d → %d），不还原", seqAfterWrite, uint32(r2))
 			return
 		}
 		if snap == nil {
 			logf("无快照（无主剪贴板），无需还原")
 		} else {
 			restoreClipboard(snap)
+			clipOrigSnap = nil // 原内容已还给用户 → 下一轮重新捕获
 			logf("剪贴板已还原原内容")
 		}
 		if onRestore != nil {

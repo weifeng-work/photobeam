@@ -5,6 +5,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
@@ -96,6 +97,13 @@ func onReady() {
 	mFW := systray.AddMenuItem("修复防火墙规则", "以管理员权限重建防火墙入站规则")
 	mAuto := systray.AddMenuItemCheckbox("开机自启（登录时启动）", "写入当前用户的启动项", cfg.Autostart)
 	systray.AddSeparator()
+	// [Stage 5 收尾 · 场景D] 剪贴板相关的两项配置原本只能手改 config.json，
+	// 改完还得重启进程才生效 → 现在托盘里直接改，**立即生效**。
+	mClip := systray.AddMenuItemCheckbox("剪贴板同步：开", "把收到的图片同时写入系统剪贴板（可随时关掉）", cfg.ClipboardEnabled)
+	mClipSec := systray.AddMenuItem(clipSecondsLabel(cfg.ClipboardSeconds), "点击切换自动还原时长：30 / 60 / 120 / 300 秒")
+	systray.AddSeparator()
+	mRestart := systray.AddMenuItem("重启 PhotoBeam", "重新启动接收端（改了 config.json 后用；端口会自动释放）")
+	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("退出", "退出 PhotoBeam")
 
 	syncAutostartCheck(mAuto)
@@ -150,10 +158,93 @@ func onReady() {
 			saveConfig(cfg)
 			setAutostart(cfg.Autostart)
 			syncAutostartCheck(mAuto)
+		case <-mClip.ClickedCh:
+			// [场景D] 剪贴板开关：立即生效（写入路径每次都读 cfg）
+			cfg.ClipboardEnabled = !cfg.ClipboardEnabled
+			saveConfig(cfg)
+			setMenuChecked(mClip, cfg.ClipboardEnabled)
+			mClip.SetTitle("剪贴板同步：" + onOffText(cfg.ClipboardEnabled))
+			logf("剪贴板同步已%s", onOffText(cfg.ClipboardEnabled))
+			messageBox("剪贴板同步已"+onOffText(cfg.ClipboardEnabled)+"。\n"+
+				"（关闭后图片仍然会保存到接收文件夹，只是不再写入剪贴板）", "PhotoBeam")
+		case <-mClipSec.ClickedCh:
+			// [场景D] 还原秒数：点击循环切换，立即生效
+			cfg.ClipboardSeconds = nextClipSeconds(cfg.ClipboardSeconds)
+			saveConfig(cfg)
+			mClipSec.SetTitle(clipSecondsLabel(cfg.ClipboardSeconds))
+			logf("剪贴板自动还原时长改为 %d 秒", cfg.ClipboardSeconds)
+			messageBox(fmt.Sprintf("剪贴板自动还原时长已改为 %d 秒。\n"+
+				"（超过这个时间没人复制别的东西，就把剪贴板还回你原来的内容）",
+				cfg.ClipboardSeconds), "PhotoBeam")
+		case <-mRestart.ClickedCh:
+			restartSelf()
 		case <-mQuit.ClickedCh:
 			systray.Quit()
 		}
 	}
+}
+
+// onOffText：开关状态的中文文案
+func onOffText(on bool) string {
+	if on {
+		return "开"
+	}
+	return "关"
+}
+
+// setMenuChecked：把托盘勾选项设成指定状态（systray 的 Check/Uncheck 无参）
+func setMenuChecked(item *systray.MenuItem, on bool) {
+	if on {
+		item.Check()
+	} else {
+		item.Uncheck()
+	}
+}
+
+// clipSecondsLabel：托盘菜单里「剪贴板还原秒数」的标题
+func clipSecondsLabel(sec int) string {
+	return fmt.Sprintf("剪贴板还原时长：%d 秒", sec)
+}
+
+// clipSecondsSteps：可选的还原时长档位
+var clipSecondsSteps = []int{30, 60, 120, 300}
+
+// nextClipSeconds：循环到下一档
+func nextClipSeconds(cur int) int {
+	for i, s := range clipSecondsSteps {
+		if cur == s {
+			return clipSecondsSteps[(i+1)%len(clipSecondsSteps)]
+		}
+	}
+	return clipSecondsSteps[0]
+}
+
+// restartSelf：重启接收端。
+// 关键：**先释放 TCP/UDP 端口**，否则新进程一起来就撞上「端口被占」而弹框退出。
+func restartSelf() {
+	exe, err := os.Executable()
+	if err != nil {
+		messageBox("无法定位程序文件：\n"+err.Error(), "PhotoBeam 重启")
+		return
+	}
+	stopTCPServer()
+	stopDiscoveryResponder()
+	cmd := exec.Command(exe)
+	cmd.Dir = filepath.Dir(exe)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Start(); err != nil {
+		messageBox("重启失败：\n"+err.Error()+"\n\n请手动双击 PhotoBeam.exe。", "PhotoBeam 重启")
+		return
+	}
+	logf("已启动新进程 %s，本进程即将退出", exe)
+	// 给新进程留出绑定端口的时间，再退出旧进程
+	go func() {
+		time.Sleep(1200 * time.Millisecond)
+		systray.Quit()
+		time.Sleep(300 * time.Millisecond)
+		os.Exit(0)
+	}()
 }
 
 func onExit() {}

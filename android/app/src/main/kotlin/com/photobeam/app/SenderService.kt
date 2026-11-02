@@ -558,6 +558,39 @@ class SenderService : Service() {
         } catch (e: Exception) { }
     }
 
+    // ---------- [B3] 逐张「已到电脑」回执 ----------
+    // 之前手机端只有「最近同步：HH:mm:ss 成功/失败」这种**汇总**回执，
+    // 用户看不到「这一张图到底有没有到电脑」→ 补逐张回执。
+    // PC 端每落盘一张就回一条 ACK（协议 §5.2），这里把它记进 prefs 供状态区回显。
+
+    /** 一张图已被电脑确认落盘 */
+    private fun recordArrival(name: String) {
+        try {
+            val n = prefs.getInt("arrived_count", 0) + 1
+            prefs.edit()
+                .putInt("arrived_count", n)
+                .putString("arrived_last_name", name)
+                .putLong("arrived_last_at", System.currentTimeMillis())
+                // 成功一张就把「最近失败」清掉：失败提示只反映当前状态，不是历史
+                .remove("failed_last_name")
+                .remove("failed_last_reason")
+                .apply()
+            android.util.Log.d("PhotoBeam", "到达回执: $name（累计 $n 张）")
+        } catch (e: Exception) { }
+    }
+
+    /** 一张图被电脑拒绝/失败 */
+    private fun recordArrivalFailure(name: String, reason: String) {
+        try {
+            prefs.edit()
+                .putString("failed_last_name", name)
+                .putString("failed_last_reason", reason)
+                .putLong("failed_last_at", System.currentTimeMillis())
+                .apply()
+            android.util.Log.w("PhotoBeam", "失败回执: $name reason=$reason")
+        } catch (e: Exception) { }
+    }
+
     private fun doReconcileAndFlush(manual: Boolean = false) {
         val pc = pairing.loadPairedPC()
         // 未配对也要对账入队（协议 §7.1：截图先进队列，配对后补发）
@@ -774,6 +807,7 @@ class SenderService : Service() {
                     queue.save()
                     flushedSomething = true
                     flushedCount++ // [A3] 回执：已发送 N 张
+                    recordArrival(it.name) // [B3] 逐张「已到电脑」回执
                     android.util.Log.d("PhotoBeam", "落盘确认: ${it.name}")
                 } catch (e: SendException) {
                     android.util.Log.w("PhotoBeam", "发送失败(${e.errClass}): ${it.name} reason=${e.reason}")
@@ -781,6 +815,7 @@ class SenderService : Service() {
                     it.dropReason = e.reason
                     if (e.errClass == "transient") it.tries++ // [R-4] transient 也要计数
                     if (e.errClass == "permanent") Notifier.dropped(applicationContext, it.name, e.reason)
+                    recordArrivalFailure(it.name, e.reason) // [B3] 失败也要有回执
                     queue.save()
                 } catch (e: Exception) {
                     // 连接级/传输级异常 → 该图回 pending，断开重连下一轮再试 [E-02]
