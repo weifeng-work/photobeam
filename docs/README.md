@@ -2,9 +2,12 @@
 
 本目录是 PhotoBeam 的协议规范、各阶段证据与审核记录。**实现唯一依据是 `protocol-v1.md`**。
 
+**第一次用这个软件 → 看 [`user-journey.md`](user-journey.md)**（按步骤走的用户操作手册，含状态区释义与故障自查）。
+
 | 文档 | 内容 |
 |------|------|
-| `protocol-v1.md` | 传输协议规范 v1.3（帧格式、三通道发现、握手、批次与时序） |
+| `protocol-v1.md` | 传输协议规范 **v1.4**（帧格式、三通道发现、握手、批次与时序；§11 登记 v1.3↔实测的全部偏离） |
+| **`user-journey.md`** | **用户操作手册**：首次安装配对 → 日常使用 → 出问题自查 → 已知限制 |
 | `handoff.md` | 交接说明：模块边界、协议约定、构建与运行方式 |
 | `delivery-status.md` | 交付状态快照 |
 | `m1-status.md` | M1 里程碑状态 |
@@ -12,6 +15,7 @@
 | `stage2-evidence.md` / `stage2-review.md` | Stage 2（剪贴板 + 弹窗）证据与审核报告 |
 | `stage3-evidence.md` / `stage3-review.md` | Stage 3（加固 + 打包）证据与审核报告 |
 | `stage4-evidence.md` | Stage 4（图标 / 托盘 / 弹窗 / 传输动画 / 后台自起）完整证据 |
+| `stage5-evidence.md` | Stage 5（**使用场景全流程核对 + 交互断裂修复**）：逐步复核、断点清单、协议偏离登记 |
 
 ## 关键图（`images/`）
 

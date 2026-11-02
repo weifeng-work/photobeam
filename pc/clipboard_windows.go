@@ -292,46 +292,6 @@ func prepareImageData(path string) (dib []byte, pngData []byte, w, h int, err er
 	return dib, pngData, w, h, nil
 }
 
-// ---------- 简单文本写入（诊断一键复制用；用户主动复制语义，不快照不还原） ----------
-
-func setClipboardTextSimple(text string) bool {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	cbMu.Lock() // [S3-6] 与 60 秒还原互斥，防极端时序互相 EmptyClipboard
-	defer cbMu.Unlock()
-	if !openClipboardRetry() {
-		return false
-	}
-	defer procCloseClipboard.Call()
-	procEmptyClipboard.Call()
-	u16 := utf16Encode(text)
-	h := globalAllocCopy(u16)
-	if h == 0 {
-		return false
-	}
-	r, _, _ := procSetClipboardData.Call(13, h) // CF_UNICODETEXT
-	return r != 0
-}
-
-func utf16Encode(s string) []byte {
-	u := make([]uint16, 0, len(s)*2+2)
-	for _, r := range s {
-		if r >= 0x10000 {
-			r -= 0x10000
-			u = append(u, uint16(0xD800+(r>>10)), uint16(0xDC00+(r&0x3FF)))
-		} else {
-			u = append(u, uint16(r))
-		}
-	}
-	u = append(u, 0)
-	out := make([]byte, len(u)*2)
-	for i, v := range u {
-		out[i*2] = byte(v)
-		out[i*2+1] = byte(v >> 8)
-	}
-	return out
-}
-
 // ---------- 写入剪贴板 + 60 秒还原 ----------
 
 var cbMu sync.Mutex

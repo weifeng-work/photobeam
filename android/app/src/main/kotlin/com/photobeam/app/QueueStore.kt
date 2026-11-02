@@ -24,7 +24,7 @@ class QueueItem(
     var isLatestInBatch: Boolean = false,
     var batchSize: Int = 1,    // 批内数量 [P0-04]
     var state: String = "pending", // pending | sending | sent | dropped
-    var unreadyTries: Int = 0, // 读取未就绪计数（blocked 语义：永不因此丢弃 [§6.1]）
+    var unreadyTries: Int = 0, // 读取未就绪计数（blocked 语义：永不因此丢弃 [§7.3.1]）
     var tries: Int = 0,        // 发送失败计数
     var dropReason: String = ""
 )
@@ -128,11 +128,11 @@ class QueueStore(private val ctx: Context) {
     @Synchronized
     fun readyItems(): List<QueueItem> = pendingItems().filter { it.fileId.isNotEmpty() }
 
-    /** 全部待处理项（含未就绪）[§6.2]：通知显示"待发送 N 张（其中 M 张暂不可读）" */
+    /** 全部待处理项（含未就绪）[§7.3.1]：通知显示"待发送 N 张（其中 M 张暂不可读）" */
     @Synchronized
     fun pendingCount(): Int = items.count { it.state == "pending" }
 
-    /** 未就绪计数 [§6.2]：通知与主界面展示"其中 M 张暂不可读" */
+    /** 未就绪计数 [§7.3.1]：通知与主界面展示"其中 M 张暂不可读" */
     @Synchronized
     fun unreadyCount(): Int = items.count { it.state == "pending" && it.fileId.isEmpty() }
 

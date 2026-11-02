@@ -64,5 +64,8 @@
         </receiver>
 
         <receiver android:name=".AlarmReceiver" android:exported="false" />
+
+        <!-- 通知里的「停止」动作（PendingIntent 带 ACTION_STOP）→ 直接停服务 [A1] -->
+        <receiver android:name=".StopReceiver" android:exported="false" />
     </application>
 </manifest>

@@ -277,6 +277,17 @@ class HandshakeResult(
     val versionErr: String?      // 非 null = 对端报告版本不支持
 )
 
+/**
+ * SAS 核对结果（三态，Stage 5 新增）
+ *
+ * 此前只有「一致 / 不一致」两态，**等待超时也被当成「不一致」**发 `pair_reject` →
+ * PC 端会把一次「用户没来得及看」记成「手机端拒绝配对」，日志与提示全错。
+ * 现在超时单独成一态：手机端**不发任何帧**直接断开，由 PC 自己的 60 秒定时器收尾并提示。
+ */
+const val SAS_CONFIRM = 0 // 用户点「一致」
+const val SAS_REJECT = 1  // 用户点「不一致」→ 发 pair_reject
+const val SAS_TIMEOUT = 2 // 等待超时 → 静默断开
+
 class PairingEngine(
     private val prefs: android.content.SharedPreferences,
     private val keys: IdentityKeys,
@@ -297,10 +308,17 @@ class PairingEngine(
 
     fun savePairedPC(pc: PairedPC) {
         android.util.Log.d("PhotoBeam", "savePairedPC: fp=${pc.fp} name=${pc.name} prefs=$prefs")
+        // [A4] 记录配对时间（诊断信息用）：只在**首次**配对时写入，
+        // 之后 updateLastConnection 的重写不能覆盖它。
+        val pairedAt = try {
+            val old = prefs.getLong("pc_paired_at", 0L)
+            if (old > 0L) old else System.currentTimeMillis()
+        } catch (e: Exception) { System.currentTimeMillis() }
         prefs.edit()
             .putString("pc_fp", pc.fp).putString("pc_edpub", b64e(pc.edPubRaw))
             .putString("pc_name", pc.name).putString("pc_ip", pc.lastIP)
-            .putInt("pc_port", pc.lastPort).commit() // [B-09] 同步落盘
+            .putInt("pc_port", pc.lastPort).putLong("pc_paired_at", pairedAt)
+            .commit() // [B-09] 同步落盘
     }
 
     fun pairedFingerprint(): String? = prefs.getString("pc_fp", null)
@@ -322,11 +340,12 @@ class PairingEngine(
 
     /**
      * 执行握手（HELLO → HELLO → MODE → ECDH/SAS → 认证帧）。
-     * pairing 模式下，本函数发送 pair_confirm 前会回调 [sasConfirm]（应返回 true=两端一致）。
+     * pairing 模式下，本函数发送 pair_confirm 前会回调 [sasConfirm]
+     * （返回 SAS_CONFIRM / SAS_REJECT / SAS_TIMEOUT 三态）。
      */
     fun handshake(
         sock: Socket,
-        sasConfirm: (sas: String) -> Boolean,
+        sasConfirm: (sas: String) -> Int,
         allowPairing: Boolean = true
     ): HandshakeResult {
         val inp = sock.getInputStream()
@@ -396,15 +415,35 @@ class PairingEngine(
             if (!allowPairing) {
                 throw java.io.IOException("对端要求重新配对（本端在后台发送路径，已断开）")
             }
-            val agreed = sasConfirm(sas)
-            ch.writeFrame(out, FRAME_CTRL, org.json.JSONObject()
-                .put("type", if (agreed) "pair_confirm" else "pair_reject")
-                .put("sas", sas)
-                .put("sig", b64e(keys.sign(transcript)))
-                .put("dev_name", myName)
-                .toString().toByteArray(Charsets.UTF_8))
-            dbg("pair_confirm 已发送 (agreed=$agreed)")
-            if (!agreed) throw java.io.IOException("用户拒绝配对（两端数字不一致）")
+            // [Stage 5] 三态：一致 / 用户拒绝 / 等待超时
+            // 超时**不发 pair_reject**——pair_reject 的语义是「用户明确拒绝」，
+            // 把「用户没来得及看」也当成拒绝，会让 PC 端记成「手机端拒绝配对」并弹错提示。
+            // 超时只静默断开，由 PC 自己的 60 秒定时器收尾并提示「配对超时」。
+            when (sasConfirm(sas)) {
+                SAS_CONFIRM -> {
+                    ch.writeFrame(out, FRAME_CTRL, org.json.JSONObject()
+                        .put("type", "pair_confirm")
+                        .put("sas", sas)
+                        .put("sig", b64e(keys.sign(transcript)))
+                        .put("dev_name", myName)
+                        .toString().toByteArray(Charsets.UTF_8))
+                    dbg("pair_confirm 已发送 (agreed=true)")
+                }
+                SAS_REJECT -> {
+                    ch.writeFrame(out, FRAME_CTRL, org.json.JSONObject()
+                        .put("type", "pair_reject")
+                        .put("sas", sas)
+                        .put("sig", b64e(keys.sign(transcript)))
+                        .put("dev_name", myName)
+                        .toString().toByteArray(Charsets.UTF_8))
+                    dbg("pair_reject 已发送 (用户点了『不一致』)")
+                    throw java.io.IOException("用户拒绝配对（两端数字不一致）")
+                }
+                else -> {
+                    dbg("SAS 核对超时，静默断开（不发 pair_reject）")
+                    throw java.io.IOException("配对核对超时（未在窗口内确认）")
+                }
+            }
             // 读 pair_ok 并校验 Receiver 签名 [P0-03]
             dbg("读 pair_ok...")
             val (ft, pt) = ch.readFrame(inp)

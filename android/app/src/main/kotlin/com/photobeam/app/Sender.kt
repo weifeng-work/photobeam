@@ -19,7 +19,7 @@ object Sender {
      *     MediaStore 行（实测截断 130126/160387 通过了纯长度比对，仅内容判据能拦住）
      *   ② 长度双采样 [R-5]：读前 length == 读后 length（两者皆 >0 时）——文件仍在增长则判未就绪
      *   ③ bytes 非空 且（expected 未知 或 bytes == expected）
-     * 返回 null = 未就绪（文件仍在写入/不可读）——调用方按 blocked 处理（永不丢弃 [§6.1]）
+     * 返回 null = 未就绪（文件仍在写入/不可读）——调用方按 blocked 处理（永不丢弃 [§7.3.1]）
      */
     fun readReady(ctx: android.content.Context, item: QueueItem): ByteArray? {
         val realPath = "/storage/emulated/0/" + item.relPath.trimEnd('/') + "/" + item.name
@@ -77,6 +77,29 @@ object Sender {
         }
         android.util.Log.w("PhotoBeam", "readReady: 三路均未就绪 (${item.name})")
         return null
+    }
+
+    /**
+     * URI 是否**彻底失效**（MediaStore 行已被删除）[协议 §7.3]
+     *
+     * 与 readReady 返回 null 的另一类情况严格区分：
+     *   · 行还在、文件内容没写完 → **未就绪**，永不丢弃（blocked），下轮重试；
+     *   · 行没了（用户在相册里删了 / 存储被清）→ **URI 失效**，该图永远不会再就绪 → 可标 dropped。
+     *
+     * 判据：按 item.uri 查 MediaStore，返回 0 行即视为失效。
+     * 查询抛异常一律判「未失效」——保守起见宁可继续重试，也不误丢照片。
+     */
+    fun uriDead(ctx: android.content.Context, item: QueueItem): Boolean {
+        return try {
+            ctx.contentResolver.query(
+                android.net.Uri.parse(item.uri),
+                arrayOf(android.provider.MediaStore.Images.Media._ID),
+                null, null, null
+            )?.use { c -> c.count == 0 } ?: false
+        } catch (e: Exception) {
+            android.util.Log.w("PhotoBeam", "uriDead 查询异常（按未失效处理）: ${e.message}")
+            false
+        }
     }
 
     /** 图片内容完整性：JPEG SOI…EOI / PNG 头…IEND；两者都不是 → 未完成 */

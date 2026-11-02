@@ -69,7 +69,7 @@ class MediaStoreSync(
                     val mime = c.getString(4) ?: "image/*"
                     val capturedAt = c.getLong(5)
                     val relPath = c.getString(6) ?: ""
-                    // 扩展名白名单（协议级拒绝，提前过滤省流量 [§6.1②]）
+                    // 扩展名白名单（协议级拒绝，提前过滤省流量 [§5.2]）
                     val ext = name.substringAfterLast('.', "").lowercase()
                     if (ext !in setOf("jpg", "jpeg", "png", "webp", "gif", "bmp", "heic")) {
                         queue.discoveryLedger[id] = capturedAt

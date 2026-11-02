@@ -4,6 +4,7 @@ package main
 // 协议实现依据：docs/protocol-v1.md（v1.2，MiniMax 签字放行）
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -202,8 +203,42 @@ func isUnderOneDrive(dir string) bool {
 
 func nowUnix() int64 { return timeNow().Unix() }
 
-func logf(format string, a ...any) {
-	s := fmt.Sprintf(format, a...)
-	appendLog(AppName + " " + s)
-	fmt.Println(s)
+// ---------- 保存目录读写（PC-2：向导窗/托盘可在运行时改目录） ----------
+
+// saveDirMu 保护 cfg.SaveDir —— 向导窗线程改目录与接收线程读目录并发
+var saveDirMu sync.RWMutex
+
+func getSaveDir() string {
+	saveDirMu.RLock()
+	defer saveDirMu.RUnlock()
+	return cfg.SaveDir
+}
+
+func setSaveDir(d string) {
+	saveDirMu.Lock()
+	defer saveDirMu.Unlock()
+	cfg.SaveDir = d
+}
+
+// applySaveDir：校验 → 建目录（含 .tmp）→ 写回配置并落盘
+// 失败不写配置（保持旧目录继续可用）
+func applySaveDir(dir string) error {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return errors.New("目录路径为空")
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return fmt.Errorf("路径无效: %w", err)
+	}
+	if err := os.MkdirAll(abs, 0o755); err != nil {
+		return fmt.Errorf("无法创建目录: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(abs, ".tmp"), 0o755); err != nil {
+		return fmt.Errorf("无法创建临时子目录: %w", err)
+	}
+	setSaveDir(abs)
+	saveConfig(cfg)
+	logf("接收目录已改为: %s", abs)
+	return nil
 }

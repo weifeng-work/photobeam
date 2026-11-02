@@ -1,9 +1,21 @@
-# PhotoBeam 协议规范 v1.3（Stage 3 修订版）
+# PhotoBeam 协议规范 v1.4（Stage 5 修订版）
 
-> 状态：v1.3（Stage 3 修订版，§3.1 SAS salt 文档勘误）。Stage 0 已四轮签字，Stage 1~3 实现已按本规范交付。
-> v1.3 变更：更正 §3.1 SAS salt 的 Receiver 侧描述（v1.2 误写为 receiver 在前，与
-> "按发送方视角固定顺序"规则及两端实现矛盾）——语义不变，纯文档勘误 [R-1]。
-> v1.2 变更标注：[N-xx] = 复核新 P0，[R-xx] = 复核 P1。本文档是 M1 实现的唯一依据。
+> 状态：v1.4（Stage 5 修订版）。Stage 0 已四轮签字，Stage 1~4 实现已按规范交付；
+> **v1.4 的修订原则：以实机验证结果为准**——凡 v1.3 的条文与真机行为冲突，
+> 一律**改协议而不是回退已验证有效的实现**，每处偏离在 §11 登记（条款 / 实测 / 理由 / 证据）。
+>
+> v1.4 变更：
+> 1. **§3.2 / §8 / §9.1 SAS 展示落为可实现条款**：Receiver 端由「只落日志」改为**必须弹出向导窗**
+>    显示 6 位码并提供「一致 / 不一致」按钮（Stage 5 实测发现原实现只写日志，用户无从核对）。
+> 2. **§8 诊断信息不再写系统剪贴板**，改为导出到 `logs\diagnostics-<时间戳>.txt`（Stage 5 决策：
+>    复制诊断会 `EmptyClipboard` 且不还原，直接丢弃用户原剪贴板内容）。
+> 3. **§0 / §7.7 精确闹钟条款按 MIUI 实测改写**：本实现使用 `USE_EXACT_ALARM`（API 33+ 安装即授予）
+>    + `setExactAndAllowWhileIdle`，v1.3「不申请、不使用 exact 闹钟」仅适用于 AOSP 假设。
+> 4. **§7.6 开机流程按实测改写**：广播内**直接起服务** + 精确闹钟兜底（v1.3 写的是「只起闹钟」）。
+> 5. **§8 计划任务看门狗移出本版范围**（Stage 5 决策：不在系统注册计划任务），登记为后续项。
+> 6. §7.7 Android 14 部分媒体授权三态、§7.5 FGS `onTimeout` 降级链路：条款保留，实现状态标注。
+>
+> v1.3 变更标注：[N-xx] = 复核新 P0，[R-xx] = 复核 P1。本文档是 M1 实现的唯一依据。
 
 ## 0. 术语、角色与版本
 
@@ -11,14 +23,14 @@
 - 角色在协议消息层可切换（`role` 字段预留）。**设计依据**：Android 17（targetSdk 37）的
   `ACCESS_LOCAL_NETWORK` 只限制**主动发起**连接的一方，被动接受方不受限——预留角色切换
   是该权限落地后的存活通道。v1 只实现 Sender→Receiver，**不实现运行时角色切换**。
-- **编译与目标版本（钉死）**[P0-12]：`compileSdk = 37`，`targetSdk = 36`，`minSdk = 31`。
+- **编译与目标版本（钉死）**[P0-12]：`compileSdk = 37`，`targetSdk = 36`，`minSdk = 33`。
   | 行为 | 与 targetSdk 36 的关系 |
   |---|---|
-  | `specialUse` FGS | 可用（API 34+；API 31-33 降级 dataSync 路径见 §7.5） |
-  | `SCHEDULE_EXACT_ALARM` | targetSdk ≥ 33 新装默认拒绝 → **不申请、不使用** exact 闹钟（见 §7.5/§7.7） |
+  | `specialUse` FGS | 可用（API 34+；API 33 走 `dataSync` 分支——**minSdk 33 起 API 31~32 的 dataSync 降级分支不适用**） |
+  | `USE_EXACT_ALARM` | **v1.4 按实测改写**：本实现**使用** `USE_EXACT_ALARM`（API 33+ 安装即授予）+ `setExactAndAllowWhileIdle`；v1.3 的「targetSdk ≥ 33 不申请、不使用 exact 闹钟」是 AOSP 假设，**在 MIUI 上与实测冲突**（见 §11 偏离 3） |
   | `ACCESS_LOCAL_NETWORK` | targetSdk 36 隐式授予；manifest 预埋声明，37 时仅需打开申请弹窗 |
-  | Android 14 部分媒体授权 | targetSdk ≥ 34 触发"选中的照片" → 必须处理（见 §7.7） |
-  | Android 15 BOOT_COMPLETED FGS 禁令 | targetSdk ≥ 35 **触发** → 开机流程 = BootReceiver 起闹钟，闹钟起 FGS（见 §7.6） |
+  | Android 14 部分媒体授权 | targetSdk ≥ 34 触发"选中的照片" → **必须处理**（见 §7.7）；Stage 5 已实现三态检测与引导 |
+  | Android 15 BOOT_COMPLETED FGS 禁令 | targetSdk ≥ 35 **触发** → 开机流程见 §7.6（**v1.4 按实测改写**，见 §11 偏离 4） |
   | Android 16 JobScheduler 配额 | 对 Android 16+ 全部应用生效，与 targetSdk 无关（及时性/不丢失的口径见 §7.5） |
 - 端口：**UDP 发现端口固定 5416/udp**（被占 → PC 明确告警拒绝启动，不静默漂移——漂移会让
   手机端固定广播永远收不到应答）；**TCP 传输端口可漂移**（5416→5436 自动探测空闲），实际
@@ -123,11 +135,24 @@ salt 段顺序**两端一律按 Sender 视角固定顺序**（sender_eph ‖ rec
    曾被"重新配对"清除** [R-13]。
 2. mode=pairing → **两端同时展示 SAS**（Receiver 向导窗 + Sender 全屏页），手机端出现
    "两端数字一致吗？一致/不一致"。
+   - **v1.4 落地要求**：Receiver 端**必须弹出向导窗**显示 6 位码（本机指纹 + 设备名 + 码 + 两个
+     按钮），**只写日志视为未实现**——用户必须能在 PC 上看到那 6 位数字，否则 Sender 端的
+     "请在电脑上核对数字"对话框无法完成，人眼比对退化为无条件信任（Stage 5 实测发现此缺口）。
    - **Sender 已 pin 该 PC 但 mode=pairing**（无论 reset）→ 手机端提示
      "该电脑的配对记录已被重置，将更新信任密钥"，经用户确认后清除旧 pin 再继续 [R-13][R-14]。
    - 用户点"不一致" → **任一端均可发** `{"type":"pair_reject"}`（加密帧，双向可发 [R-22]）
      → 双方立即断开；Receiver 向导显示"用户已拒绝配对"，Sender 显示"两端数字不一致，请确认
      没有中间人，重试"。
+   - **v1.4 落地要求**：Receiver 端的"不一致"必须**真的发出** `pair_reject`（v1.3 条款允许双向发，
+     但实现只收不发）。
+   - **v1.4 新增（Stage 5 实测确立）· 核对窗口 60 秒**：两端各自的 SAS 核对等待上限均为
+     **60 秒**，必须成对实现——Receiver 向导窗的定时器与 Sender 对话框的等待是**同一个窗口**，
+     任一端先超时都会导致配对失败。**15 秒不够用**：人要读 6 位数字、再看一眼手机、再去点按钮，
+     15 秒很容易来不及（实测首轮验收时手机端因等待超时直接发出了 `pair_reject`，
+     PC 端日志只留下「手机端已拒绝配对」，用户完全不知道发生了什么）。
+     超时后 Sender 端必须**关闭核对对话框**（不能把失效的框留在屏幕上）。
+   - **v1.4 新增（Stage 5 实测确立）· 失败路径必须可见**：配对失败（任一端拒绝 / 超时）时，
+     Receiver 端必须给出**对话框**提示，不得只发托盘气泡（托盘气泡在用户不盯着托盘时等于没有）。
 3. mode=reconnect → 跳过 SAS，直接进 §3.3。**若 Sender 本地无该 fp 的 pin**（PC 重装/换密钥）
    → Sender 断开并提示"电脑的身份已变化，请在电脑端重新配对"。
 
@@ -196,7 +221,10 @@ key = session（32B），每帧独立 12B 随机 nonce；重连换新 session �
 - **文件名消毒**：取 base name、剥路径分隔符（`\` `/`）与控制字符、强制保留原扩展名
   —— 防路径穿越（`name` 来自对端，可含 `..\`）；
 - **扩展名白名单**：`jpg/jpeg/png/webp/gif/bmp/heic`；白名单外 → `ACK{error, permanent,
-  reason:"ext_rejected"}`；
+  reason:"ext_rejected"}`（**v1.4：实现已统一为此字符串**——原实现发 `invalid_name`，Android 侧不按
+  该字符串分支，改名无兼容风险）；
+- **v1.4 新增**：上述四类接收端错误（`ext_rejected` / `io_error` / `disk_full` / `file_too_large`）
+  **必须同时给用户可见反馈**（PC 端日志 + 合并限流的消息提示），不得只回 ACK 静默丢弃；
 - **隔离写入**：先写 `Received\.tmp\<file_id>.part`，FILE_END 后校验整文件 SHA-256 =
   file_id → 通过则**原子 rename** 到 `<unixMs_Receiver时钟>_<消毒名>`（冲突加 -1/-2）；
   校验失败删 .part 回 transient；
@@ -242,38 +270,67 @@ is_latest_in_batch, state: pending|sending|sent|dropped, tries, drop_reason}`：
 - 双上限 200 张 / 500MB，超限丢**最旧的 pending**（不碰 sending），通知栏告知丢弃数量；
 - URI 失效 → 标 `dropped`（drop_reason 记录），不再重试。
 
+#### 7.3.1 就绪判据与两种「读不到」 [v1.4 新增]
+入队只记 URI；**读文件发生在发送时**（入队那一刻文件可能还在写）。三路读取取先成功者
+（File 直读 / `openFileDescriptor` / `openInputStream`），全部满足才算就绪：
+- **内容完整**：JPEG 末尾 EOI(`FFD9`) / PNG 末尾 `IEND`——MIUI 会在文件写完前就插
+  MediaStore 行（实测截断 130126/160387 通过了纯长度比对，只有内容判据能拦住）；
+- **长度稳定**：读前 length == 读后 length（两者皆 > 0 时）——仍在增长则判未就绪；
+- **长度相符**：bytes 非空，且（expected 未知 或 bytes == expected）。
+
+「读不到」**必须分成两类，不可一律当作未就绪**：
+
+| 情况 | 判据 | 处置 |
+|---|---|---|
+| 文件还没写完 / 暂不可读 | MediaStore 行**还在** | 保持 `pending`，下轮重试，**永不丢弃**（防丢图） |
+| URI 已失效 | MediaStore 行**已删除**（查得 0 行） | 标 `dropped`（`drop_reason=uri_dead`），不再重试，并通知用户 |
+
+查询抛异常按「未失效」处理（保守：宁可继续重试，也不误丢照片）。
+未就绪日志限流：前 3 次每次告警，之后每 20 次告警一次（避免长期不可读的文件刷爆日志）。
+
 ### 7.4 发送循环
 队首 → §2 **三通道**解析 → 连接 → 握手（重连模式）→ file_meta/chunks/end → ack → 记账。
 失败回队列，指数退避 30s→1m→5m→15m 封顶；permanent → dropped。
 
 ### 7.5 前台服务与保活 [P0-13][P1-07][R-11][R-16]
-- FGS 类型：`specialUse`（API 34+；**API 31-33 降级 `dataSync`**：Android 15 上 6h/24h
-  累计超时 → `onTimeout()` → stopSelf → 30s 后重启；**连续超时 3 次 → 降级 Alarm-only 模式**
-  （不启 FGS），通知栏提示授予省电白名单）[R-16]；
+- FGS 类型：`specialUse`（API 34+；**API 33 走 `dataSync`**——minSdk 33 起 API 31~32 的 dataSync
+  降级分支不适用）。Android 15 上 6h/24h 累计超时 → `onTimeout()` → 重启服务；**连续超时 3 次 →
+  降级 Alarm-only 模式**（不启 FGS），通知栏提示授予省电白名单）[R-16]；
   **`startForegroundService` 后必须 5 秒内调用 `startForeground()`**（否则系统抛异常）[R-11]；
+- **v1.4 新增（Stage 4 实测确立）**：`startForeground()` **必须无条件调用**，绝不因任何历史标志
+  而跳过——跳过 = 30 秒后 `ForegroundServiceDidNotStartInTimeException` 杀进程 → 通知随进程消失
+  → 状态栏图标整体消失。判据：**抛异常 = 真被拒；不抛 = 成功**（`activeNotifications` 复核实测为
+  假阴性，会导致重复图标，禁止使用）。
 - 厂商杀后台**不调用 onTimeout** → 自恢复：`START_STICKY` + onStartCommand 重注册 Observer +
-  `AlarmManager.setAndAllowWhileIdle()` 自检心跳（非 exact，不申请 SCHEDULE_EXACT_ALARM；
-  Doze 下真实节拍 ≈ 15 分钟，如实写明）；
+  精确闹钟自检心跳（`setExactAndAllowWhileIdle`，`USE_EXACT_ALARM`，见 §7.7）；
 - "服务被杀/后台受限"状态显式可见：通知栏"已暂停，点此恢复"；
-- **息屏三级保障**：① FGS + Observer（前台/近期活跃时秒级）；② setAndAllowWhileIdle 心跳
-  （Doze ~15 分钟）；③ 省电白名单 + 厂商自启动引导（分厂商页 + 完成回读，未完成显示"后台
-  受限"红标）。**对外口径："最终一定到，息屏时可能迟到 ~15 分钟"。**
+- **息屏三级保障**：① FGS + Observer（前台/近期活跃时秒级）；② 精确闹钟心跳
+  （**MIUI 上进入 deviceidle 白名单后该闹钟不再被挂起**，Doze 下真实节拍可到分钟级；
+  未放行时可能被 `Pending user blocked background alarms` 挂起）；③ 省电白名单 + 厂商自启动引导
+  （分厂商页 + 完成回读，未完成显示"后台受限"红标）。**对外口径："最终一定到，息屏时可能迟到"。**
 
 ### 7.6 开机流程 [P0-12]
-targetSdk 36 触发 BOOT_COMPLETED FGS 禁令 → BootReceiver 收到开机广播后**只起
-setAndAllowWhileIdle 闹钟**，闹钟触发时经 `startForegroundService` 启动 FGS（合法路径），
-并遵守 5 秒 `startForeground()` 约束。
+**v1.4 按实测改写**（见 §11 偏离 4）：targetSdk 36 触发 BOOT_COMPLETED FGS 禁令，
+`BootReceiver` 收到开机广播后**在广播内直接起服务**（`startForegroundService`），**同时**挂
+`setExactAndAllowWhileIdle` 精确闹钟作兜底（10 秒后）。
+- 依据：MIUI 实测 `Background started FGS: Allowed [... code:SYSTEM_ALLOW_LISTED ...]` —— 白名单
+  用户在开机路径上同样被放行，且广播直起比"等闹钟"少一个 10 秒的迟到窗口；
+- 降级链：广播内 `startForegroundService` 被拒 → 退化为普通后台服务（`startService`）→
+  再被拒才发 `NOTI_ID_DOWN` 提示（不占状态栏）。
+- 覆盖安装链（`MY_PACKAGE_REPLACED`）同构：广播直起 + 5 秒后精确闹钟兜底。
 
 ### 7.7 权限清单 [P1-06][P1-08][S-01]
 `READ_MEDIA_IMAGES`、`READ_MEDIA_VISUAL_USER_SELECTED`（Android 14+ 三态检测：部分授权
-→ 明确提示"仅能访问 N 张"并引导全选）、`POST_NOTIFICATIONS`（运行时申请）、`INTERNET`、
+→ 明确提示"仅能访问 N 张"并引导全选，**v1.4 已实现**）、`POST_NOTIFICATIONS`（运行时申请）、`INTERNET`、
 `ACCESS_NETWORK_STATE`、`ACCESS_WIFI_STATE`（读 SSID/网络状态）、
 `FOREGROUND_SERVICE`、`FOREGROUND_SERVICE_SPECIAL_USE`（34+）/
 `FOREGROUND_SERVICE_DATA_SYNC`（33 降级）、`RECEIVE_BOOT_COMPLETED`、
 `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`、`ACCESS_LOCAL_NETWORK`（预埋）。
 **可选增强**：`ACCESS_FINE_LOCATION`（仅让 SSID 提示更精确；**不申请也完整可用**——
 读不到 SSID 时指纹自动降级为网关 IP/子网判据，见 §2；不为一个提示申请位置权限）。
-**不申请** `SCHEDULE_EXACT_ALARM`。`ACTION_SEND` 分享目标：M2。
+**v1.4 按实测改写**：`SCHEDULE_EXACT_ALARM`（≤API 32，需用户授权）**不申请**；API 33+ 使用
+`USE_EXACT_ALARM`（安装即授予）——MIUI 实测该权限 + 电池优化白名单是把后台 FGS 变为
+`SYSTEM_ALLOW_LISTED` 永久放行的必要条件之一（见 §11 偏离 3）。`ACTION_SEND` 分享目标：M2。
 
 ### 7.8 网络指纹（存储落点）[P2-c]
 配对成功时写入 app 私有 config：`{ssid, gateway_ip, paired_at}`；每次网络切换事件更新；
@@ -283,9 +340,16 @@ setAndAllowWhileIdle 闹钟**，闹钟触发时经 `startForegroundService` 启�
 
 - **托盘**：`fyne.io/systray`（定案，不用 walk——cgo/MinGW 冲突）；向导/弹窗用
   `x/sys/windows` 原生 Win32；构建脚本 **`CGO_ENABLED=0`** [P1-10]；
-- 菜单 = 打开接收文件夹 / 重新配对 / 复制诊断信息 / 修复防火墙规则 / 开机自启(勾选) / 退出；
+- 菜单 = 打开接收文件夹 / **接收文件夹…（改保存目录）** / 重新配对 / **导出诊断信息** /
+  修复防火墙规则 / 开机自启(勾选) / 退出；
+  - **v1.4**：诊断项由「复制诊断信息」改为「**导出诊断信息**」——写入
+    `logs\diagnostics-<时间戳>.txt` 并弹窗告知路径，**不触碰系统剪贴板**（复制语义会
+    `EmptyClipboard` 且不还原，直接丢弃用户原内容）；
 - **向导窗**：选保存文件夹（默认 `%LOCALAPPDATA%\PhotoBeam\Received`，OneDrive 重定向检测
   + 警告，配置目录同样避开）→ 显示 SAS → 配对成功；
+  - **v1.4 落地要求**：向导窗须**同时**承担三件事——显示 6 位 SAS 码 + 本机指纹 + 手机设备名、
+    提供「一致 / 不一致」两个按钮（「不一致」**必须真的发出** `pair_reject`）、提供
+    保存目录选择。**只落日志不算实现**；
 - **网络自检四件套**（诊断置顶）[P1-11]：对外通告 IP + 所属网卡名（`GetAdaptersAddresses`
   IfType 过滤 + 名称黑名单 Hyper-V/WSL/VMware/Tailscale/WireGuard/Loopback/vEthernet）、
   监听端口、防火墙规则存在性 + **规则路径与当前 exe 路径比对**、网络 profile（公用/专用）；
@@ -293,16 +357,22 @@ setAndAllowWhileIdle 闹钟**，闹钟触发时经 `startForegroundService` 启�
 - **防火墙**[P1-11]：预置两条规则——TCP 5416-5436 与 UDP 5416，按程序路径绑定、绑定**全部**
   profile；启动自检规则存在 + 路径一致，失效自动重建（UAC，拒绝 → 托盘"修复防火墙规则"
   退路 + 诊断置顶）；发现端口被占 → 明确告警拒绝启动 [P0-11]；
-- **常驻**[P1-09][R-17]：**登录自启**（HKCU Run 键，登录时生效——措辞如实）+ **计划任务
-  看门狗每 5 分钟拉起，以当前用户身份运行（`/RU <user>` + 交互式 `/IT`，避免 Session 0
-  看不到托盘）**（M1 就做）；卸载清理说明写入 README；
+  - **v1.4 落地要求**：端口被占的告警**必须同步弹出**（等用户确认再退出），不得
+    `go messageBox(...)` 后立即 `os.Exit(1)`——那会让提示赶不上进程退出，用户只看到"闪退"；
+- **常驻**[P1-09][R-17]：**登录自启**（HKCU Run 键，登录时生效——措辞如实）。
+  **计划任务看门狗 v1.4 不实现**（Stage 5 决策：不在系统注册计划任务）→ 登记为 §10 延后项；
 - 日志：内部环形 200 条 + **崩溃时写退出码与最后 200 条日志**落盘
-  `%LOCALAPPDATA%\PhotoBeam\logs` [R-20]。
+  `%LOCALAPPDATA%\PhotoBeam\logs` [R-20]；日志需分级别（INFO/WARN/ERR）并按大小轮转；
+- **接收反馈**（v1.4 新增）：文件落盘后弹窗须显示**手机端原始文件名**（不是带毫秒前缀的落盘名）
+  + 「已保存到 <保存目录>」；`ext_rejected` / `io_error` / `disk_full` / `file_too_large`
+  四类错误须给用户可见提示（合并限流，不得逐张弹框）。
 
 ## 9. 验收标准（v1.2 修订）[P0-14][N-07][N-06][R-10]
 
 时延类判据统一"连续 20 次采样 ≥18 次满足"；每条记录实测值+设备+ROM+是否息屏。
 1. 配对全流程：**两端同时显示 SAS**；点"不一致"（任一端）→ 双方断开，PC 显示"用户已拒绝配对"；
+   （**v1.4**：PC 端向导窗为**必测项**——只有日志不算通过；另需验证 PC 端点「不一致」后
+   手机端收到 `pair_reject` 并断开）；
 2. 截图 ≤3 秒落盘（20 采样 18 次达标，从按下截图键起算）；
 3. **PC 程序退出** 1 小时 → 队列累积（≥30 张）→ PC 程序重启后自动补发，批次关系保持；
 4. **`adb shell kill <pid>`**（可杀 FGS 进程，保留闹钟/作业；**`am force-stop` 不可用——清空
@@ -320,7 +390,8 @@ setAndAllowWhileIdle 闹钟**，闹钟触发时经 `startForegroundService` 启�
 12. `.txt`/`.exe` 伪装图片 → `permanent` 拒绝，手机不重试、通知说明原因；
 13. **拒绝 UAC** → 托盘"修复防火墙规则"入口 + 诊断置顶；profile 切公用 → 全 profile 绑定
     规则仍可入站；
-14. 杀 PC 进程 → 看门狗（当前用户身份）5 分钟内拉起；重启 PC → 登录自启 + 队列补发；
+14. **v1.4 调整**：计划任务看门狗本版不实现 → 本条只验**登录自启**：重启 PC（登录后）→
+    PhotoBeam 自动拉起 + 队列补发；「杀 PC 进程 → 5 分钟内自动拉起」一条**不适用**（登记为 §10 延后项）；
 15. 手机时钟**调快 2 小时与调慢 2 小时**各测一次 → 落盘与批次标记均不受影响（_ID 水位
     不受时钟影响）[R-09]；
 16. 6 次错误配对 → 第 6 次被拒且有提示；一次网络抖动的重连失败**不**触发冷却；
@@ -330,6 +401,7 @@ setAndAllowWhileIdle 闹钟**，闹钟触发时经 `startForegroundService` 启�
 18. 多网卡（WiFi+有线+VPN 虚拟网卡）→ 诊断"手机可达 IP"落在手机同网段网卡，配对成功；
 19. Android 14+ 部分媒体授权：选 3 张 → 提示"仅能访问 3 张"并引导全选（**需一台 Android 14+
     真机**，vivo 日常机满足；红米 13 测不到）[R-10]；
+    （**v1.4**：三态检测与引导**已实现**，待 Android 14+ 真机补测）；
 20. **在 Android 14+ 真机上验证 `specialUse` 分支能起 FGS**（红米 13 跑的是 dataSync 降级
     分支，specialUse 分支必须另有设备验证）[R-10]；
 21. **MIUI/vivo 真机场景**：从最近任务划掉 App / 开启省电限制后，30 分钟内仍能自动补发；
@@ -342,4 +414,32 @@ M1 不做：剪贴板写入/还原与弹窗（M2）、EXIF 方向与降采样（
 加速器）、静默自更新（M3）、ACTION_SEND（M2）、角色切换的实际实现（字段预留）、
 PC 反向拉取（协议字段预留，v1 不实现 [P2-新2]）。
 `captured_at`（EXIF 来源）与截图类缺失时的取值规则 → M2 前补 [P2 备注]。
-"复制诊断信息"的稳定文本字段序 → M2 定稿（当前为给人看的自由文本）[P2 备注]。
+
+**v1.4 新增延后项**：
+- **计划任务看门狗**（§8 原要求每 5 分钟拉起进程）→ Stage 5 决策不实现，登记为后续范围
+  （涉及在系统注册计划任务，需用户单独授权）；
+- 「导出诊断信息」的稳定文本字段序 → M2 定稿（当前为给人看的自由文本）[P2 备注]；
+- 手机端诊断信息的落盘位置（`getExternalFilesDir`）在部分国产 ROM 的"文件管理"里不可见，
+  待补充"分享"入口。
+
+---
+
+## 11. v1.4 偏离登记（v1.3 条款 ↔ 实机行为）
+
+> 修订原则：**以实测为准**。凡 v1.3 条款与真机行为冲突，改协议而非回退已验证有效的实现。
+> 每条偏离必须写清：条款位置 / 实测现象 / 处置 / 依据。
+
+| # | v1.3 条款 | 实机现象 | v1.4 处置 | 依据 |
+|---|---|---|---|---|
+| 1 | §3.2:124 / §8:287「两端同时展示 SAS（Receiver 向导窗）」；§9.1 验收 | PC 端只有 `logf("配对模式 SAS=%s…")`，**屏幕上没有那 6 位数字**；手机端弹「请在电脑上核对数字」→ 用户无从核对，只能盲点「一致」→ SAS 人眼比对退化为无条件信任 | **条款改为可实现化**：Receiver 必须弹向导窗显示码 + 提供「一致/不一致」，「不一致」必须真发 `pair_reject`；**只落日志视为未实现** | Stage 5 核对（`pc/server.go:262`）；协议 §3.2:128 本就允许双向发 |
+| 2 | §8 菜单「复制诊断信息」 | 该项 `EmptyClipboard` 后写文本且**不快照不还原** → 直接丢弃用户原剪贴板内容；且可能被正在跑的还原定时器冲掉 | **改为「导出诊断信息」**：写 `logs\diagnostics-<ts>.txt` + 弹窗告知路径，**完全不碰剪贴板** | Stage 5 决策；`pc/clipboard_windows.go` 剪贴板语义仅用于图片 |
+| 3 | §0「`SCHEDULE_EXACT_ALARM` → targetSdk ≥ 33 **不申请、不使用** exact 闹钟」；§7.7 同款表述 | MIUI 实测：精确闹钟链**可用**，且白名单后 AM 放行 `code:SYSTEM_ALLOW_LISTED`（永久许可）；v1.3 的"不申请"是 AOSP 假设 | **改写条款**：API 33+ 用 `USE_EXACT_ALARM`（安装即授予）+ `setExactAndAllowWhileIdle`；≤API 32 的 `SCHEDULE_EXACT_ALARM` 仍不申请 | Stage 4 实测（08:25 白名单前闹钟被 `Pending user blocked` 挂起 → 加入白名单后立即触发） |
+| 4 | §7.6 开机流程「BootReceiver **只起**闹钟，闹钟触发时起 FGS」 | 实测 `MY_PACKAGE_REPLACED` / `BOOT_COMPLETED` 广播期间 AM 已放行后台 FGS（`code:PACKAGE_REPLACED` 临时许可 / `code:SYSTEM_ALLOW_LISTED` 永久许可）→ 广播直起可用且少一个 10 秒迟到窗口 | **改写条款**：广播内**直接起服务** + 精确闹钟兜底；并补三级降级链 | Stage 4 实测（09:29:22 `Background started FGS: Allowed`） |
+| 5 | §0 `minSdk = 31` | 实际实现 `minSdk = 33`（Android 13+），§7.5 的「API 31-33 dataSync 降级」分支因此不适用 | **改写为 `minSdk = 33`** | `AndroidManifest.xml` |
+| 6 | §3.2:122 配对记录在 `devices.json` | 实现写在 `config.json` 的 `devices[]` | **改写条款**为 `config.json`，语义不变 | `pc/config.go` |
+| 7 | §5.2:198 ACK `reason:"ext_rejected"` | 实现发 `invalid_name`（Android 侧不按该字符串分支，无兼容风险） | **回改代码**统一为 `ext_rejected` | Stage 5 |
+| 8 | §8:296-298 计划任务看门狗（M1 就做） | Stage 5 决策：不注册系统计划任务 | **移出本版范围** → §10 延后项 | Stage 5 决策 |
+| 9 | §8:289-292 网络自检四件套 | 诊断文本只有端口/防火墙存在性/设备数/日志尾部 | **保留条款并落地**：补通告 IP+网卡名、默认网关、网络 profile、规则路径比对、认证失败统计 | Stage 5 |
+| 10 | §8:299 环形 200 条 + 崩溃写退出码与最近 200 条 | 实现无环形缓冲，panic 只写一行文本 | **保留条款并落地** | Stage 5 |
+| 11 | §3.2:129 PC 显示「用户已拒绝配对」 | 实现文案为「手机端已拒绝配对」，且 PC 端**没有**"不一致"动作 | **改写条款**：PC 点「不一致」后 PC 显示「用户已拒绝配对」 | Stage 5 |
+| 12 | §7.7 Android 14 三态授权 | 实现只请求 `READ_MEDIA_IMAGES`，选「部分照片」后永远提示"权限未授予" | **保留条款并落地**：三态检测 + 引导全量 | Stage 5 |

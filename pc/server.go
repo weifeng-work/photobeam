@@ -16,6 +16,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -241,9 +243,11 @@ func handleConn(conn net.Conn) {
 				dev.LastIP, dev.LastPort = ip, cfg.TCPPort // last_port = PC 自身监听端口 [P1-01]
 				saveConfig(cfg)
 				logf("重连认证通过: %s", dev.DevName)
+				authStats.ok()
 				break
 			}
 			// 验签失败（pin 过期/伪造）→ 降级 pairing，SAS 人眼比对重建
+			authStats.fail("重连验签失败（对端身份不匹配）")
 			if authAttempts >= 1 {
 				logf("重连认证失败且已降级过，断开")
 				return
@@ -260,12 +264,75 @@ func handleConn(conn net.Conn) {
 		}
 		// pairing 分支
 		logf("配对模式 SAS=%s（等待手机 pair_confirm）", keys.SAS)
+		// [PC-1] 弹出配对向导窗：协议 §3.2 / 验收 §9.1 要求「两端同时展示 SAS」——
+		// 此前 PC 端只有这一行日志，用户看不到那 6 位数字，手机端的核对框无从完成
+		// 配对阶段要留出 pairTimeout（60s）给用户核对 6 位数字，帧超时（45s）盖不住 →
+		// 这里把连接截止时间延长到「向导超时 + 30s 余量」。
+		// [Stage 5 修订] 原先沿用 frameTimeout(45s) 配 15s 向导窗；窗口放宽到 60s 后必须同步放宽。
+		conn.SetDeadline(timeNow().Add(pairTimeout + 30*time.Second))
+		pw := showPairingWizard(keys.SAS, identity.FP(), senderHello.DevName)
+		defer pw.close()
+		// 向导窗的用户动作：点『不一致』→ 发 pair_reject（协议 §3.2：任一端均可发）；
+		// 60 秒超时 → 断开（与手机端 SAS 对话框 60s 等待对齐）
+		var pairingDecided int32 // 0=进行中 1=已决（原子：与主流程互斥）
+		go func() {
+			ev, ok := <-pw.events
+			if !ok {
+				// 会话被关闭且没有用户决策：
+				//   · 收到 pair_confirm 时主流程已 CAS（不会走到这里）
+				//   · 被**新**的向导窗取代（重复配对）→ 中断旧连接，别让旧连接干等 45 秒
+				if atomic.CompareAndSwapInt32(&pairingDecided, 0, 1) {
+					logf("配对向导窗被新会话取代，断开旧连接")
+					abortConn(conn)
+				}
+				return
+			}
+			switch ev {
+			case pairEvMatch:
+				// 点『一致』只关窗 —— PC 侧仍以程序比对 SAS 为准（绝不跳过校验）
+				logf("用户已核对 SAS（一致），继续等待手机 pair_confirm")
+			case pairEvMismatch:
+				if !atomic.CompareAndSwapInt32(&pairingDecided, 0, 1) {
+					return
+				}
+				logf("用户拒绝配对（已发送 pair_reject）")
+				if err := sendCtrl(conn, keys.Session, map[string]any{"type": "pair_reject"}); err != nil {
+					logErr("发送 pair_reject 失败: %v", err)
+				}
+				abortConn(conn)
+				// [Stage 5] 协议 §3.2 要求「Receiver 向导显示『用户已拒绝配对』」——
+				// 此前只有托盘气泡（多数情况下用户根本没注意到），现在给一个明确的对话框。
+				trayNotify("配对已拒绝", "你在电脑上点了『不一致』，已断开连接")
+				messageBox("你在电脑上点了『不一致』，已拒绝本次配对。\n"+
+					"连接已断开。请确认两端显示的 6 位数字确实不同，再重新配对。",
+					"PhotoBeam 配对已拒绝")
+			case pairEvTimeout:
+				if !atomic.CompareAndSwapInt32(&pairingDecided, 0, 1) {
+					return
+				}
+				logf("配对超时：%d 秒内未收到手机确认，已断开", pairTimeoutMs/1000)
+				abortConn(conn)
+				trayNotify("配对超时", fmt.Sprintf("%d 秒内未收到手机确认，连接已断开", pairTimeoutMs/1000))
+				messageBox(fmt.Sprintf("%d 秒内没有收到手机的确认，配对已取消。\n"+
+					"请重新点手机上的「② 配对电脑」，并在电脑上完成核对。", pairTimeoutMs/1000),
+					"PhotoBeam 配对超时")
+			}
+		}()
 		ft, pt, err := readEncFrame(conn, keys.Session)
 		if err != nil {
+			if atomic.LoadInt32(&pairingDecided) == 1 {
+				return // 用户拒绝 / 超时（原因已记日志）
+			}
 			logf("读认证帧失败: %v", err)
 			return
 		}
+		// 关闭向导窗并标记「已决」（否则看门 goroutine 会误报『被新会话取代』）
+		finish := func() {
+			atomic.StoreInt32(&pairingDecided, 1)
+			pw.close()
+		}
 		if ft != FrameCtrlJSON {
+			finish()
 			return
 		}
 		var m struct {
@@ -275,19 +342,35 @@ func handleConn(conn net.Conn) {
 			DevName string `json:"dev_name"`
 		}
 		if parseJSONInto(pt, &m) != nil {
+			finish()
 			return
 		}
 		if m.Type == "pair_reject" {
+			finish()
+			logf("手机端已拒绝配对（pair_reject）")
 			trayNotify("手机端已拒绝配对", "两端数字不一致，已断开")
+			// [Stage 5] 同上：手机上点了「不一致」/ 超时取消，电脑端也要明确告知用户
+			messageBox("手机端拒绝配对（两端显示的数字不一致），连接已断开。\n"+
+				"请确认中间没有第三方设备，然后重新配对。",
+				"PhotoBeam 配对未完成")
 			return
 		}
 		if m.Type != "pair_confirm" {
+			finish()
 			return
 		}
+		if !atomic.CompareAndSwapInt32(&pairingDecided, 0, 1) {
+			// 用户已点『不一致』或已超时 → 不再确认配对
+			finish()
+			return
+		}
+		pw.close() // 收到 pair_confirm → 关闭向导窗
 		if !ctEqual(m.SAS, keys.SAS) || !ed25519.Verify(ed25519.PublicKey(edRaw), th, mustDecode(m.Sig)) {
 			logf("配对校验失败（SAS 或签名），静默断开")
+			authStats.fail("配对校验失败（SAS 或签名不一致）")
 			return
 		}
+		authStats.ok()
 		okSig := ed25519.Sign(identity.EdPriv, th)
 		if err := sendCtrl(conn, keys.Session, map[string]any{"type": "pair_ok", "sig": b64encode(okSig)}); err != nil {
 			return
@@ -304,7 +387,8 @@ func handleConn(conn net.Conn) {
 
 	// 消息循环（文件接收）；落盘成功 → 剪贴板+弹窗（异步 [MiniMax 坑 6]）
 	logf("进入消息循环")
-	onFile := func(destPath string) {
+	// [PC-4] 弹窗显示**手机端原始文件名** + 已保存目录（落盘名带毫秒前缀，用户对不上）
+	onFile := func(destPath, origName, saveDir string) {
 		go goroutineSafe("clipboard+popup", func() {
 			if !cfg.ClipboardEnabled {
 				return
@@ -317,19 +401,29 @@ func handleConn(conn net.Conn) {
 			initClipboardFormats()
 			// 写入成功才弹窗承诺 [F-03]：失败只弹"写入失败"提示，绝不假承诺可粘贴
 			ok, snapNil := writeClipboardWithRestore(dib, pngData, cfg.ClipboardSeconds, nil)
-			name := filepath.Base(destPath)
+			name := origName
+			if name == "" {
+				name = filepath.Base(destPath)
+			}
+			saved := "已保存到 " + ellipsisTail(saveDir, 34) // [PC-4] 路径过长时保留尾部
 			if ok {
 				hint := "Ctrl+V 可粘贴 · " + fmt.Sprint(cfg.ClipboardSeconds) + " 秒后还原"
 				if snapNil {
 					hint = "原内容无可还原，本次不还原" // 中性表述：真因多为上一次同步的图 [S3-13]
 				}
-				showPopupThumb("已同步到剪贴板", name, hint, 5000, dib, imgW, imgH)
+				showPopupThumb4("已同步到剪贴板", name, hint, saved, 5000, dib, imgW, imgH)
 			} else {
-				showPopup("剪贴板写入失败", "图片已落盘", "剪贴板被其他程序长期占用", 5000)
+				showPopup4("剪贴板写入失败", name, "剪贴板被其他程序长期占用", saved, 5000)
 			}
 		})
 	}
 	messageLoop(conn, keys.Session, senderFP, onFile)
+}
+
+// abortConn：把连接截止时间推到过去 → 阻塞中的读立即返回
+// （用于『不一致』/ 配对超时后立即断开，不等 45 秒帧超时）
+func abortConn(conn net.Conn) {
+	_ = conn.SetDeadline(timeNow().Add(-time.Second))
 }
 
 func remoteOf(conn net.Conn) string { return conn.RemoteAddr().String() }
@@ -337,16 +431,17 @@ func remoteOf(conn net.Conn) string { return conn.RemoteAddr().String() }
 // ---------- 消息循环与文件接收（协议 §4/§5） ----------
 
 type rxFile struct {
-	fileID  string
-	name    string
-	size    int64
-	part    *os.File
-	hasher  hash.Hash
-	written int64
-	skip    bool // 幂等命中：吞掉剩余块
+	fileID   string
+	name     string
+	origName string // [PC-4] 手机端原始文件名（弹窗显示用）
+	size     int64
+	part     *os.File
+	hasher   hash.Hash
+	written  int64
+	skip     bool // 幂等命中：吞掉剩余块
 }
 
-func messageLoop(conn net.Conn, key []byte, senderFP string, onFileReceived func(string)) {
+func messageLoop(conn net.Conn, key []byte, senderFP string, onFileReceived func(string, string, string)) {
 	var rx *rxFile
 	for {
 		conn.SetDeadline(timeNow().Add(frameTimeout))
@@ -443,34 +538,95 @@ func handleFileMeta(conn net.Conn, key []byte, meta *struct {
 	// 文件名消毒 + 扩展名白名单（§5.2）
 	clean, err := sanitizeName(meta.Name)
 	if err != nil {
-		sendAck("error", "invalid_name", "permanent")
+		// [PC-10] 协议 §5.2:198：白名单外 → reason=ext_rejected（原为 invalid_name）
+		sendAck("error", "ext_rejected", "permanent")
+		logErr("文件名被拒: %q（%v）", meta.Name, err)
+		notifyRecvFailure("ext_rejected", "文件名不在白名单: "+meta.Name)
 		return &rxFile{fileID: meta.FileID, skip: true}
 	}
 	if meta.Size > maxFileSize {
 		sendAck("error", "file_too_large", "permanent")
+		logErr("文件过大被拒: %s（%d 字节 > 上限 %d）", meta.Name, meta.Size, maxFileSize)
+		notifyRecvFailure("file_too_large", fmt.Sprintf("文件超过 %d MB 上限: %s", maxFileSize>>20, meta.Name))
 		return &rxFile{fileID: meta.FileID, skip: true}
 	}
 	if meta.Size <= 0 {
 		// 0 字节 = 发送端未就绪/空文件 [P0-02]，一律拒绝
 		sendAck("error", "empty_file", "permanent")
+		logErr("空文件被拒: %s", meta.Name)
+		notifyRecvFailure("empty_file", "手机发来空文件: "+meta.Name)
 		return &rxFile{fileID: meta.FileID, skip: true}
 	}
 	// 磁盘配额（第二优先）[R-15]
-	if free, err := diskFreeBytes(cfg.SaveDir); err == nil && free < 500<<20 {
+	saveDir := getSaveDir()
+	if free, err := diskFreeBytes(saveDir); err == nil && free < 500<<20 {
 		sendAck("error", "disk_full", "permanent")
+		logErr("磁盘空间不足，拒收: %s（剩余 %d MB）", meta.Name, free>>20)
+		notifyRecvFailure("disk_full", fmt.Sprintf("磁盘剩余不足 500 MB（当前 %d MB）", free>>20))
 		return &rxFile{fileID: meta.FileID, skip: true}
 	}
-	part, err := os.Create(filepath.Join(cfg.SaveDir, ".tmp", meta.FileID+".part"))
+	part, err := os.Create(filepath.Join(saveDir, ".tmp", meta.FileID+".part"))
 	if err != nil {
 		sendAck("error", "io_error", "transient")
+		logErr("创建临时文件失败: %v", err)
+		notifyRecvFailure("io_error", "无法写入接收目录: "+err.Error())
 		return &rxFile{fileID: meta.FileID, skip: true}
 	}
 	logf("接收文件: %s (%d bytes) batch=%s", clean, meta.Size, meta.BatchID)
-	return &rxFile{fileID: meta.FileID, name: clean, size: meta.Size, part: part,
+	return &rxFile{fileID: meta.FileID, name: clean, origName: meta.Name, size: meta.Size, part: part,
 		hasher: sha256.New()}
 }
 
-func finalizeFile(conn net.Conn, key []byte, rx *rxFile, onFileReceived func(string)) {
+// notifyRecvFailure：接收失败的用户提示 —— 合并同类 + 限流 [PC-6]
+// 规则：错误类型变化时立即提示；同类错误 10 秒内只提示一次；一次成功后重置
+var recvFailState struct {
+	mu      sync.Mutex
+	lastKey string
+	lastAt  time.Time
+}
+
+func notifyRecvFailure(reason, detail string) {
+	recvFailState.mu.Lock()
+	now := timeNow()
+	dup := reason == recvFailState.lastKey && now.Sub(recvFailState.lastAt) < 10*time.Second
+	if !dup {
+		recvFailState.lastKey = reason
+		recvFailState.lastAt = now
+	}
+	recvFailState.mu.Unlock()
+	if dup {
+		return // 同类限流：只记日志，不打扰用户
+	}
+	title, l1, l2 := recvFailureText(reason, detail)
+	showPopup(title, l1, l2, 6000)
+}
+
+// resetRecvFailState：成功收图后清空限流状态（下次出错会重新提示）
+func resetRecvFailState() {
+	recvFailState.mu.Lock()
+	recvFailState.lastKey = ""
+	recvFailState.mu.Unlock()
+}
+
+// recvFailureText：ACK reason → 用户可读文案
+func recvFailureText(reason, detail string) (title, l1, l2 string) {
+	switch reason {
+	case "ext_rejected":
+		return "接收失败：文件名被拒", "只接受 jpg/png/webp/gif/bmp/heic", detail
+	case "file_too_large":
+		return "接收失败：文件过大", "单文件超过 200 MB 上限", detail
+	case "disk_full":
+		return "接收失败：磁盘空间不足", "接收目录剩余空间不足 500 MB", detail
+	case "io_error":
+		return "接收失败：写入出错", "无法写入接收目录（权限/路径问题）", detail
+	case "empty_file":
+		return "接收失败：空文件", "手机发来 0 字节文件", detail
+	default:
+		return "接收失败", reason, detail
+	}
+}
+
+func finalizeFile(conn net.Conn, key []byte, rx *rxFile, onFileReceived func(string, string, string)) {
 	sum := rx.hasher.Sum(nil)
 	fileID := fmt.Sprintf("%x", sum)
 	finalize := func(status, reason, class string) {
@@ -483,28 +639,32 @@ func finalizeFile(conn net.Conn, key []byte, rx *rxFile, onFileReceived func(str
 		rx.part.Close()
 		os.Remove(rx.part.Name())
 		finalize("error", "hash_mismatch", "transient")
-		logf("哈希不匹配: %s", rx.name)
+		logErr("哈希不匹配: %s", rx.name)
+		notifyRecvFailure("hash_mismatch", "文件校验失败（可能传输损坏）: "+rx.name)
 		return
 	}
+	saveDir := getSaveDir()
 	finalName := fmt.Sprintf("%d_%s", timeNow().UnixMilli(), rx.name)
-	dest := filepath.Join(cfg.SaveDir, finalName)
+	dest := filepath.Join(saveDir, finalName)
 	// 落盘名冲突加 -1/-2 后缀（协议 §5.2）[P2-06]
 	for i := 1; fileExists(dest); i++ {
 		ext := filepath.Ext(rx.name)
 		base := strings.TrimSuffix(rx.name, ext)
-		dest = filepath.Join(cfg.SaveDir, fmt.Sprintf("%d_%s-%d%s", timeNow().UnixMilli(), base, i, ext))
+		dest = filepath.Join(saveDir, fmt.Sprintf("%d_%s-%d%s", timeNow().UnixMilli(), base, i, ext))
 	}
 	if err := os.Rename(rx.part.Name(), dest); err != nil {
 		os.Remove(rx.part.Name()) // 残留清理 [P2-07]
 		finalize("error", "io_error", "transient")
-		logf("rename 失败: %v", err)
+		logErr("rename 失败: %v", err)
+		notifyRecvFailure("io_error", "落盘失败: "+err.Error())
 		return
 	}
 	addSeenID(rx.fileID)
 	finalize("ok", "ok", "permanent")
 	logf("落盘完成: %s", dest)
+	resetRecvFailState() // 成功一次 → 清掉限流状态（下次出错重新提示）[PC-6]
 	if onFileReceived != nil {
-		onFileReceived(dest)
+		onFileReceived(dest, rx.origName, saveDir)
 	}
 }
 

@@ -62,7 +62,8 @@ var (
 
 // 弹窗文字（自绘 [WM_PAINT]，不用 STATIC 子控件——主题化 STATIC 会无视
 // WM_CTLCOLORSTATIC 的深底白字，实测渲染成白底白字不可读）
-var popupText struct{ title, l1, l2 *uint16 }
+// l3 为可选第 4 行（PC-4：『已保存到 <目录>』）
+var popupText struct{ title, l1, l2, l3 *uint16 }
 
 type wndClassEx struct {
 	CbSize     uint32
@@ -107,11 +108,21 @@ var popupThumb struct {
 
 // 带缩略图的同步弹窗（onFile 专用）
 func showPopupThumb(title, line1, line2 string, durationMs int, dib []byte, w, h int) {
-	showPopupEx(title, line1, line2, durationMs, dib, w, h)
+	showPopupEx(title, line1, line2, "", durationMs, dib, w, h)
 }
 
 func showPopup(title, line1, line2 string, durationMs int) {
-	showPopupEx(title, line1, line2, durationMs, nil, 0, 0)
+	showPopupEx(title, line1, line2, "", durationMs, nil, 0, 0)
+}
+
+// showPopup4：带第 4 行的弹窗（PC-4：原始文件名 + 已保存目录）
+func showPopup4(title, line1, line2, line3 string, durationMs int) {
+	showPopupEx(title, line1, line2, line3, durationMs, nil, 0, 0)
+}
+
+// showPopupThumb4：带缩略图 + 第 4 行的弹窗（PC-4）
+func showPopupThumb4(title, line1, line2, line3 string, durationMs int, dib []byte, w, h int) {
+	showPopupEx(title, line1, line2, line3, durationMs, dib, w, h)
 }
 
 // 唯一实现：popupMu 全程串行化（同一时刻只有一个弹窗，文字不会串台 [R-3]）。
@@ -119,7 +130,7 @@ func showPopup(title, line1, line2 string, durationMs int) {
 // showPopup 又把 has 置回 false —— 缩略图状态在窗口建好之前就被清掉了，
 // 所以 WM_PAINT 永远走不到画缩略图的分支（v_popup2.png 只有文字没有图）。
 // 现改为：文字与缩略图状态都由 createPopupWindow 在 popupMu 内一次性设置。
-func showPopupEx(title, line1, line2 string, durationMs int, dib []byte, w, h int) {
+func showPopupEx(title, line1, line2, line3 string, durationMs int, dib []byte, w, h int) {
 	// [S3-8] 顶掉还在显示的旧弹窗（跨线程只能 PostMessage，不能直接 DestroyWindow）
 	if old := atomic.LoadUintptr(&activePopupHwnd); old != 0 {
 		procPostMessageW.Call(old, wmClose, 0, 0)
@@ -130,7 +141,7 @@ func showPopupEx(title, line1, line2 string, durationMs int, dib []byte, w, h in
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 		registerPopupClassOnce()
-		hwnd := createPopupWindow(title, line1, line2, dib, w, h)
+		hwnd := createPopupWindow(title, line1, line2, line3, dib, w, h)
 		if hwnd == 0 {
 			return
 		}
@@ -162,6 +173,18 @@ const wmPaint = 0x000F
 
 // 单行文本绘制（DrawTextW：CENTER|VCENTER|SINGLELINE，透明底）
 // cchText 必须 -1（表示以 \0 结尾）——传 0 = 零字符，什么都不画（实测返回 1）
+// ellipsisTail：过长时保留**尾部**并加省略号（路径尾部信息量最大）
+func ellipsisTail(s string, maxRunes int) string {
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	if maxRunes <= 1 {
+		return "…"
+	}
+	return "…" + string(r[len(r)-maxRunes+1:])
+}
+
 func drawTextLine(hdc uintptr, s *uint16, x, y, wd, ht int32, color uint32) {
 	if s == nil {
 		return
@@ -206,7 +229,7 @@ func popupWndProc(hwnd windows.HWND, msg uint32, wParam, lParam uintptr) uintptr
 		procDestroyWindowP.Call(uintptr(hwnd))
 		procPostQuitMessageP.Call(0)
 		return 0
-	case wmPaint: // 自绘三行文字（深底：标题白、正文灰）
+	case wmPaint: // 自绘文字（深底：标题白、正文灰）
 		// PAINTSTRUCT 在 x64 是 80 字节（原写 72 → BeginPaint 越界写 8 字节，踩栈）
 		var ps [80]byte
 		hdc, _, _ := procBeginPaintP.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&ps[0])))
@@ -230,6 +253,10 @@ func popupWndProc(hwnd windows.HWND, msg uint32, wParam, lParam uintptr) uintptr
 			drawTextLine(hdc, popupText.title, tx, 9, textW, 26, 0xFFFFFF)
 			drawTextLine(hdc, popupText.l1, tx, 40, textW, 22, 0xD0D0D0)
 			drawTextLine(hdc, popupText.l2, tx, 66, textW, 22, 0xB8B8B8)
+			// 第 4 行（PC-4：『已保存到 <目录>』）——有则窗口更高（见 createPopupWindow）
+			if popupText.l3 != nil {
+				drawTextLine(hdc, popupText.l3, tx, 92, textW, 22, 0x9AA0A6)
+			}
 			procEndPaintP.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&ps[0])))
 		}
 		return 0
@@ -253,9 +280,12 @@ func pumpMessages() {
 	}
 }
 
-func createPopupWindow(title, line1, line2 string, dib []byte, imgW, imgH int) uintptr {
+func createPopupWindow(title, line1, line2, line3 string, dib []byte, imgW, imgH int) uintptr {
 	w := int32(440)
 	h := int32(96)
+	if line3 != "" {
+		h = 120 // 加第 4 行（PC-4：『已保存到 <目录>』）
+	}
 	// 工作区（扣除任务栏）右下角 [F-07]：SystemParametersInfo(SPI_GETWORKAREA)
 	// 而非整屏尺寸——任务栏在左/顶部时也贴对角，且 DPI 感知后坐标不再被虚拟化
 	var wa struct{ L, T, R, B int32 }
@@ -269,6 +299,11 @@ func createPopupWindow(title, line1, line2 string, dib []byte, imgW, imgH int) u
 	w2, _ := windows.UTF16PtrFromString(line2)
 	// 自绘文字由 WM_PAINT 使用（同一时刻最多一个弹窗在显示）
 	popupText.title, popupText.l1, popupText.l2 = tw, w1, w2
+	popupText.l3 = nil
+	if line3 != "" {
+		w3, _ := windows.UTF16PtrFromString(line3)
+		popupText.l3 = w3
+	}
 	// 缩略图状态与文字同在 popupMu 内设置 → WM_PAINT 读到的一定是本弹窗自己的一份
 	if len(dib) > 40 && imgW > 0 && imgH > 0 {
 		popupThumb.dib = dib

@@ -33,6 +33,8 @@ class SenderService : Service() {
         const val ACTION_STOP = "photobeam.stop"
         /** 应用已在前台 → 重试恢复正规前台服务通知（解除降级态） */
         const val ACTION_ENSURE_FGS = "photobeam.ensure.fgs"
+        /** ③ 立即同步 → 立刻跑一轮对账+冲刷，并把结果写回 prefs 供 UI 回显 [A3] */
+        const val ACTION_SYNC_NOW = "photobeam.sync.now"
         /** 正规前台服务通知 id */
         const val NOTI_ID = 1
         /** 降级（普通通知）id：必须与 NOTI_ID 分离。
@@ -60,6 +62,29 @@ class SenderService : Service() {
          */
         @Volatile var iconMode = "none"
 
+        // ---------- [A6] 前台服务超时（Android 14+）降级开关 ----------
+
+        /** 前台服务被系统超时停止的连续次数（prefs key） */
+        const val PREFS_TIMEOUT_STREAK = "fgs_timeout_streak"
+        /** 「仅闹钟模式」开关（prefs key）：true = 不再申请前台服务身份，只靠心跳闹钟拉起 */
+        const val PREFS_ALARM_ONLY = "alarm_only"
+        /** 连续超时多少次后降级为「仅闹钟模式」 */
+        const val TIMEOUT_DEGRADE_THRESHOLD = 3
+
+        /**
+         * 「仅闹钟模式」：Android 14+ 上 dataSync/specialUse 前台服务会被系统超时停止 →
+         * onDestroy 撤通知 → **状态栏图标整体消失**（Stage 4 修好的失效模式在 API 34+ 复发）。
+         * 连续超时 [TIMEOUT_DEGRADE_THRESHOLD] 次后置位：不再 startForeground（再申请还是会被超时杀），
+         * 只靠心跳闹钟拉起服务。应用回到前台时自动解除（见 onStartCommand 的 ACTION_ENSURE_FGS）。
+         */
+        @Volatile var alarmOnlyMode = false
+
+        /**
+         * 「停止」动作用途的服务实例标记。
+         * 用它避免为"马上要停的服务"先建一次前台服务通知（状态栏图标会闪一下）。
+         */
+        @Volatile var stopRequested = false
+
         /** 上传动画 4 帧（独立 drawable，逐帧切换以保证状态栏重绘） */
         val UPLOAD_FRAMES = intArrayOf(
             R.drawable.ic_stat_up_0, R.drawable.ic_stat_up_1,
@@ -68,6 +93,31 @@ class SenderService : Service() {
         fun start(ctx: Context, action: String? = null) {
             val i = Intent(ctx, SenderService::class.java)
             if (action != null) i.action = action
+            // [A1] 停止动作：**不能**用 startForegroundService —— 系统会等 5 秒内 startForeground()，
+            // 而服务马上就 stopSelf 了 → 触发 ForegroundServiceDidNotStartInTime（正是 Stage 4 修掉的坑）。
+            // 停止不需要前台服务身份，用普通 startService 即可。
+            if (action == ACTION_STOP) {
+                stopRequested = true
+                try {
+                    ctx.startService(i)
+                } catch (e: Exception) {
+                    android.util.Log.w("PhotoBeam", "停止动作启动服务失败: ${e.message}")
+                    try { ctx.stopService(i) } catch (e2: Exception) { }
+                    stopRequested = false
+                }
+                return
+            }
+            // [A6] 仅闹钟模式：不再申请前台服务身份（Android 14+ 连续超时后系统会停掉前台服务 → 图标消失）。
+            // 普通 startService 不会触发"必须调 startForeground"的硬约束 → 不会自杀式崩溃。
+            if (alarmOnlyMode) {
+                try {
+                    ctx.startService(i)
+                    android.util.Log.d("PhotoBeam", "仅闹钟模式启动服务（非前台服务）")
+                } catch (e: Exception) {
+                    android.util.Log.w("PhotoBeam", "仅闹钟模式启动服务被拒: ${e.message}")
+                }
+                return
+            }
             try {
                 ctx.startForegroundService(i)
             } catch (e: Exception) {
@@ -164,6 +214,11 @@ class SenderService : Service() {
         super.onCreate()
         running = true
         prefs = getSharedPreferences("photobeam", Context.MODE_PRIVATE)
+        // [A1] 「停止」动作用途的实例：不建前台服务通知、不挂心跳闹钟（马上要停，别闪图标）
+        val stopping = stopRequested
+        stopRequested = false
+        // [A6] 恢复「仅闹钟模式」标记（降级态跨进程保留）
+        alarmOnlyMode = try { prefs.getBoolean(PREFS_ALARM_ONLY, false) } catch (e: Exception) { false }
         // 记住"后台 startForeground 已被系统拒绝"：闹钟拉起的是新实例，
         // 不记住就会每次都去试 → 又触发系统对同 id 通知的异步取消 → 图标闪没。
         fgsDenied = try { prefs.getBoolean("fgs_denied", false) } catch (e: Exception) { false }
@@ -191,15 +246,31 @@ class SenderService : Service() {
                     reconcileAndFlush()
                 }
             })
-        startForegroundCompat()
-        scheduleHeartbeat()
-        handler.post(tick)
+        // [A1] 「停止」动作拉起的实例：跳过前台服务通知与心跳排程（onStartCommand 会 stopSelf）
+        if (!stopping) {
+            startForegroundCompat()
+            scheduleHeartbeat()
+            handler.post(tick)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // [A1] 「停止」标记只对本次启动有效：
+        // 服务本来就在跑时 onCreate 不会执行（标记不会被消费），必须在这里清掉，
+        // 否则下一次闹钟拉起的新实例会误判成"停止用途"→ 不建前台服务通知、不挂心跳。
+        stopRequested = false
         if (intent?.action == ACTION_STOP) {
+            // [A1] 停止同步服务：撤掉心跳闹钟链（否则 5 分钟内又被闹钟拉起）+ 停服务
+            // → onDestroy 撤通知 → iconMode="none" → 状态栏图标消失（如实反映"服务未运行"）。
+            android.util.Log.d("PhotoBeam", "收到停止动作 → 停止同步服务")
+            cancelHeartbeat(this)
             stopSelf()
             return START_NOT_STICKY
+        }
+        // [A3] ③ 立即同步：立刻跑一轮对账+冲刷，结束时把结果写回 prefs（UI 轮询回显）
+        if (intent?.action == ACTION_SYNC_NOW) {
+            android.util.Log.d("PhotoBeam", "收到立即同步请求")
+            reconcileAndFlush(manual = true)
         }
         // [修复 2026-11-02] 服务已在跑时再被拉起（用户打开应用 / ④ 按钮 / 闹钟），
         // 重新发一次状态通知：若之前是"后台被拒"的降级态，此时应用在前台，
@@ -207,9 +278,49 @@ class SenderService : Service() {
         if (intent?.action == ACTION_ENSURE_FGS) {
             // 用户把应用拉到前台了 → 强制重试一次正规前台服务通知（此时系统允许 FGS）
             android.util.Log.d("PhotoBeam", "前台重试 FGS")
+            // [A6] 应用回到前台 = 用户有机会处理省电白名单 → 解除「仅闹钟模式」降级态，
+            // 恢复正规前台服务（若还是被系统超时，连续计数会重新开始）。
+            if (alarmOnlyMode) {
+                alarmOnlyMode = false
+                try { prefs.edit().putBoolean(PREFS_ALARM_ONLY, false).apply() } catch (e: Exception) { }
+                android.util.Log.d("PhotoBeam", "应用回到前台 → 解除仅闹钟降级态")
+            }
         }
         try { startForegroundCompat() } catch (e: Exception) { }
         return START_STICKY
+    }
+
+    /**
+     * Android 14+ 前台服务超时回调（协议 §7.5 [R-16]）
+     *
+     * 系统超时后会**停掉服务** → onDestroy 撤掉通知 → **状态栏图标整体消失**
+     * （这正是 Stage 4 刚修好的失效模式在 API 34+ 复发），只能等心跳闹钟（≤5 分钟）重拉。
+     *
+     * 这里：记日志 → 重新拉起服务（走 startForegroundCompat 那条路）→ 维护「连续超时次数」；
+     * 连续 [TIMEOUT_DEGRADE_THRESHOLD] 次 → 降级为「仅闹钟模式」（不再 startForeground，
+     * 只靠心跳闹钟拉起），并用 Notifier 事件通道通知用户去授予省电白名单。
+     *
+     * 注：API 33 上系统没有这个回调（minSdk=33，不会被调用）。
+     */
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        super.onTimeout(startId, fgsType)
+        val streak = try { prefs.getInt(PREFS_TIMEOUT_STREAK, 0) + 1 } catch (e: Exception) { 1 }
+        try { prefs.edit().putInt(PREFS_TIMEOUT_STREAK, streak).apply() } catch (e: Exception) { }
+        android.util.Log.w("PhotoBeam",
+            "前台服务被系统超时停止: startId=$startId fgsType=$fgsType 连续=$streak")
+        try {
+            if (streak >= TIMEOUT_DEGRADE_THRESHOLD) {
+                alarmOnlyMode = true
+                try { prefs.edit().putBoolean(PREFS_ALARM_ONLY, true).apply() } catch (e: Exception) { }
+                android.util.Log.w("PhotoBeam", "连续超时 $streak 次 → 降级为仅闹钟模式")
+                // 提示用户：授予省电白名单后前台服务才不会被反复超时
+                Notifier.batteryAdvice(applicationContext)
+            }
+            // 重新拉起服务（已降级则只走普通 startService，不申请前台服务身份）
+            SenderService.start(applicationContext)
+        } catch (e: Exception) {
+            android.util.Log.w("PhotoBeam", "超时后重拉服务失败: ${e.message}")
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -242,6 +353,11 @@ class SenderService : Service() {
         nm.createNotificationChannel(
             NotificationChannel(CH_OFF, "PhotoBeam · 未连接", NotificationManager.IMPORTANCE_MIN))
         val pending = pendingIntent(Intent(this, MainActivity::class.java))
+        // [A1] 通知里的「停止」动作：不打开应用也能停掉服务。
+        // 用 BroadcastReceiver + stopService（后台 stopService 不受"后台不能起服务"限制）。
+        val stopPi = PendingIntent.getBroadcast(this, 3,
+            Intent(this, StopReceiver::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_IMMUTABLE)
         val pc = pairing.loadPairedPC()
         val on = linkOk && pc != null
         val chId = if (on) CH_ON else CH_OFF
@@ -267,6 +383,8 @@ class SenderService : Service() {
                 .setContentText(notifyText ?: text)
                 .setContentIntent(pending)
                 .setOngoing(true)
+                // [A1] 通知动作：停止同步服务（不打开应用也能停）
+                .addAction(android.R.drawable.ic_menu_close_clear_cancel, "停止", stopPi)
                 .setSmallIcon(
                     if (iconLevel >= 0 && uploading)
                         UPLOAD_FRAMES[animLevel % UPLOAD_FRAMES.size]
@@ -305,6 +423,20 @@ class SenderService : Service() {
      */
     private fun postStatus(n: Notification, fallback: Notification) {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        // [A6] 仅闹钟模式：Android 14+ 前台服务被系统超时停止后，连续 3 次即降级。
+        // 此时**不再**调用 startForeground()：
+        //   ① 再申请身份 → 系统照样超时再杀（图标整体消失的循环）
+        //   ② 跳过 startForeground 而服务又是 startForegroundService 起的 → 30 秒后
+        //      ForegroundServiceDidNotStartInTime 杀进程（Stage 4 修掉的坑，不能再踩）
+        // 降级期间只发普通通知（独立 id=2，带自动过期），靠心跳闹钟拉起服务。
+        if (alarmOnlyMode) {
+            try { nm.cancel(NOTI_ID) } catch (e: Exception) { }
+            try { nm.notify(NOTI_ID_FALLBACK, fallback) } catch (e: Exception) { }
+            iconMode = "alarm"
+            try { prefs.edit().putString("icon_mode", iconMode).apply() } catch (e: Exception) { }
+            android.util.Log.d("PhotoBeam", "状态通知已发 mode=$iconMode（仅闹钟模式）")
+            return
+        }
         // ① 无条件调用 startForeground() —— 这是 startForegroundService() 的硬性对价：
         //    跳过它 = 30 秒后被系统杀进程（见上方缺陷①）。
         //    v1 用持久化 fgsDenied 标志跳过 → 08:20:45 / 08:34:59 两次
@@ -340,6 +472,12 @@ class SenderService : Service() {
             fgsDenied = false
             try { prefs.edit().putBoolean("fgs_denied", false).apply() } catch (e: Exception) { }
             try { prefs.edit().putString("icon_mode", iconMode).apply() } catch (e: Exception) { }
+            // [A6] 前台服务恢复正常 → 连续超时计数清零（"连续"的语义）
+            try {
+                if (prefs.getInt(PREFS_TIMEOUT_STREAK, 0) > 0) {
+                    prefs.edit().putInt(PREFS_TIMEOUT_STREAK, 0).apply()
+                }
+            } catch (e: Exception) { }
             android.util.Log.d("PhotoBeam", "状态通知已发 mode=$iconMode（正规前台服务）")
         } else {
             postFallback(nm, fallback)
@@ -390,17 +528,37 @@ class SenderService : Service() {
 
     // ---------- 对账与发送（全部在 workExecutor 线程） ----------
 
-    fun reconcileAndFlush() {
+    /**
+     * 对账 + 冲刷一轮。
+     * @param manual true = 由「③ 立即同步」触发（结果照样写回 prefs，UI 据此回显）
+     */
+    fun reconcileAndFlush(manual: Boolean = false) {
         workExecutor.execute {
             try {
-                doReconcileAndFlush()
+                doReconcileAndFlush(manual)
             } catch (e: Exception) {
                 android.util.Log.w("PhotoBeam", "reconcileAndFlush 异常", e)
             }
         }
     }
 
-    private fun doReconcileAndFlush() {
+    /** 本轮真正发出去的张数（用于「已发送 N 张」回执） */
+    private var flushedCount = 0
+
+    /** 把本轮同步结果写进 prefs（MainActivity 轮询回显）[A3] */
+    private fun recordSync(ok: Boolean, result: String, manual: Boolean) {
+        try {
+            prefs.edit()
+                .putLong("last_sync_at", System.currentTimeMillis())
+                .putBoolean("last_sync_ok", ok)
+                .putString("last_sync_result", result)
+                .putBoolean("last_sync_manual", manual)
+                .apply()
+            android.util.Log.d("PhotoBeam", "同步回执[$result] ok=$ok manual=$manual")
+        } catch (e: Exception) { }
+    }
+
+    private fun doReconcileAndFlush(manual: Boolean = false) {
         val pc = pairing.loadPairedPC()
         // 未配对也要对账入队（协议 §7.1：截图先进队列，配对后补发）
         val n = sync.reconcile()
@@ -409,6 +567,7 @@ class SenderService : Service() {
             android.util.Log.d("PhotoBeam", "未配对：对账新增 $n，队列 ${queue.pendingCount()}")
             updateNotification()
             scheduleHeartbeat()
+            recordSync(false, "未配对", manual)
             return
         }
         // 网络指纹前置判定 [N-06][P1-02]：不一致 → 立即提示并跳过发送（<1s，不进三通道扫描）
@@ -420,6 +579,7 @@ class SenderService : Service() {
             sync.reconcile()
             updateNotification("当前 WiFi 与配对时不同，请切回原网络")
             scheduleHeartbeat()
+            recordSync(false, "网络已切换 · 已跳过发送", manual)
             return
         }
         android.util.Log.d("PhotoBeam", "对账新增 $n")
@@ -432,6 +592,13 @@ class SenderService : Service() {
         } else {
             allOk
         }
+        // [A3] 本轮回执：已发送 N 张 / 未连接电脑 · 队列 N 张 / 无可发送图片
+        val result = when {
+            flushedCount > 0 -> "已发送 $flushedCount 张"
+            !allOk -> "未连接电脑 · 队列 ${queue.pendingCount()} 张"
+            else -> "无可发送图片"
+        }
+        recordSync(allOk || flushedCount > 0, result, manual)
         updateNotification()
         scheduleHeartbeat() // AlarmManager 自检心跳链 [P0-13]
     }
@@ -495,6 +662,7 @@ class SenderService : Service() {
         val pc = pairing.loadPairedPC() ?: return true
         var ok = true
         flushedSomething = false
+        flushedCount = 0 // [A3] 本轮发送计数（回执用）
         val pend = queue.pendingItems().sortedBy { it.capturedAt }
         if (pend.isEmpty()) {
             // 空队列 = 本轮不传输 → 动画必须停。
@@ -530,7 +698,7 @@ class SenderService : Service() {
             sock.tcpNoDelay = true
             sock.connect(java.net.InetSocketAddress(hit.ip, hit.port), 1500)
             sock.soTimeout = 45_000
-            val hs = pairing.handshake(sock, { _ -> false }, allowPairing = false)
+            val hs = pairing.handshake(sock, { _ -> SAS_CONFIRM }, allowPairing = false)
             if (hs.mode != "reconnect") {
                 throw java.io.IOException("对端要求重新配对（本端在后台发送路径，已断开）")
             }
@@ -542,13 +710,29 @@ class SenderService : Service() {
                 try {
                     it.state = "sending"
                     queue.save()
-                    // 发送时就绪判定 + 哈希 [方案 A/C]：读不到 → 跳过该项继续（blocked 永不丢弃 [§6.1]）
+                    // 发送时就绪判定 + 哈希 [方案 A/C]：读不到 → 分两种情况处理
+                    //   · URI 确实失效（MediaStore 行已删除）→ 标 dropped，不再重试 [协议 §7.3]
+                    //   · 文件还没写完/暂不可读 → 保持 pending，下轮重试（永不丢弃）
                     val data = Sender.readReady(this, it)
                     if (data == null) {
                         it.unreadyTries++
+                        if (Sender.uriDead(this, it)) {
+                            it.state = "dropped"
+                            it.dropReason = "uri_dead"
+                            queue.save()
+                            android.util.Log.w("PhotoBeam", "URI 已失效，丢弃: ${it.name} (unready=${it.unreadyTries})")
+                            Notifier.localDropped(applicationContext, it.name)
+                            continue
+                        }
                         it.state = "pending"
                         queue.save()
-                        android.util.Log.w("PhotoBeam", "文件未就绪: ${it.name} unready=${it.unreadyTries}")
+                        // 日志限流：前 3 次每次告警，之后每 20 次（≈10 分钟）告警一次，其余降为 debug。
+                        // [修复 2026-11-02] 此前每 30 秒刷一条 warn，个别长期不可读的文件会把日志刷爆。
+                        if (it.unreadyTries <= 3 || it.unreadyTries % 20 == 0) {
+                            android.util.Log.w("PhotoBeam", "文件未就绪: ${it.name} unready=${it.unreadyTries}")
+                        } else {
+                            android.util.Log.d("PhotoBeam", "文件未就绪(限流): ${it.name} unready=${it.unreadyTries}")
+                        }
                         continue
                     }
                     it.fileId = sha256(data).joinToString("") { "%02x".format(it) }
@@ -589,6 +773,7 @@ class SenderService : Service() {
                     it.state = "sent"
                     queue.save()
                     flushedSomething = true
+                    flushedCount++ // [A3] 回执：已发送 N 张
                     android.util.Log.d("PhotoBeam", "落盘确认: ${it.name}")
                 } catch (e: SendException) {
                     android.util.Log.w("PhotoBeam", "发送失败(${e.errClass}): ${it.name} reason=${e.reason}")
@@ -669,6 +854,41 @@ class UpgradeReceiver : BroadcastReceiver() {
     }
 }
 
+/**
+ * 通知里的「停止」动作（PendingIntent 带 ACTION_STOP）[A1]
+ *
+ * 用 BroadcastReceiver + stopService 而不是 startForegroundService(ACTION_STOP)：
+ *   ① 后台"起服务"在 Android 8+ 受限，而"停服务"不受限；
+ *   ② startForegroundService 会给系统一个"5 秒内必须 startForeground"的欠条，
+ *      而停止流程根本不会调 startForeground → 触发 ForegroundServiceDidNotStartInTime。
+ */
+class StopReceiver : BroadcastReceiver() {
+    override fun onReceive(ctx: Context, intent: Intent) {
+        if (intent.action != SenderService.ACTION_STOP) return
+        android.util.Log.d("PhotoBeam", "收到通知「停止」动作 → 停止同步服务")
+        try {
+            ctx.stopService(Intent(ctx, SenderService::class.java))
+        } catch (e: Exception) {
+            android.util.Log.w("PhotoBeam", "stopService 失败: ${e.message}")
+        }
+        // 撤掉心跳闹钟链（否则 ≤5 分钟后又被闹钟拉起，"停止"名不副实）
+        cancelHeartbeat(ctx)
+        // 兜底撤通知（服务没在跑时不会有 onDestroy）
+        try {
+            (ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+                .apply {
+                    cancel(SenderService.NOTI_ID)
+                    cancel(SenderService.NOTI_ID_FALLBACK)
+                }
+        } catch (e: Exception) { }
+        SenderService.iconMode = "none"
+        try {
+            ctx.getSharedPreferences("photobeam", Context.MODE_PRIVATE)
+                .edit().putString("icon_mode", "none").apply()
+        } catch (e: Exception) { }
+    }
+}
+
 /** 精确闹钟是否可用：API 31/32 需 SCHEDULE_EXACT_ALARM（用户授权），API 33+ 用 USE_EXACT_ALARM */
 fun canExactAlarm(ctx: Context): Boolean {
     if (android.os.Build.VERSION.SDK_INT < 31) return true
@@ -677,6 +897,28 @@ fun canExactAlarm(ctx: Context): Boolean {
     }
     return granted(android.Manifest.permission.SCHEDULE_EXACT_ALARM) ||
         (android.os.Build.VERSION.SDK_INT >= 33 && granted(android.Manifest.permission.USE_EXACT_ALARM))
+}
+
+/**
+ * 取消心跳闹钟链 [A1]
+ *
+ * 「停止同步服务」必须同时撤掉心跳闹钟：否则 ≤5 分钟后 AlarmReceiver 又把服务拉起来，
+ * "停止"只停了 5 分钟。
+ * requestCode 1 = 周期心跳链（与"立刻起服务"的一次性闹钟 requestCode 2 互不覆盖）。
+ */
+fun cancelHeartbeat(ctx: Context) {
+    try {
+        val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val pi = PendingIntent.getBroadcast(ctx, 1, Intent(ctx, AlarmReceiver::class.java),
+            PendingIntent.FLAG_IMMUTABLE)
+        am.cancel(pi)
+    } catch (e: Exception) {
+        android.util.Log.w("PhotoBeam", "取消心跳闹钟失败: ${e.message}")
+    }
+    try {
+        ctx.getSharedPreferences("photobeam", Context.MODE_PRIVATE)
+            .edit().putLong("next_alarm_at", 0L).apply()
+    } catch (e: Exception) { }
 }
 
 /**

@@ -78,18 +78,90 @@ func goroutineSafe(name string, fn func()) {
 	fn()
 }
 
-var logMu sync.Mutex
+// 日志分级（PC-9）：logf 保持既有签名与调用点不变（INFO），新增 logWarn / logErr
+const (
+	logLevelInfo  = "INFO"
+	logLevelWarn  = "WARN"
+	logLevelError = "ERROR"
+)
 
-func appendLog(line string) {
+const (
+	logRingMax    = 200       // 内存环形缓冲条数（协议 §8：崩溃时带最后 200 条）
+	logRotateSize = 5 << 20   // 单个日志文件超过 5MB 轮转
+	logRotateKeep = 3         // 最多保留 3 份历史（pc.log.1 ~ pc.log.3）
+)
+
+var (
+	logMu   sync.Mutex
+	logRing []string // 内存环形缓冲（最近 200 条）
+)
+
+// appendLog：写文件 + 写内存环形缓冲（200 条）[PC-8]
+func appendLog(level, line string) {
 	logMu.Lock()
 	defer logMu.Unlock()
-	f, err := os.OpenFile(filepath.Join(appDir(), "logs", "pc.log"),
-		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	full := fmt.Sprintf("[%s] [%s] %s", timeNow().Format("2006-01-02 15:04:05"), level, line)
+	logRing = append(logRing, full)
+	if len(logRing) > logRingMax {
+		logRing = append(logRing[:0], logRing[len(logRing)-logRingMax:]...)
+	}
+	p := filepath.Join(appDir(), "logs", "pc.log")
+	if err := rotateLogIfNeeded(p); err != nil {
+		fmt.Fprintln(os.Stderr, "日志轮转失败:", err)
+	}
+	f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return
 	}
 	defer f.Close()
-	fmt.Fprintf(f, "[%s] %s\r\n", timeNow().Format("2006-01-02 15:04:05"), line)
+	fmt.Fprintf(f, "%s\r\n", full)
+}
+
+// rotateLogIfNeeded：单文件超过 5MB 时改名为 .1（最多保留 3 份）[PC-9]
+// 调用方持有 logMu —— 内部不得再调用 log*（会自锁）。
+func rotateLogIfNeeded(path string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil // 文件还不存在 → 无需轮转（不是错误）
+	}
+	if fi.Size() < logRotateSize {
+		return nil
+	}
+	os.Remove(path + ".3")
+	os.Rename(path+".2", path+".3")
+	os.Rename(path+".1", path+".2")
+	return os.Rename(path, path+".1")
+}
+
+// logTail：返回内存环形缓冲里最近 n 条（崩溃 dump 用）[PC-8]
+func logTail(n int) []string {
+	logMu.Lock()
+	defer logMu.Unlock()
+	if n > len(logRing) {
+		n = len(logRing)
+	}
+	out := make([]string, n)
+	copy(out, logRing[len(logRing)-n:])
+	return out
+}
+
+// logf / logWarn / logErr：日志分级（PC-9）
+func logf(format string, a ...any) {
+	s := fmt.Sprintf(format, a...)
+	appendLog(logLevelInfo, AppName+" "+s)
+	fmt.Println(s)
+}
+
+func logWarn(format string, a ...any) {
+	s := fmt.Sprintf(format, a...)
+	appendLog(logLevelWarn, AppName+" "+s)
+	fmt.Println(logLevelWarn + " " + s)
+}
+
+func logErr(format string, a ...any) {
+	s := fmt.Sprintf(format, a...)
+	appendLog(logLevelError, AppName+" "+s)
+	fmt.Println(logLevelError + " " + s)
 }
 
 // ---------- Win32 ----------
