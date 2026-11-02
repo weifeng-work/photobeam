@@ -725,7 +725,9 @@ func browseForFolder(owner uintptr, initial, title string) string {
 	}
 	hwnd, _, _ := procSHBrowseForFolderW.Call(uintptr(unsafe.Pointer(&bi)))
 	if hwnd == 0 {
-		logWarn("文件夹选择器打开失败（SHBrowseForFolderW 返回 0）")
+		// SHBrowseForFolderW 返回 0 有两种可能：用户按「取消」，或对话框根本没打开。
+		// 两者在这里无法区分（该 API 不设 last error），措辞不要断言「打开失败」。
+		logf("文件夹选择器未返回结果（用户取消，或对话框未能打开）")
 		return ""
 	}
 	defer procCoTaskMemFree.Call(hwnd)
