@@ -3,7 +3,7 @@
 手机截图/图片 → 局域网 → Windows 剪贴板的极简自研工具。
 拍完照，电脑上直接 Ctrl+V。不经过任何云，数据不出局域网。
 
-协议规范：`docs/protocol-v1.md`（**v1.4**）
+协议规范：`docs/protocol-v1.md`（**v1.5**）
 使用手册（按步骤走，含已知限制）：**`docs/user-journey.md`**
 
 ## 安装与使用

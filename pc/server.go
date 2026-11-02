@@ -270,54 +270,69 @@ func handleConn(conn net.Conn) {
 		// 这里把连接截止时间延长到「向导超时 + 30s 余量」。
 		// [Stage 5 修订] 原先沿用 frameTimeout(45s) 配 15s 向导窗；窗口放宽到 60s 后必须同步放宽。
 		conn.SetDeadline(timeNow().Add(pairTimeout + 30*time.Second))
-		pw := showPairingWizard(keys.SAS, identity.FP(), senderHello.DevName)
-		defer pw.close()
+		//
+		// [Stage 5 修复 · 配对意图 + 单实例]
+		// (1) 意图：只有 Sender 明确声明「用户主动发起配对」(HELLO.pair_intent=true，
+		//     字段缺省按 true 处理以兼容旧版本)才弹向导窗。
+		//     手机端的**后台同步服务每 30 秒自动重连一次**，若也弹窗，
+		//     用户正在核对的窗口会被反复顶掉（实测 19:11~19:16 每 30 秒弹一个新窗）。
+		// (2) 单实例：showPairingWizard 内部保证同一时刻只有一个向导窗。
+		//     pw == nil 时人眼核对根本未发生 —— 即便收到 pair_confirm 也必须拒绝（fail closed）。
+		var pw *pairingSession
+		if senderHello.pairIntent() {
+			pw = showPairingWizard(keys.SAS, identity.FP(), senderHello.DevName)
+			defer pw.close()
+		} else {
+			logf("后台连接请求配对（pair_intent=false）：按协议不弹向导窗，人眼核对不成立")
+		}
 		// 向导窗的用户动作：点『不一致』→ 发 pair_reject（协议 §3.2：任一端均可发）；
 		// 60 秒超时 → 断开（与手机端 SAS 对话框 60s 等待对齐）
 		var pairingDecided int32 // 0=进行中 1=已决（原子：与主流程互斥）
-		go func() {
-			ev, ok := <-pw.events
-			if !ok {
-				// 会话被关闭且没有用户决策：
-				//   · 收到 pair_confirm 时主流程已 CAS（不会走到这里）
-				//   · 被**新**的向导窗取代（重复配对）→ 中断旧连接，别让旧连接干等 45 秒
-				if atomic.CompareAndSwapInt32(&pairingDecided, 0, 1) {
-					logf("配对向导窗被新会话取代，断开旧连接")
+		if pw != nil {
+			go func() {
+				ev, ok := <-pw.events
+				if !ok {
+					// 会话被关闭且没有用户决策：
+					//   · 收到 pair_confirm 时主流程已 CAS（不会走到这里）
+					//   · 被**新**的向导窗取代（重复配对）→ 中断旧连接，别让旧连接干等 45 秒
+					if atomic.CompareAndSwapInt32(&pairingDecided, 0, 1) {
+						logf("配对向导窗被新会话取代，断开旧连接")
+						abortConn(conn)
+					}
+					return
+				}
+				switch ev {
+				case pairEvMatch:
+					// 点『一致』只关窗 —— PC 侧仍以程序比对 SAS 为准（绝不跳过校验）
+					logf("用户已核对 SAS（一致），继续等待手机 pair_confirm")
+				case pairEvMismatch:
+					if !atomic.CompareAndSwapInt32(&pairingDecided, 0, 1) {
+						return
+					}
+					logf("用户拒绝配对（已发送 pair_reject）")
+					if err := sendCtrl(conn, keys.Session, map[string]any{"type": "pair_reject"}); err != nil {
+						logErr("发送 pair_reject 失败: %v", err)
+					}
 					abortConn(conn)
+					// [Stage 5] 协议 §3.2 要求「Receiver 向导显示『用户已拒绝配对』」——
+					// 此前只有托盘气泡（多数情况下用户根本没注意到），现在给一个明确的对话框。
+					trayNotify("配对已拒绝", "你在电脑上点了『不一致』，已断开连接")
+					messageBox("你在电脑上点了『不一致』，已拒绝本次配对。\n"+
+						"连接已断开。请确认两端显示的 6 位数字确实不同，再重新配对。",
+						"PhotoBeam 配对已拒绝")
+				case pairEvTimeout:
+					if !atomic.CompareAndSwapInt32(&pairingDecided, 0, 1) {
+						return
+					}
+					logf("配对超时：%d 秒内未收到手机确认，已断开", pairTimeoutMs/1000)
+					abortConn(conn)
+					trayNotify("配对超时", fmt.Sprintf("%d 秒内未收到手机确认，连接已断开", pairTimeoutMs/1000))
+					messageBox(fmt.Sprintf("%d 秒内没有收到手机的确认，配对已取消。\n"+
+						"请重新点手机上的「② 配对电脑」，并在电脑上完成核对。", pairTimeoutMs/1000),
+						"PhotoBeam 配对超时")
 				}
-				return
-			}
-			switch ev {
-			case pairEvMatch:
-				// 点『一致』只关窗 —— PC 侧仍以程序比对 SAS 为准（绝不跳过校验）
-				logf("用户已核对 SAS（一致），继续等待手机 pair_confirm")
-			case pairEvMismatch:
-				if !atomic.CompareAndSwapInt32(&pairingDecided, 0, 1) {
-					return
-				}
-				logf("用户拒绝配对（已发送 pair_reject）")
-				if err := sendCtrl(conn, keys.Session, map[string]any{"type": "pair_reject"}); err != nil {
-					logErr("发送 pair_reject 失败: %v", err)
-				}
-				abortConn(conn)
-				// [Stage 5] 协议 §3.2 要求「Receiver 向导显示『用户已拒绝配对』」——
-				// 此前只有托盘气泡（多数情况下用户根本没注意到），现在给一个明确的对话框。
-				trayNotify("配对已拒绝", "你在电脑上点了『不一致』，已断开连接")
-				messageBox("你在电脑上点了『不一致』，已拒绝本次配对。\n"+
-					"连接已断开。请确认两端显示的 6 位数字确实不同，再重新配对。",
-					"PhotoBeam 配对已拒绝")
-			case pairEvTimeout:
-				if !atomic.CompareAndSwapInt32(&pairingDecided, 0, 1) {
-					return
-				}
-				logf("配对超时：%d 秒内未收到手机确认，已断开", pairTimeoutMs/1000)
-				abortConn(conn)
-				trayNotify("配对超时", fmt.Sprintf("%d 秒内未收到手机确认，连接已断开", pairTimeoutMs/1000))
-				messageBox(fmt.Sprintf("%d 秒内没有收到手机的确认，配对已取消。\n"+
-					"请重新点手机上的「② 配对电脑」，并在电脑上完成核对。", pairTimeoutMs/1000),
-					"PhotoBeam 配对超时")
-			}
-		}()
+			}()
+		}
 		ft, pt, err := readEncFrame(conn, keys.Session)
 		if err != nil {
 			if atomic.LoadInt32(&pairingDecided) == 1 {
@@ -329,7 +344,9 @@ func handleConn(conn net.Conn) {
 		// 关闭向导窗并标记「已决」（否则看门 goroutine 会误报『被新会话取代』）
 		finish := func() {
 			atomic.StoreInt32(&pairingDecided, 1)
-			pw.close()
+			if pw != nil {
+				pw.close()
+			}
 		}
 		if ft != FrameCtrlJSON {
 			finish()
@@ -361,6 +378,15 @@ func handleConn(conn net.Conn) {
 		}
 		if !atomic.CompareAndSwapInt32(&pairingDecided, 0, 1) {
 			// 用户已点『不一致』或已超时 → 不再确认配对
+			finish()
+			return
+		}
+		// [Stage 5 修复 · fail closed] 没弹向导窗 = 用户从未看见 PC 端的 6 位码，
+		// 人眼核对没有发生 → **不能接受配对**。
+		// （程序侧 SAS 比对只能证明两端算出同一个数，证明不了「没有人被中间人骗过」。）
+		if pw == nil {
+			logf("收到 pair_confirm 但本端未展示 SAS 向导窗（pair_intent=false），拒绝配对")
+			authStats.fail("未展示 SAS 向导窗却收到 pair_confirm")
 			finish()
 			return
 		}

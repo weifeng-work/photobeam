@@ -109,7 +109,8 @@ func onReady() {
 			go goroutineSafe("set-savedir", func() {
 				runtime.LockOSThread()
 				defer runtime.UnlockOSThread()
-				dir := browseForFolder(getSaveDir(), "选择图片接收文件夹")
+				// owner=0：托盘路径没有向导窗这种 TOPMOST 窗口压着，无主对话框照样能置前
+				dir := browseForFolder(0, getSaveDir(), "选择图片接收文件夹")
 				if dir == "" {
 					return // 用户取消
 				}

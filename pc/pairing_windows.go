@@ -64,8 +64,12 @@ var (
 
 	procSHBrowseForFolderW   = shell32.NewProc("SHBrowseForFolderW")
 	procSHGetPathFromIDListW = shell32.NewProc("SHGetPathFromIDListW")
+	procILCreateFromPathW    = shell32.NewProc("ILCreateFromPathW") // 路径 → ITEMIDLIST(PIDL)
+	procILFree               = shell32.NewProc("ILFree")            // 释放 PIDL
 	ole32                   = windows.NewLazySystemDLL("ole32.dll")
 	procCoTaskMemFree        = ole32.NewProc("CoTaskMemFree")
+	procCoInitializeEx       = ole32.NewProc("CoInitializeEx")
+	procCoUninitialize       = ole32.NewProc("CoUninitialize")
 )
 
 // 向导窗客户区尺寸与子控件 ID
@@ -99,6 +103,11 @@ const (
 	pairTimeout   = 60 * time.Second
 	pairTimeoutMs = int(pairTimeout / time.Millisecond)
 
+	// pairReplaceWait：新配对向导窗开出来之前，等旧窗口真正销毁的上限。
+	// 正常情况几毫秒就结束；超时的唯一可能是旧窗口正卡在模态框里（文件夹选择器），
+	// 那时也不能无限等——最多让屏幕上短暂并存两个窗，也不能卡住新会话。
+	pairReplaceWait = 2 * time.Second
+
 	wsChildVis    = 0x40000000 | 0x10000000
 	wsTabStop     = 0x00010000
 	wsBorder      = 0x00800000
@@ -108,6 +117,10 @@ const (
 	bifEditBox    = 0x00000002
 	bffmInit      = 0x0401 // WM_USER+1
 	bffmSetSelW   = 0x0438 // WM_USER+56 BFFM_SETSELECTIONW
+
+	// COM 初始化
+	coinitApartmentThreaded = 0x2 // COINIT_APARTMENTTHREADED
+	coinitSFalse            = 1   // S_FALSE：线程已初始化过，仍需配一次 CoUninitialize
 
 	// 普通窗口样式（带标题栏）
 	wsOverlapped  = 0x00000000
@@ -149,6 +162,13 @@ type pairingSession struct {
 	devName string
 	events  chan pairEvent
 	closed  bool
+	// closeReq：已请求关闭。**用于修「关闭请求早于窗口创建」的竞态**：
+	// 旧实现里 close() 读到的 p.hwnd 可能还是 0（窗口已可见但句柄还没写回），
+	// 于是 WM_CLOSE 根本没发出去 → 旧窗口永久留在屏幕上（实测一次弹两个配对窗）。
+	closeReq bool
+	// gone：窗口**彻底销毁**后关闭（单实例等待用）。
+	// 保证新向导窗开出来之前，旧窗口已经从屏幕上消失。
+	gone chan struct{}
 }
 
 var (
@@ -179,6 +199,9 @@ func (p *pairingSession) close() {
 		return
 	}
 	p.closed = true
+	// [Stage 5 修复] 置 closeReq：即使此刻 p.hwnd 还是 0（窗口已建但句柄还没写回），
+	// 创建 goroutine 也会在写回句柄后立刻把窗口销毁掉 —— 杜绝「关了没关掉」的残窗。
+	p.closeReq = true
 	h := p.hwnd
 	close(p.events)
 	p.mu.Unlock()
@@ -209,7 +232,14 @@ func clearActivePair(p *pairingSession) {
 	}
 }
 
-// showPairingWizard：弹出配对向导窗（同一时刻只允许一个，重复配对先关旧的）
+// showPairingWizard：弹出配对向导窗
+//
+// [Stage 5 修复 · 真正的单实例]
+//   旧实现的「同一时刻只允许一个」是假的：它只把旧会话标记为关闭（PostMessage WM_CLOSE），
+//   **不保证旧窗口真的消失**，于是屏幕上会同时挂着两个配对确认窗（实测复现）。
+//   现在：① 关闭请求先于窗口创建到达时，创建端立即销毁（closeReq）；
+//         ② 新窗口开出来之前**等旧窗口确实销毁**（gone 通道），保证任意时刻至多一个可见向导窗。
+//
 // 返回会话对象：调用方用 close() 主动关窗，用 events 接收用户动作
 func showPairingWizard(sas, fp, devName string) *pairingSession {
 	p := &pairingSession{
@@ -217,13 +247,22 @@ func showPairingWizard(sas, fp, devName string) *pairingSession {
 		fp:      fp,
 		devName: devName,
 		events:  make(chan pairEvent, 4),
+		gone:    make(chan struct{}),
 	}
 	if old := setActivePair(p); old != nil {
 		old.close() // 旧向导窗先关（PC-1：同一时刻只允许一个向导窗）
+		// 等旧窗口彻底销毁再开新的 —— 否则屏幕上会同时出现两个配对确认窗。
+		select {
+		case <-old.gone:
+		case <-time.After(pairReplaceWait):
+			logWarn("旧配对向导窗未在 %v 内销毁，仍继续开新窗", pairReplaceWait)
+		}
 	}
 	go func() {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
+		// 无论走哪条退出路径，都要告诉「等着开新窗的那一方」：这个窗口已经没了。
+		defer close(p.gone)
 		registerPairingClassOnce()
 		hwnd := createPairingWindow(p)
 		if hwnd == 0 {
@@ -234,10 +273,17 @@ func showPairingWizard(sas, fp, devName string) *pairingSession {
 		}
 		p.mu.Lock()
 		p.hwnd = hwnd
+		needClose := p.closeReq
 		p.mu.Unlock()
 		pairWinMu.Lock()
 		pairWinMap[hwnd] = p
 		pairWinMu.Unlock()
+		if needClose {
+			// 关闭请求先于窗口创建到达 → 立即销毁，绝不留下残窗
+			procDestroyWindowP.Call(hwnd)
+			procPostQuitMessageP.Call(0)
+			return
+		}
 		// 超时定时器（WM_TIMER → pairEvTimeout）
 		procSetTimerP.Call(hwnd, 1, uintptr(pairTimeoutMs), 0)
 		procShowWindowP.Call(hwnd, 5) // SW_SHOW
@@ -435,7 +481,11 @@ func createPairingWindow(p *pairingSession) uintptr {
 		uintptr(exStyle),
 		uintptr(unsafe.Pointer(clsName)),
 		uintptr(unsafe.Pointer(title)),
-		uintptr(style|wsVisible),
+		// [Stage 5 修复] **不带 WS_VISIBLE**：窗口先以隐藏状态创建，
+		// 等句柄写回会话、且确认没有「提前到达的关闭请求」之后才 ShowWindow。
+		// 否则会出现「窗口已经可见、但会话还不知道它的句柄」的窗口期——
+		// 那个窗口期里来的 close() 读到的 hwnd 是 0，旧窗口就永远关不掉了。
+		uintptr(style),
 		uintptr(x), uintptr(y), uintptr(ow), uintptr(oh),
 		0, 0, hInst, 0)
 	if hwnd == 0 {
@@ -556,7 +606,7 @@ func setWindowText(hwnd uintptr, s string) {
 
 // onBrowseDir：『浏览…』→ SHBrowseForFolderW → 立即写回配置
 func onBrowseDir(parent uintptr) {
-	dir := browseForFolder(getSaveDir(), "选择图片接收文件夹")
+	dir := browseForFolder(parent, getSaveDir(), "选择图片接收文件夹")
 	if dir == "" {
 		return // 用户取消
 	}
@@ -599,7 +649,7 @@ var (
 
 type browseInfo struct {
 	hwndOwner      uintptr
-	pszRootDir     uintptr
+	pidlRoot       uintptr // LPCITEMIDLIST —— **必须是 PIDL，不能是路径字符串**
 	pszDisplayName uintptr
 	lpszTitle      uintptr
 	ulFlags        uint32
@@ -625,7 +675,22 @@ func browseCallback(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	return 0
 }
 
-func browseForFolder(initial, title string) string {
+func browseForFolder(owner uintptr, initial, title string) string {
+	// [Stage 5 修复] 必须先初始化 COM：
+	// SHBrowseForFolderW 在 BIF_NEWDIALOGSTYLE（Vista+ 的新样式）下走 shell 的 COM 实现，
+	// **线程没初始化 COM 时对话框能弹出来，但左侧目录树是全空的**（用户实机反馈「预览窗口空白」）。
+	// 必须在**调用 SHBrowseForFolderW 的同一个线程**上初始化——
+	// 本函数由向导窗的 WM_COMMAND 处理路径调用，那已经是向导窗自己的专用 OS 线程 ✔。
+	hr, _, _ := procCoInitializeEx.Call(0, coinitApartmentThreaded)
+	// S_OK(0) / S_FALSE(1) 都表示「本线程已被初始化」→ 必须配一次 CoUninitialize；
+	// 负值（如 RPC_E_CHANGED_MODE）表示本线程已用别的模型初始化过 → 不能反初始化。
+	needUninit := hr == 0 || hr == coinitSFalse
+	if needUninit {
+		defer procCoUninitialize.Call()
+	} else {
+		logWarn("CoInitializeEx 返回 0x%X（本线程 COM 模型已存在），继续", uint32(hr))
+	}
+
 	browseMu.Lock()
 	browseTarget = initial
 	browseMu.Unlock()
@@ -635,16 +700,26 @@ func browseForFolder(initial, title string) string {
 
 	displayName := make([]uint16, 260)
 	titlePtr, _ := windows.UTF16PtrFromString(title)
-	var rootPtr uintptr
-	if initial != "" {
-		if p, err := windows.UTF16PtrFromString(initial); err == nil {
-			rootPtr = uintptr(unsafe.Pointer(p))
-		}
-	}
+
+	// [Stage 5 修复 · 目录树空白的真正根因]
+	// SHBrowseForFolder 的第二个参数是 **LPCITEMIDLIST（PIDL）**，不是路径字符串。
+	// 此前这里直接把路径字符串的指针塞进了那个槽位 —— shell 拿它当 ITEMIDLIST 解析，
+	// 得到的是垃圾 → 左侧目录树一个节点都没有（实测 TREE_ITEM_COUNT=0，
+	// 用户反馈「选择图片接收文件夹预览窗口空白」；独立复现器里甚至直接把 shell32 打成访问违例）。
+	//
+	// 根节点取 **NULL（桌面）** 而不是当前保存目录：
+	// 根 = 当前目录时目录树只显示该目录的子树，**用户没法往上导航到别的盘/别的位置**，
+	// 而这个对话框的用途恰恰是「换一个位置」。
+	// 「打开时落在当前目录」由 BFFM_SETSELECTIONW 负责（见 browseCallback）。
+	var pidlRoot uintptr // = 0 → 根 = 桌面（完整命名空间树）
 	bi := browseInfo{
+		// [Stage 5 修复] 传 owner：向导窗是 WS_EX_TOPMOST，
+		// 不设 owner 的话选择器对话框会被压在向导窗**下面**（用户完全看不到目录树）。
+		// 设了 owner 之后，对话框是向导窗的 owned 窗口 → 永远显示在主人之上。
+		hwndOwner:      owner,
 		ulFlags:        bifReturnOnly | bifNewDialog | bifEditBox,
 		lpszTitle:      uintptr(unsafe.Pointer(titlePtr)),
-		pszRootDir:     rootPtr,
+		pidlRoot:       pidlRoot,
 		pszDisplayName: uintptr(unsafe.Pointer(&displayName[0])),
 		lpfn:           browseCb,
 	}

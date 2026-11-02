@@ -366,6 +366,13 @@ class PairingEngine(
             .put("nonce", b64e(myNonce))
             .put("dev_name", myName)
             .put("role", "sender")
+            // [协议 §3.1 增补 · v1.5] pair_intent：本次连接是否由**用户主动发起配对**。
+            //   allowPairing=true  → 交互路径（MainActivity 点「② 配对电脑」）→ PC 必须弹向导窗，
+            //                         用户才能做人眼核对 6 位 SAS。
+            //   allowPairing=false → 后台自动连接/重连（SenderService 每 30 秒一次）
+            //                         → PC 不得弹向导窗（否则用户正在核对的窗口被反复顶掉）。
+            // 注意：该字段**不进入 transcript**（§3.1 字段表未增补），密码学中性。
+            .put("pair_intent", allowPairing)
             .toString().toByteArray(Charsets.UTF_8))
 
         dbg("HELLO 已发送, 本机 fp=${keys.fingerprint()}")

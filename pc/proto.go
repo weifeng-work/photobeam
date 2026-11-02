@@ -41,6 +41,21 @@ type Hello struct {
 	Nonce       string `json:"nonce"`          // b64 std 16B
 	DevName     string `json:"dev_name"`
 	Role        string `json:"role"` // "sender"|"receiver"
+
+	// PairIntent（协议 §3.1 增补，v1.5）：Sender 本次连接是否由**用户主动发起配对**。
+	//   true  —— 交互路径（手机点「② 配对电脑」）→ Receiver 必须展示配对向导窗，
+	//            否则用户无从做人眼核对（6 位 SAS 比对），配对的人眼环节形同虚设。
+	//   false —— 后台自动连接/重连（手机 SenderService 每 30 秒一次）→ Receiver 不得弹窗，
+	//            否则用户正在核对的窗口会被每 30 秒顶掉一次（Stage 5 实测）。
+	//   nil（字段缺省）—— 旧版本 Sender，按 true 处理：**宁可多弹窗，不可跳过人眼核对**。
+	//
+	// **不参与 transcript**：§3.1 的字段表与 transcript 字节序列均未增补，密码学中性。
+	PairIntent *bool `json:"pair_intent,omitempty"`
+}
+
+// pairIntent：读取 Sender 的配对意图；字段缺省按 true 处理（保守：宁可多弹窗，不可跳过人眼核对）
+func (h *Hello) pairIntent() bool {
+	return h.PairIntent == nil || *h.PairIntent
 }
 
 // 单条 HELLO 的规范化字段项（协议 §3.1 表格），按字段名字典序
