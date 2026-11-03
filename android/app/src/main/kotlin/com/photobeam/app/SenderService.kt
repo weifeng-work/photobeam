@@ -712,7 +712,8 @@ class SenderService : Service() {
 
         // 一次发现（三通道）
         val hit = try {
-            Discovery.resolve(this, pc.lastIP, pc.lastPort)
+            // [Stage 5 修正] 传入已配对 PC 的指纹：局域网里有多台 PhotoBeam 时只认自己那台
+            Discovery.resolve(this, pc.lastIP, pc.lastPort, pc.fp)
                 ?: throw java.io.IOException("未发现电脑（三通道均失败）")
         } catch (e: Exception) {
             linkOk = false

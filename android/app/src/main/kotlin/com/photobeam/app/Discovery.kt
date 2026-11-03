@@ -102,9 +102,11 @@ object Discovery {
 
     /**
      * 三通道解析（协议 §2）。knownIP/knownPort 来自已配对记录（可为 null/0）。
+     * knownFP = 已配对 PC 的指纹（可为 null）。
      * 返回第一个命中的 PC，全失败返回 null。
      */
-    fun resolve(ctx: Context, knownIP: String?, knownPort: Int, timeoutBudgetMs: Long = 9000): FoundPC? {
+    fun resolve(ctx: Context, knownIP: String?, knownPort: Int, knownFP: String? = null,
+                timeoutBudgetMs: Long = 9000): FoundPC? {
         val start = System.currentTimeMillis()
         // ① 直连上次 IP（TCP connect 有即时失败反馈 → 不等满 1.5s [N-06]）
         if (!knownIP.isNullOrEmpty() && knownPort in TCP_BASE..TCP_MAX) {
@@ -121,10 +123,10 @@ object Discovery {
 
         // ② UDP 广播（等满 1.5s；UDP 无失败信号 [N-06]）
         broadcastAddrs().forEach { bcast ->
-            hitViaUDP(bcast, knownIP)?.let { return it }
+            hitViaUDP(bcast, knownIP, knownFP)?.let { return it }
         }
         // 受限广播补充
-        hitViaUDP(InetAddress.getByName("255.255.255.255"), knownIP)?.let { return it }
+        hitViaUDP(InetAddress.getByName("255.255.255.255"), knownIP, knownFP)?.let { return it }
         if (System.currentTimeMillis() - start > timeoutBudgetMs) return null
 
         // ③ 单播扫描 /24（等满 6s；不做 TCP 端口扫描 [P0-11]）
@@ -137,18 +139,31 @@ object Discovery {
             val ip = prefix24 + i
             if (ip == own) continue
             pool.execute {
-                hitViaUDP(InetAddress.getByName(ip), knownIP, perAddrTimeoutMs = 400)?.let { hits.add(it) }
+                hitViaUDP(InetAddress.getByName(ip), knownIP, knownFP, perAddrTimeoutMs = 400)?.let { hits.add(it) }
             }
         }
         pool.shutdown()
         pool.awaitTermination(6, TimeUnit.SECONDS)
         if (hits.isNotEmpty()) {
-            return hits.firstOrNull { it.fp.isNotEmpty() && knownIP == null } ?: hits.first()
+            // 指纹相同的那台优先（同一局域网可能有多台 PhotoBeam PC）
+            return hits.firstOrNull { !knownFP.isNullOrEmpty() && it.fp == knownFP }
+                ?: hits.firstOrNull { it.fp.isNotEmpty() && knownIP == null }
+                ?: hits.first()
         }
         return null
     }
 
-    private fun hitViaUDP(target: InetAddress, knownIP: String?, perAddrTimeoutMs: Int = 1500): FoundPC? {
+    /**
+     * 往 target 发一次 discover，然后收应答。
+     *
+     * [Stage 5 修正] 同一局域网里可能**同时有多台 PhotoBeam PC**（同事的、另一台机器上的）。
+     * 已知 PC 的指纹（knownFP）时：
+     *   · 应答来自别的 IP 且指纹不同 → **是别人的机器 → 忽略这条应答，继续等自己那台的**；
+     *   · 应答来自别的 IP 但指纹相同 → 同一台 PC 换了 IP → 算命中。
+     * 没有 knownFP（首次配对）→ 首个应答即走（此时没有可比对的指纹；真伪由握手签名把关）。
+     */
+    private fun hitViaUDP(target: InetAddress, knownIP: String?, knownFP: String?,
+                          perAddrTimeoutMs: Int = 1500): FoundPC? {
         return try {
             val s = DatagramSocket().apply {
                 soTimeout = perAddrTimeoutMs
@@ -157,24 +172,41 @@ object Discovery {
             val frame = discoverFrame()
             s.send(DatagramPacket(frame, frame.size, InetSocketAddress(target, UDP_PORT)))
             val buf = ByteArray(2048)
-            val pkt = DatagramPacket(buf, buf.size)
-            try {
-                s.receive(pkt)
-                val found = parseFound(pkt.data) ?: return null
-                // 手机端手工 IP 兜底时 ip 字段可能为空 → 补 [R-19]
-                val ip = if (found.ip.isNotEmpty()) found.ip else pkt.address.hostAddress
-                if (knownIP != null && knownIP != ip) {
-                    // 广播可能收到别的 PhotoBeam PC；仅当 fp 匹配已知设备时才算命中
-                    // （fp 仅为 UI 提示 [P1-17]；真正的安全判断在握手签名）
-                    s.close()
-                    return FoundPC(found.name, ip, found.port, found.fp, found.paired)
+            val deadline = System.currentTimeMillis() + perAddrTimeoutMs
+            var fallback: FoundPC? = null
+            while (true) {
+                val left = (deadline - System.currentTimeMillis()).toInt()
+                if (left <= 0) break
+                try {
+                    s.soTimeout = left
+                    val pkt = DatagramPacket(buf, buf.size)
+                    s.receive(pkt)
+                    val found = parseFound(pkt.data) ?: continue
+                    // 手机端手工 IP 兜底时 ip 字段可能为空 → 补 [R-19]
+                    val ip = if (found.ip.isNotEmpty()) found.ip else pkt.address.hostAddress
+                    if (knownFP.isNullOrEmpty()) {
+                        // 没有可比对的指纹 → 首个应答即走
+                        s.close()
+                        return FoundPC(found.name, ip, found.port, found.fp, found.paired)
+                    }
+                    if (found.fp == knownFP) {
+                        // 指纹一致 = 同一台 PC（哪怕 IP 变了）→ 精确命中
+                        s.close()
+                        return FoundPC(found.name, ip, found.port, found.fp, found.paired)
+                    }
+                    if (knownIP != null && knownIP != ip) {
+                        // 别人的 PhotoBeam PC → 忽略，继续等自己那台的应答
+                        continue
+                    }
+                    if (fallback == null) {
+                        fallback = FoundPC(found.name, ip, found.port, found.fp, found.paired)
+                    }
+                } catch (e: Exception) {
+                    break // 收超时（UDP 无失败信号，只能等满）
                 }
-                s.close()
-                FoundPC(found.name, ip, found.port, found.fp, found.paired)
-            } catch (e: Exception) {
-                s.close()
-                null
             }
+            s.close()
+            fallback
         } catch (e: Exception) {
             null
         }

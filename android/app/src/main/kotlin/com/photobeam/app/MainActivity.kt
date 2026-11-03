@@ -20,6 +20,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
 import java.text.SimpleDateFormat
@@ -122,6 +123,21 @@ class MainActivity : Activity() {
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
             }
 
+        // [Stage 5] 手工输入电脑 IP 的兜底（协议 §2 [R-19]）：
+        // 某些网络（AP 隔离 / 不同 VLAN / 广播被挡）三通道都找不到电脑，
+        // 但只要用户知道 PC 的 IP，直连通道① 就能连上 —— 前提是有一个地方能填这个 IP。
+        // 此前手机上没有任何输入口，却在失败提示里让用户「手动输入电脑 IP」→ 改为真的提供输入框。
+        val ipInput = EditText(this).apply {
+            // 示例地址必须是**中性的**，不能写本机真实网段（仓库会进 GitHub）
+            hint = "电脑 IP（可选：连不上时手动填，如 192.168.1.10）"
+            textSize = 14f
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                android.text.InputType.TYPE_TEXT_VARIATION_URI
+            setSingleLine(true)
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+
         // [A5] 按钮编号连续、文案统一
         // [A4] ① 不是「首次授权」而是「再要一次」——应用启动时已经自动申请过，
         //      用户被拒过之后系统不会再弹窗，所以文案要说清它到底能干什么。
@@ -139,6 +155,7 @@ class MainActivity : Activity() {
         root.addView(bPerm)
         root.addView(bPermSys)
         root.addView(bPair)
+        root.addView(ipInput)
         root.addView(bSync)
         root.addView(bService)
         root.addView(bBattery)
@@ -159,7 +176,8 @@ class MainActivity : Activity() {
                 statusView.text = "无法打开系统权限页：${e.message}"
             }
         }
-        bPair.setOnClickListener { pairFlow() }
+        // [Stage 5] 填了 IP 就优先用它（直连通道①），没填就走完整三通道发现
+        bPair.setOnClickListener { pairFlow(ipInput.text.toString().trim()) }
         bSync.setOnClickListener {
             // [A3] 立即同步：服务跑完一轮会把结果写进 prefs，这里启动轮询等回执
             SenderService.start(this, SenderService.ACTION_SYNC_NOW)
@@ -436,19 +454,25 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    /** 配对流程：发现 → 握手 → SAS 双端比对 → 保存 */
-    private fun pairFlow() {
+    /** 配对流程：发现 → 握手 → SAS 双端比对 → 保存
+     *  [manualIP] 用户手工填的电脑 IP（可空）。填了就**优先直连它**（通道①），
+     *  用于广播被挡（AP 隔离 / 不同 VLAN）时三通道都找不到电脑的场景。 */
+    private fun pairFlow(manualIP: String? = null) {
         statusView.text = "正在发现电脑…"
         Thread {
             var sasTimedOut = false
             try {
-                val lastIP = prefs.getString("pc_ip", null)
+                // 手工填的 IP 优先；没填就用上次记录里的
+                val lastIP = manualIP?.takeIf { it.isNotBlank() }
+                    ?: prefs.getString("pc_ip", null)
                 val lastPort = prefs.getInt("pc_port", 0)
-                val pc = Discovery.resolve(this, lastIP, lastPort)
+                // [Stage 5 修正] 把已配对 PC 的指纹一并传下去：同一局域网里可能有多台
+                // PhotoBeam PC，靠指纹才能分清「自己那台」和「别人的那台」。
+                val pc = Discovery.resolve(this, lastIP, lastPort, prefs.getString("pc_fp", null))
                 if (pc == null) {
                     runOnUiThread {
                         statusView.text = "未发现电脑。\n请确认：手机与电脑连同一个 WiFi；" +
-                            "电脑端 PhotoBeam 正在运行。\n（或手动输入电脑 IP，见电脑托盘诊断信息）"
+                            "电脑端 PhotoBeam 正在运行。\n（也可以在上面直接填电脑的 IP 再点 ②）"
                     }
                     return@Thread
                 }
