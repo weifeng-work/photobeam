@@ -75,14 +75,22 @@ jobs:
         run: |
           $sdk = $env:ANDROID_SDK_ROOT
           if (-not $sdk) { $sdk = "$env:LOCALAPPDATA\Android\Sdk" }
+          $env:ANDROID_SDK_ROOT = $sdk
+          $env:ANDROID_HOME = $sdk
           New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.android" | Out-Null
           "sdk.dir=$sdk" | Out-File -FilePath "$env:USERPROFILE\.android\repositories.cfg" -Encoding ascii
           $sdkmanager = Get-ChildItem -Path $sdk -Recurse -Filter 'sdkmanager.bat' -ErrorAction SilentlyContinue |
             Select-Object -First 1 -ExpandProperty FullName
-          if (-not $sdkmanager) { throw '找不到 sdkmanager' }
-          # 接受 SDK 许可（非交互）
-          1..30 | ForEach-Object { 'y' } | & $sdkmanager --licenses | Out-Null
-          & $sdkmanager 'build-tools;37.0.0' 'platforms;android-36' | Out-Null
+          if (-not $sdkmanager) { throw "找不到 sdkmanager（sdk=$sdk）" }
+          Write-Output "sdkmanager = $sdkmanager"
+          # 接受 SDK 许可（非交互）：sdkmanager 需要 y 确认
+          $yes = (1..60 | ForEach-Object { 'y' }) -join "`n"
+          $yes | & $sdkmanager --sdk_root="$sdk" --licenses | Select-Object -Last 5
+          & $sdkmanager --sdk_root="$sdk" 'build-tools;37.0.0' 'platforms;android-36' | Select-Object -Last 15
+          if ($LASTEXITCODE -ne 0) { throw "sdkmanager 安装失败（exit=$LASTEXITCODE）" }
+          foreach ($p in @("$sdk\build-tools\37.0.0\aapt2.exe", "$sdk\platforms\android-36\android.jar")) {
+            if (-not (Test-Path $p)) { throw "缺少 $p" }
+          }
           Write-Output "SDK 组件安装完成（sdk=$sdk）"
 
       # kotlinc（不进仓库，体积大）：从 JetBrains 官方 release 取 2.1.20（与本机一致）
