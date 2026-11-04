@@ -110,11 +110,13 @@ jobs:
           KEYSTORE_PASS: ${{ secrets.APK_KEYSTORE_PASS }}
         run: |
           if (-not $env:KEYSTORE_B64) { throw '缺少 secret：APK_KEYSTORE_B64' }
+          $b64 = ($env:KEYSTORE_B64 -replace '\s', '')
+          if ($b64.Length -lt 100) { throw 'APK_KEYSTORE_B64 长度异常' }
           $dir = "$env:LOCALAPPDATA\PhotoBeam"
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          [IO.File]::WriteAllBytes("$dir\photobeam-release.keystore", [Convert]::FromBase64String($env:KEYSTORE_B64))
-          [IO.File]::WriteAllText("$dir\keystore.pass", $env:KEYSTORE_PASS)
-          Write-Output "签名材料已就位"
+          [IO.File]::WriteAllBytes("$dir\photobeam-release.keystore", [Convert]::FromBase64String($b64))
+          [IO.File]::WriteAllText("$dir\keystore.pass", $env:KEYSTORE_PASS.Trim())
+          Write-Output "签名材料已就位（$((Get-Item "$dir\photobeam-release.keystore").Length) 字节）"
 
       - name: 构建 PhotoBeam.apk
         shell: pwsh
