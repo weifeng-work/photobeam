@@ -105,9 +105,15 @@ func startSupervisor() {
 }
 
 // supervisorEnabled：托盘开关（崩溃后自动重启）
+// 标记文件不存在 = **默认开启**；写了 "0" = 关闭。
+// （注意：早期版本把这里写反了 —— 文件不存在时返回 false，导致监护进程根本不起，
+//  CI 编译查不出来，只有实机跑才暴露。）
 func supervisorEnabled() bool {
 	b, err := os.ReadFile(filepath.Join(appDir(), "logs", "supervisor_off"))
-	return err == nil && len(b) > 0 && string(b) != "0"
+	if err != nil {
+		return true // 没有标记文件 → 开启
+	}
+	return strings.TrimSpace(string(b)) != "0"
 }
 
 // setSupervisorEnabled：切换托盘开关
@@ -116,7 +122,7 @@ func setSupervisorEnabled(on bool) {
 	if on {
 		_ = os.Remove(p)
 	} else {
-		_ = os.WriteFile(p, []byte("1"), 0o644)
+		_ = os.WriteFile(p, []byte("0"), 0o644)
 	}
 }
 
@@ -138,6 +144,7 @@ func runSupervisor() {
 		return
 	}
 	cur := readSupervisorPID()
+	logf("监护进程启动，盯住主进程 pid=%d", cur)
 	for {
 		// ① 等当前主进程结束
 		for cur > 0 && processAlive(cur) {
