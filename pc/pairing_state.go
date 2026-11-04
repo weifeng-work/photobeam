@@ -20,6 +20,7 @@ package main
 // 首次配对没有指纹可比，但「双方都同意」不依赖任何指纹。
 
 import (
+	"strings"
 	"sync"
 	"time"
 )
@@ -75,4 +76,32 @@ func pairingArmRemaining() int {
 		return 0
 	}
 	return int(d.Seconds()) + 1
+}
+
+// ---------- 最近一次连上来的对端（手机）IP ----------
+
+var (
+	peerMu   sync.Mutex
+	peerIP   string
+)
+
+// notePeerIP：记下最近一次连入的对端 IP（只取 IP 部分）
+func notePeerIP(remoteAddr string) {
+	ip := remoteAddr
+	if i := strings.Index(ip, ":"); i > 0 {
+		ip = ip[:i]
+	}
+	if ip == "" {
+		return
+	}
+	peerMu.Lock()
+	peerIP = ip
+	peerMu.Unlock()
+}
+
+// lastPeerIP：最近一次连入的对端 IP（空 = 还没有连接过）
+func lastPeerIP() string {
+	peerMu.Lock()
+	defer peerMu.Unlock()
+	return peerIP
 }

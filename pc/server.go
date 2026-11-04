@@ -143,6 +143,8 @@ func stopTCPServer() {
 
 func handleConn(conn net.Conn) {
 	defer conn.Close()
+	// [Stage 5 第五轮] 记下对端 IP —— 托盘 tooltip 用它挑「手机所在网段」的本地地址
+	notePeerIP(conn.RemoteAddr().String())
 	logf("连接进入: %s", conn.RemoteAddr().String())
 
 	conn.SetDeadline(timeNow().Add(handshakeTimeout))

@@ -338,18 +338,38 @@ func updateTrayTooltip() {
 	systray.SetTooltip(tip)
 }
 
-// tooltipIP：手机可达的 IP（第一个真实网卡的 IPv4）——
-// 用户在手机上「手动输入电脑 IP」时需要它，诊断信息里也有同一个值。
+// tooltipIP：手机可达的 IP —— **优先选与手机同网段的那个**。
+//
+// 为什么不能直接取第一个：这台机器上「移动热点/ICS 桥接」（本地连接* 2，<ICS-IP>）
+// 的 IfType 也是以太网，不会被虚拟网卡过滤器排除，取第一个就可能给出手机根本到不了的地址。
+// 正确做法：拿「最近一次连上来的对端 IP」（手机）做 /24 前缀匹配，挑同网段的本地地址；
+// 挑不到再退回第一个真实网卡。
 func tooltipIP() string {
 	ips := netAdvertisedIPs()
 	if len(ips) == 0 {
 		return ""
 	}
-	s := ips[0]
-	if i := strings.Index(s, " "); i > 0 {
-		return s[:i]
+	first := ips[0]
+	if i := strings.Index(first, " "); i > 0 {
+		first = first[:i]
 	}
-	return s
+	peer := lastPeerIP()
+	if peer != "" {
+		pfx := peer
+		if i := strings.LastIndex(pfx, "."); i > 0 {
+			pfx = pfx[:i]
+		}
+		for _, s := range ips {
+			ip := s
+			if i := strings.Index(s, " "); i > 0 {
+				ip = s[:i]
+			}
+			if strings.HasPrefix(ip, pfx+".") {
+				return ip
+			}
+		}
+	}
+	return first
 }
 
 func openFolder(dir string) {
