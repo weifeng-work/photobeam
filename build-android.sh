@@ -4,7 +4,9 @@
 set -e
 cd "$(dirname "$0")"
 
-SDK="$LOCALAPPDATA/Android/Sdk"
+# SDK 根目录：优先认环境变量（CI runner 的 ANDROID_SDK_ROOT 与本机路径不同），
+# 都没有才退回 Windows 默认位置 %LOCALAPPDATA%\Android\Sdk
+SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$LOCALAPPDATA/Android/Sdk}}"
 BT="$SDK/build-tools/37.0.0"
 PLATFORM="$SDK/platforms/android-36/android.jar"
 KOTLINC="tools/kotlinc/bin/kotlinc.bat"
