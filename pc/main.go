@@ -325,13 +325,31 @@ func restartSelf() {
 
 func onExit() {}
 
-// updateTrayTooltip：托盘 tooltip 显示当前 TCP 端口、指纹，以及**是否在等待新设备**
+// updateTrayTooltip：托盘 tooltip 显示当前 TCP 端口、指纹、手机可达 IP，以及**是否在等待新设备**
 func updateTrayTooltip() {
-	tip := "PhotoBeam 接收器 · TCP " + fmt.Sprint(cfg.TCPPort) + " · 指纹 " + identity.FP()
+	tip := "PhotoBeam 接收器"
+	if ip := tooltipIP(); ip != "" {
+		tip += " · " + ip
+	}
+	tip += " · TCP " + fmt.Sprint(cfg.TCPPort) + " · 指纹 " + identity.FP()
 	if rem := pairingArmRemaining(); rem > 0 {
 		tip += fmt.Sprintf(" · 等待新设备（%d 秒）", rem)
 	}
 	systray.SetTooltip(tip)
+}
+
+// tooltipIP：手机可达的 IP（第一个真实网卡的 IPv4）——
+// 用户在手机上「手动输入电脑 IP」时需要它，诊断信息里也有同一个值。
+func tooltipIP() string {
+	ips := netAdvertisedIPs()
+	if len(ips) == 0 {
+		return ""
+	}
+	s := ips[0]
+	if i := strings.Index(s, " "); i > 0 {
+		return s[:i]
+	}
+	return s
 }
 
 func openFolder(dir string) {
