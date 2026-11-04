@@ -49,7 +49,8 @@ func main() {
 	cfg = loadConfig()
 	identity = loadOrCreateIdentity()
 	loadSeenIDs()
-	logf("PhotoBeam 启动 · 指纹 %s · 保存目录 %s", identity.FP(), getSaveDir())
+	logf("PhotoBeam 启动 · 指纹 %s · 保存目录 %s · 本机 IP %s",
+		identity.FP(), getSaveDir(), tooltipIP())
 	// [Stage 5 第五轮 · L] 把自己的 PID 写进交接文件，并拉起隐藏的监护进程
 	writeSupervisorPID()
 	startSupervisor()
@@ -340,36 +341,44 @@ func updateTrayTooltip() {
 
 // tooltipIP：手机可达的 IP —— **优先选与手机同网段的那个**。
 //
-// 为什么不能直接取第一个：这台机器上「移动热点/ICS 桥接」（本地连接* 2，<ICS-IP>）
+// 为什么不能直接取第一个：这台机器上「移动热点 / ICS 桥接」（本地连接* 2，<ICS-IP>）
 // 的 IfType 也是以太网，不会被虚拟网卡过滤器排除，取第一个就可能给出手机根本到不了的地址。
-// 正确做法：拿「最近一次连上来的对端 IP」（手机）做 /24 前缀匹配，挑同网段的本地地址；
-// 挑不到再退回第一个真实网卡。
+// 判据顺序：
+//   ① 与**最近一次连上来的对端（手机）同 /24 网段**的那个地址（最准）；
+//   ② **有默认网关**的真实网卡（排除 ICS/桥接这类只给别的设备用的网段）；
+//   ③ 第一个真实网卡（兜底）。
 func tooltipIP() string {
-	ips := netAdvertisedIPs()
-	if len(ips) == 0 {
+	adapters := pickRealAdapters(queryNetIfaces())
+	if len(adapters) == 0 {
 		return ""
 	}
-	first := ips[0]
-	if i := strings.Index(first, " "); i > 0 {
-		first = first[:i]
-	}
-	peer := lastPeerIP()
-	if peer != "" {
+	// ① 同网段优先
+	if peer := lastPeerIP(); peer != "" {
 		pfx := peer
 		if i := strings.LastIndex(pfx, "."); i > 0 {
 			pfx = pfx[:i]
 		}
-		for _, s := range ips {
-			ip := s
-			if i := strings.Index(s, " "); i > 0 {
-				ip = s[:i]
-			}
-			if strings.HasPrefix(ip, pfx+".") {
-				return ip
+		for _, ni := range adapters {
+			for _, ip := range ni.IPv4 {
+				if strings.HasPrefix(ip, pfx+".") {
+					return ip
+				}
 			}
 		}
 	}
-	return first
+	// ② 有默认网关的适配器优先
+	for _, ni := range adapters {
+		if len(ni.Gateway) > 0 && len(ni.IPv4) > 0 {
+			return ni.IPv4[0]
+		}
+	}
+	// ③ 兜底
+	for _, ni := range adapters {
+		if len(ni.IPv4) > 0 {
+			return ni.IPv4[0]
+		}
+	}
+	return ""
 }
 
 func openFolder(dir string) {
