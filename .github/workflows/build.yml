@@ -27,21 +27,28 @@ jobs:
       # rsrc：纯 Go 的资源编译器，把 icon.ico + app.manifest 嵌进 exe
       # （不需要 Windows SDK / MinGW 的 rc.exe）
       - name: 安装 rsrc（嵌图标与清单）
+        shell: pwsh
         run: |
           go install github.com/akavel/rsrc@latest
-          "$(go env GOPATH)\bin\rsrc.exe" -h 2>&1 | Select-Object -First 2
+          $rsrc = Join-Path (go env GOPATH) 'bin\rsrc.exe'
+          if (-not (Test-Path $rsrc)) { throw "rsrc 未就位：$rsrc" }
+          Write-Output "rsrc 就位：$rsrc"
 
       - name: 构建 PhotoBeam.exe
-        run: cmd /c build-pc.bat
+        shell: pwsh
+        run: |
+          # build-pc.bat 内部调 bash build-pc.sh → 确保 Git Bash 在 PATH 上
+          $env:Path = "C:\Program Files\Git\bin;" + $env:Path
+          cmd /c build-pc.bat
 
       - name: 校验产物
         shell: pwsh
         run: |
           $f = 'dist\PhotoBeam.exe'
           if (-not (Test-Path $f)) { throw '产物不存在' }
-          $b = [IO.File]::ReadAllBytes($f)
+          $txt = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($f))
           foreach ($k in @('Microsoft.Windows.Common-Controls','PerMonitorV2','asInvoker')) {
-            if (-not ([Text.Encoding]::ASCII.GetString($b).Contains($k))) { throw "清单缺少 $k" }
+            if (-not $txt.Contains($k)) { throw "清单缺少 $k" }
           }
           Write-Output "产物 $((Get-Item $f).Length) 字节；清单校验通过"
 
@@ -68,12 +75,15 @@ jobs:
         run: |
           $sdk = $env:ANDROID_SDK_ROOT
           if (-not $sdk) { $sdk = "$env:LOCALAPPDATA\Android\Sdk" }
-          "sdk.dir=$sdk" | Out-File -FilePath "$env:USERPROFILE\.android\repositories.cfg" -Encoding ascii -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.android" | Out-Null
+          "sdk.dir=$sdk" | Out-File -FilePath "$env:USERPROFILE\.android\repositories.cfg" -Encoding ascii
           $sdkmanager = Get-ChildItem -Path $sdk -Recurse -Filter 'sdkmanager.bat' -ErrorAction SilentlyContinue |
             Select-Object -First 1 -ExpandProperty FullName
           if (-not $sdkmanager) { throw '找不到 sdkmanager' }
-          & $sdkmanager "build-tools;37.0.0" "platforms;android-36" | Out-Null
-          Write-Output "SDK 组件安装完成"
+          # 接受 SDK 许可（非交互）
+          1..30 | ForEach-Object { 'y' } | & $sdkmanager --licenses | Out-Null
+          & $sdkmanager 'build-tools;37.0.0' 'platforms;android-36' | Out-Null
+          Write-Output "SDK 组件安装完成（sdk=$sdk）"
 
       # kotlinc（不进仓库，体积大）：从 JetBrains 官方 release 取 2.1.20（与本机一致）
       - name: 准备 kotlinc + BouncyCastle
@@ -87,6 +97,8 @@ jobs:
           Remove-Item tools\ktmp -Recurse -Force
           curl.exe -L --fail -o tools\bcprov.jar `
             https://repo1.maven.org/maven2/org/bouncycastle/bcprov-jdk18on/1.78.1/bcprov-jdk18on-1.78.1.jar
+          if (-not (Test-Path 'tools\kotlinc\bin\kotlinc.bat')) { throw 'kotlinc 未就位' }
+          if (-not (Test-Path 'tools\bcprov.jar')) { throw 'bcprov.jar 未就位' }
           Write-Output "kotlinc + bcprov 就绪"
 
       # 签名材料：release keystore 不进仓库（仓库要脱敏），走 Actions secret
@@ -105,7 +117,10 @@ jobs:
           Write-Output "签名材料已就位"
 
       - name: 构建 PhotoBeam.apk
-        run: cmd /c build-android.bat
+        shell: pwsh
+        run: |
+          $env:Path = "C:\Program Files\Git\bin;" + $env:Path
+          cmd /c build-android.bat
 
       - uses: actions/upload-artifact@v4
         with:
