@@ -62,12 +62,7 @@ var (
 
 	procSetBkColorP = gdi32CB.NewProc("SetBkColor")
 
-	procSHBrowseForFolderW   = shell32.NewProc("SHBrowseForFolderW")
-	procSHGetPathFromIDListW = shell32.NewProc("SHGetPathFromIDListW")
-	procILCreateFromPathW    = shell32.NewProc("ILCreateFromPathW") // 路径 → ITEMIDLIST(PIDL)
-	procILFree               = shell32.NewProc("ILFree")            // 释放 PIDL
 	ole32                   = windows.NewLazySystemDLL("ole32.dll")
-	procCoTaskMemFree        = ole32.NewProc("CoTaskMemFree")
 	procCoInitializeEx       = ole32.NewProc("CoInitializeEx")
 	procCoUninitialize       = ole32.NewProc("CoUninitialize")
 )
@@ -112,11 +107,6 @@ const (
 	wsTabStop     = 0x00010000
 	wsBorder      = 0x00800000
 	esAutoHScroll = 0x0080
-	bifReturnOnly = 0x00000001
-	bifNewDialog  = 0x00000040
-	bifEditBox    = 0x00000002
-	bffmInit      = 0x0401 // WM_USER+1
-	bffmSetSelW   = 0x0438 // WM_USER+56 BFFM_SETSELECTIONW
 
 	// COM 初始化
 	coinitApartmentThreaded = 0x2 // COINIT_APARTMENTTHREADED
@@ -635,52 +625,63 @@ func onUseDir(parent uintptr) {
 	messageBox("接收文件夹已更改：\n"+getSaveDir(), "PhotoBeam")
 }
 
-// ---------- 原生文件夹选择器（零 CGO） ----------
+// ---------- 现代文件夹选择器（零 CGO） ----------
 
-// browseForFolder：Win32 原生『浏览文件夹』对话框
-// SHBrowseForFolderW + SHGetPathFromIDListW，回调用 syscall.NewCallback 传 Go 函数指针
-// 返回选中目录；用户取消/失败返回 ""
-var (
-	browseMu     sync.Mutex
-	browseTarget string
-	browseCbOnce sync.Once
-	browseCb     uintptr
+// [Stage 5 第五轮 · I] 换掉 SHBrowseForFolderW（Vista 之前的经典对话框）：
+//
+//	经典版的问题（实测）：目录树以「桌面」为根、**不预选**当前接收目录；
+//	BIF_EDITBOX 在新样式下不渲染 → **没有路径输入框**；换到别的位置只能逐层展开目录树。
+//
+//	现在改用 GetOpenFileNameW + OFN_PICKFOLDERS：Vista+ 上它就是现代的「选择文件夹」对话框
+//	（左侧命名空间树 + 右上搜索框 + 底部「文件夹:」路径输入框），lpstrInitialDir 会**预选**当前目录。
+//	仍然是纯 Win32 API，零 CGO、零新增依赖。
+
+var browseMu sync.Mutex
+
+const (
+	ofnExplore     = 0x00080000
+	ofnPathMustExi = 0x00000800
+	ofnFileMustExi = 0x00001000
+	ofnNoChangeDir = 0x00000008
+	ofnPickFolders = 0x00000020
 )
 
-type browseInfo struct {
-	hwndOwner      uintptr
-	pidlRoot       uintptr // LPCITEMIDLIST —— **必须是 PIDL，不能是路径字符串**
-	pszDisplayName uintptr
-	lpszTitle      uintptr
-	ulFlags        uint32
-	_              uint32
-	lpfn           uintptr
-	lParam         uintptr
-	iImage         int32
-	_              int32
+// openFileNameW：OPENFILENAMEW 结构（GetOpenFileNameW 用）
+type openFileNameW struct {
+	lStructSize       uint32
+	hwndOwner         uintptr
+	hInstance         uintptr
+	lpstrFilter       uintptr
+	lpstrCustomFilter uintptr
+	nMaxCustFilter    uint32
+	nFilterIndex      uint32
+	lpstrFile         uintptr
+	nMaxFile          uint32
+	lpstrFileTitle    uintptr
+	nMaxFileTitle     uint32
+	lpstrInitialDir   uintptr
+	lpstrTitle        uintptr
+	Flags             uint32
+	nFileOffset       uint16
+	nFileExtension    uint16
+	lpstrDefExt       uintptr
+	lCustData         uintptr
+	lpfnHook          uintptr
+	lpTemplateName    uintptr
+	pvReserved        uintptr
+	dwReserved        uint32
+	FlagsEx           uint32
 }
 
-// browseCallback：BFFMCALLBACK —— 打开时把初始目录选中（BFFM_SETSELECTIONW）
-func browseCallback(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
-	if msg == bffmInit {
-		browseMu.Lock()
-		target := browseTarget
-		browseMu.Unlock()
-		if target != "" {
-			if p, err := windows.UTF16PtrFromString(target); err == nil {
-				procSendMessageW.Call(hwnd, bffmSetSelW, 1, uintptr(unsafe.Pointer(p)))
-			}
-		}
-	}
-	return 0
-}
+var procGetOpenFileNameW = windows.NewLazySystemDLL("comdlg32.dll").NewProc("GetOpenFileNameW")
 
 func browseForFolder(owner uintptr, initial, title string) string {
-	// [Stage 5 修复] 必须先初始化 COM：
-	// SHBrowseForFolderW 在 BIF_NEWDIALOGSTYLE（Vista+ 的新样式）下走 shell 的 COM 实现，
-	// **线程没初始化 COM 时对话框能弹出来，但左侧目录树是全空的**（用户实机反馈「预览窗口空白」）。
-	// 必须在**调用 SHBrowseForFolderW 的同一个线程**上初始化——
-	// 本函数由向导窗的 WM_COMMAND 处理路径调用，那已经是向导窗自己的专用 OS 线程 ✔。
+	// 模态对话框 + COM（现代对话框内部是 IFileDialog，STA）→ 打开态必须绑在同一 OS 线程
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	browseMu.Lock()
+	defer browseMu.Unlock()
+
 	hr, _, _ := procCoInitializeEx.Call(0, coinitApartmentThreaded)
 	// S_OK(0) / S_FALSE(1) 都表示「本线程已被初始化」→ 必须配一次 CoUninitialize；
 	// 负值（如 RPC_E_CHANGED_MODE）表示本线程已用别的模型初始化过 → 不能反初始化。
@@ -691,49 +692,38 @@ func browseForFolder(owner uintptr, initial, title string) string {
 		logWarn("CoInitializeEx 返回 0x%X（本线程 COM 模型已存在），继续", uint32(hr))
 	}
 
-	browseMu.Lock()
-	browseTarget = initial
-	browseMu.Unlock()
-	browseCbOnce.Do(func() {
-		browseCb = windows.NewCallback(browseCallback)
-	})
-
-	displayName := make([]uint16, 260)
+	fileBuf := make([]uint16, 1024)
+	titleBuf := make([]uint16, 260)
+	filter, _ := windows.UTF16PtrFromString("文件夹")
 	titlePtr, _ := windows.UTF16PtrFromString(title)
-
-	// [Stage 5 修复 · 目录树空白的真正根因]
-	// SHBrowseForFolder 的第二个参数是 **LPCITEMIDLIST（PIDL）**，不是路径字符串。
-	// 此前这里直接把路径字符串的指针塞进了那个槽位 —— shell 拿它当 ITEMIDLIST 解析，
-	// 得到的是垃圾 → 左侧目录树一个节点都没有（实测 TREE_ITEM_COUNT=0，
-	// 用户反馈「选择图片接收文件夹预览窗口空白」；独立复现器里甚至直接把 shell32 打成访问违例）。
-	//
-	// 根节点取 **NULL（桌面）** 而不是当前保存目录：
-	// 根 = 当前目录时目录树只显示该目录的子树，**用户没法往上导航到别的盘/别的位置**，
-	// 而这个对话框的用途恰恰是「换一个位置」。
-	// 「打开时落在当前目录」由 BFFM_SETSELECTIONW 负责（见 browseCallback）。
-	var pidlRoot uintptr // = 0 → 根 = 桌面（完整命名空间树）
-	bi := browseInfo{
-		// [Stage 5 修复] 传 owner：向导窗是 WS_EX_TOPMOST，
-		// 不设 owner 的话选择器对话框会被压在向导窗**下面**（用户完全看不到目录树）。
-		// 设了 owner 之后，对话框是向导窗的 owned 窗口 → 永远显示在主人之上。
-		hwndOwner:      owner,
-		ulFlags:        bifReturnOnly | bifNewDialog | bifEditBox,
-		lpszTitle:      uintptr(unsafe.Pointer(titlePtr)),
-		pidlRoot:       pidlRoot,
-		pszDisplayName: uintptr(unsafe.Pointer(&displayName[0])),
-		lpfn:           browseCb,
+	var initPtr uintptr
+	if initial != "" {
+		if p, err := windows.UTF16PtrFromString(initial); err == nil {
+			initPtr = uintptr(unsafe.Pointer(p))
+		}
 	}
-	hwnd, _, _ := procSHBrowseForFolderW.Call(uintptr(unsafe.Pointer(&bi)))
-	if hwnd == 0 {
-		// SHBrowseForFolderW 返回 0 有两种可能：用户按「取消」，或对话框根本没打开。
-		// 两者在这里无法区分（该 API 不设 last error），措辞不要断言「打开失败」。
+	ofn := openFileNameW{
+		lStructSize: uint32(unsafe.Sizeof(openFileNameW{})),
+		// owner：向导窗是 WS_EX_TOPMOST；不设 owner 的话对话框会被压在向导窗**下面**
+		// （用户完全看不见）。设了 owner → 对话框是向导窗的 owned 窗口 → 永远在主人之上。
+		hwndOwner:       owner,
+		lpstrFilter:     uintptr(unsafe.Pointer(filter)),
+		lpstrFile:       uintptr(unsafe.Pointer(&fileBuf[0])),
+		nMaxFile:        1024,
+		lpstrFileTitle:  uintptr(unsafe.Pointer(&titleBuf[0])),
+		nMaxFileTitle:   260,
+		lpstrInitialDir: initPtr, // **预选**当前接收目录（经典版做不到）
+		lpstrTitle:      uintptr(unsafe.Pointer(titlePtr)),
+		// OFN_PICKFOLDERS：把「打开文件」变成「选择文件夹」；OFN_PATHMUSTEXIST：必须是已存在的目录
+		Flags: ofnExplore | ofnPickFolders | ofnPathMustExi | ofnNoChangeDir,
+	}
+	ok, _, _ := procGetOpenFileNameW.Call(uintptr(unsafe.Pointer(&ofn)))
+	if ok == 0 {
+		// 返回 0 = 用户取消（或对话框没能打开）；该 API 不区分，措辞不武断
 		logf("文件夹选择器未返回结果（用户取消，或对话框未能打开）")
 		return ""
 	}
-	defer procCoTaskMemFree.Call(hwnd)
-	ok, _, _ := procSHGetPathFromIDListW.Call(hwnd, uintptr(unsafe.Pointer(&displayName[0])))
-	if ok == 0 {
-		return ""
-	}
-	return windows.UTF16ToString(displayName)
+	dir := windows.UTF16ToString(fileBuf)
+	logf("文件夹选择器返回: %s", dir)
+	return dir
 }

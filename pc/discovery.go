@@ -38,12 +38,17 @@ func startDiscoveryResponder() error {
 				continue
 			}
 			resp, _ := jsonMarshalIndent(map[string]any{
-				"pb":     1,
-				"type":   "found",
-				"name":   hostname(),
-				"port":   cfg.TCPPort, // 实际生效的 TCP 端口（可能已漂移）[P1-新2]
-				"fp":     identity.FP(),
+				"pb":   1,
+				"type": "found",
+				"name": hostname(),
+				"port": cfg.TCPPort, // 实际生效的 TCP 端口（可能已漂移）[P1-新2]
+				"fp":   identity.FP(),
 				"paired": len(cfg.Devices) > 0, // 仅 UI 提示，不构成安全判断 [P1-17]
+				// [Stage 5 第五轮] pair_ready = 本机当前**愿意接受新的配对请求**
+				//（用户点过「配对新设备」，或首次启动尚未配对过设备时的自动待命窗口）。
+				// 手机端据此在多台候选里挑「正在等你」的那台 —— 同一局域网里有别人的
+				// PhotoBeam 时，不会连错机器。缺失该字段按 false 处理（保守：不配）。
+				"pair_ready": pairingArmed(),
 			})
 			conn.WriteToUDP(resp, raddr)
 		}

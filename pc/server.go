@@ -204,6 +204,23 @@ func handleConn(conn net.Conn) {
 	if findDevice(senderFP) != nil {
 		mode = "reconnect"
 	}
+	// [Stage 5 第五轮 · 配对待命闸门]
+	// 新设备（PC 不认识这个指纹）的配对请求，只有在 PC 处于「配对新设备」待命态时才受理。
+	// 不在待命态 → **不弹窗**，MODE 帧带 err{reason:"receiver_not_ready"}，
+	// 手机端立刻提示「让对方在托盘点『配对新设备』」，**不进入 SAS 阶段**。
+	// 根因：手机首次配对时没有指纹可比，旧实现取「第一个应答」就连接 →
+	//       可能连到同一局域网里**别人的电脑**，之后照片持续串到对方机器；
+	//       反过来你的电脑也会被陌生人的手机触发弹窗，你点「不一致」还会打断对方配对。
+	// 注意：**已配对设备的重连（mode=reconnect）完全不受待命态影响**。
+	if mode == "pairing" && senderHello.pairIntent() && !pairingArmed() {
+		logf("收到陌生设备的配对请求，但本机不在『配对新设备』待命态 → 拒绝（不弹窗）")
+		modeFrame, _ := jsonMarshalIndent(map[string]any{
+			"pb": 1, "type": "mode", "mode": "pairing", "fp": identity.FP(), "reset": false,
+			"err": map[string]any{"reason": "receiver_not_ready"},
+		})
+		_ = writePlainFrame(conn, modeFrame)
+		return
+	}
 	logf("Sender fp=%s mode=%s", senderFP, mode)
 
 	// MODE 帧（明文）
@@ -309,7 +326,13 @@ func handleConn(conn net.Conn) {
 		}
 		// 向导窗的用户动作：点『不一致』→ 发 pair_reject（协议 §3.2：任一端均可发）；
 		// 60 秒超时 → 断开（与手机端 SAS 对话框 60s 等待对齐）
+		// [Stage 5 第五轮 · 人眼核对硬闸门 D-b]
+		// 旧实现：PC 的「一致」只是一行日志，**收到 pair_confirm 就接受** → PC 端的人眼核对形同虚设
+		//        （真正的闸门只有手机端，用户在电脑上「看一眼」这个动作根本不参与决策）。
+		// 现在：PC 用户必须点「一致」，本端才接受 pair_confirm；不一致 / 超时 = 拒绝。
+		// 双方表态通过 agreeCh 传递（容量 1）：用户先点或后到都能正确取到。
 		var pairingDecided int32 // 0=进行中 1=已决（原子：与主流程互斥）
+		agreeCh := make(chan bool, 1) // true=用户点了「一致」
 		if pw != nil {
 			go func() {
 				ev, ok := <-pw.events
@@ -321,12 +344,14 @@ func handleConn(conn net.Conn) {
 						logf("配对向导窗被新会话取代，断开旧连接")
 						abortConn(conn)
 					}
+					agreeCh <- false
 					return
 				}
 				switch ev {
 				case pairEvMatch:
-					// 点『一致』只关窗 —— PC 侧仍以程序比对 SAS 为准（绝不跳过校验）
-					logf("用户已核对 SAS（一致），继续等待手机 pair_confirm")
+					// 点『一致』→ 记下用户已确认（窗口此刻已关闭）；等 pair_confirm 到达后据此放行
+					logf("用户已核对 SAS（一致），等待手机 pair_confirm")
+					agreeCh <- true
 				case pairEvMismatch:
 					if !atomic.CompareAndSwapInt32(&pairingDecided, 0, 1) {
 						return
@@ -338,6 +363,7 @@ func handleConn(conn net.Conn) {
 					abortConn(conn)
 					// [Stage 5] 协议 §3.2 要求「Receiver 向导显示『用户已拒绝配对』」——
 					// 此前只有托盘气泡（多数情况下用户根本没注意到），现在给一个明确的对话框。
+					agreeCh <- false
 					trayNotify("配对已拒绝", "你在电脑上点了『不一致』，已断开连接")
 					messageBox("你在电脑上点了『不一致』，已拒绝本次配对。\n"+
 						"连接已断开。请确认两端显示的 6 位数字确实不同，再重新配对。",
@@ -346,11 +372,12 @@ func handleConn(conn net.Conn) {
 					if !atomic.CompareAndSwapInt32(&pairingDecided, 0, 1) {
 						return
 					}
-					logf("配对超时：%d 秒内未收到手机确认，已断开", pairTimeoutMs/1000)
+					logf("配对超时：%d 秒内未完成双方确认，已断开", pairTimeoutMs/1000)
 					abortConn(conn)
-					trayNotify("配对超时", fmt.Sprintf("%d 秒内未收到手机确认，连接已断开", pairTimeoutMs/1000))
-					messageBox(fmt.Sprintf("%d 秒内没有收到手机的确认，配对已取消。\n"+
-						"请重新点手机上的「② 配对电脑」，并在电脑上完成核对。", pairTimeoutMs/1000),
+					agreeCh <- false
+					trayNotify("配对超时", fmt.Sprintf("%d 秒内未完成双方确认，连接已断开", pairTimeoutMs/1000))
+					messageBox(fmt.Sprintf("%d 秒内没有完成双方确认（手机或电脑任一侧没点），配对已取消。\n"+
+						"请重新点手机上的「② 配对电脑」，并在电脑上点「一致」。", pairTimeoutMs/1000),
 						"PhotoBeam 配对超时")
 				}
 			}()
@@ -412,7 +439,25 @@ func handleConn(conn net.Conn) {
 			finish()
 			return
 		}
-		pw.close() // 收到 pair_confirm → 关闭向导窗
+		// [Stage 5 第五轮 · D-b 硬闸门] 收到 pair_confirm **还不够** —— 必须等 PC 用户点「一致」。
+		// 旧实现到这里就直接接受，PC 端的人眼核对（让人看到那 6 位码）形同虚设。
+		// 现在：用户点了「一致」才放行；点了「不一致」/ 超时 / 被新会话取代 → 拒绝。
+		// agreeCh 容量 1：用户先点（已入缓冲）或后到（这里等）都能正确取到。
+		select {
+		case agreed := <-agreeCh:
+			if !agreed {
+				logf("PC 用户未确认（点不一致 / 超时 / 被取代）→ 不接受配对")
+				authStats.fail("PC 用户未确认，拒绝配对")
+				finish()
+				return
+			}
+		case <-time.After(time.Duration(pairTimeoutMs+5) * time.Millisecond):
+			logf("等待 PC 用户确认超时 → 不接受配对")
+			authStats.fail("等待 PC 用户确认超时")
+			finish()
+			return
+		}
+		pw.close() // 用户已点「一致」→ 关闭向导窗
 		if !ctEqual(m.SAS, keys.SAS) || !ed25519.Verify(ed25519.PublicKey(edRaw), th, mustDecode(m.Sig)) {
 			logf("配对校验失败（SAS 或签名），静默断开")
 			authStats.fail("配对校验失败（SAS 或签名不一致）")
@@ -428,6 +473,10 @@ func handleConn(conn net.Conn) {
 		fmt.Sscanf(portStr, "%d", &pn)
 		upsertDevice(Device{FP: senderFP, EdPub: senderHello.EdPub, XIDPub: senderHello.X25519IDPub,
 			DevName: firstNonEmpty(m.DevName, senderHello.DevName), LastIP: ip, LastPort: cfg.TCPPort})
+		// [Stage 5 第五轮] 配对待命**一次性消耗**：成功接上一台新设备就退出待命。
+		// 这样「每加一台手机都要显式点一次『配对新设备』」—— 避免陌生人随时蹭配对。
+		disarmPairing()
+		updateTrayTooltip()
 		trayNotify("配对成功", "已与 "+firstNonEmpty(m.DevName, senderHello.DevName)+" 完成配对")
 		logf("配对成功: %s (%s)", m.DevName, senderFP)
 		break

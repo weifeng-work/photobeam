@@ -1,0 +1,114 @@
+name: build
+
+# 产物构建放到 CI 上做（不在开发者本机编译）：
+#   · PC 端：dist\PhotoBeam.exe（Windows GUI 子系统，嵌图标 + 应用清单）
+#   · 安卓端：PhotoBeam.apk（aapt2 → kotlinc → d8 → zipalign → apksigner，已签名）
+# 两个 job 各自产出 artifact，跑完可在 Actions 页面直接下载。
+on:
+  push:
+    branches: [main, 'feature/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pc:
+    name: PC 端 (Windows exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          cache: false
+
+      # rsrc：纯 Go 的资源编译器，把 icon.ico + app.manifest 嵌进 exe
+      # （不需要 Windows SDK / MinGW 的 rc.exe）
+      - name: 安装 rsrc（嵌图标与清单）
+        run: |
+          go install github.com/akavel/rsrc@latest
+          "$(go env GOPATH)\bin\rsrc.exe" -h 2>&1 | Select-Object -First 2
+
+      - name: 构建 PhotoBeam.exe
+        run: cmd /c build-pc.bat
+
+      - name: 校验产物
+        shell: pwsh
+        run: |
+          $f = 'dist\PhotoBeam.exe'
+          if (-not (Test-Path $f)) { throw '产物不存在' }
+          $b = [IO.File]::ReadAllBytes($f)
+          foreach ($k in @('Microsoft.Windows.Common-Controls','PerMonitorV2','asInvoker')) {
+            if (-not ([Text.Encoding]::ASCII.GetString($b).Contains($k))) { throw "清单缺少 $k" }
+          }
+          Write-Output "产物 $((Get-Item $f).Length) 字节；清单校验通过"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhotoBeam-pc-windows
+          path: dist/PhotoBeam.exe
+          if-no-files-found: error
+
+  android:
+    name: 安卓端 (APK)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # Android SDK：runner 自带 SDK，补装本项目需要的 build-tools / platform
+      - name: 安装 Android SDK 组件
+        shell: pwsh
+        run: |
+          $sdk = $env:ANDROID_SDK_ROOT
+          if (-not $sdk) { $sdk = "$env:LOCALAPPDATA\Android\Sdk" }
+          "sdk.dir=$sdk" | Out-File -FilePath "$env:USERPROFILE\.android\repositories.cfg" -Encoding ascii -ErrorAction SilentlyContinue
+          $sdkmanager = Get-ChildItem -Path $sdk -Recurse -Filter 'sdkmanager.bat' -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $sdkmanager) { throw '找不到 sdkmanager' }
+          & $sdkmanager "build-tools;37.0.0" "platforms;android-36" | Out-Null
+          Write-Output "SDK 组件安装完成"
+
+      # kotlinc（不进仓库，体积大）：从 JetBrains 官方 release 取 2.1.20（与本机一致）
+      - name: 准备 kotlinc + BouncyCastle
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path tools | Out-Null
+          curl.exe -L --fail -o tools\kotlinc.zip `
+            https://github.com/JetBrains/kotlin/releases/download/v2.1.20/kotlin-compiler-2.1.20.zip
+          Expand-Archive tools\kotlinc.zip -DestinationPath tools\ktmp -Force
+          Move-Item tools\ktmp\kotlinc tools\kotlinc -Force
+          Remove-Item tools\ktmp -Recurse -Force
+          curl.exe -L --fail -o tools\bcprov.jar `
+            https://repo1.maven.org/maven2/org/bouncycastle/bcprov-jdk18on/1.78.1/bcprov-jdk18on-1.78.1.jar
+          Write-Output "kotlinc + bcprov 就绪"
+
+      # 签名材料：release keystore 不进仓库（仓库要脱敏），走 Actions secret
+      # 与本机同一把钥匙 → CI 产出的 APK 可以直接覆盖安装本机已装的版本
+      - name: 还原签名材料
+        shell: pwsh
+        env:
+          KEYSTORE_B64: ${{ secrets.APK_KEYSTORE_B64 }}
+          KEYSTORE_PASS: ${{ secrets.APK_KEYSTORE_PASS }}
+        run: |
+          if (-not $env:KEYSTORE_B64) { throw '缺少 secret：APK_KEYSTORE_B64' }
+          $dir = "$env:LOCALAPPDATA\PhotoBeam"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          [IO.File]::WriteAllBytes("$dir\photobeam-release.keystore", [Convert]::FromBase64String($env:KEYSTORE_B64))
+          [IO.File]::WriteAllText("$dir\keystore.pass", $env:KEYSTORE_PASS)
+          Write-Output "签名材料已就位"
+
+      - name: 构建 PhotoBeam.apk
+        run: cmd /c build-android.bat
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhotoBeam-android-apk
+          path: PhotoBeam.apk
+          if-no-files-found: error

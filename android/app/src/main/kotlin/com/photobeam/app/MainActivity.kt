@@ -29,11 +29,28 @@ import java.util.Locale
 
 object Notifier {
     const val CH_EVENTS = "photobeam_events"
+    // [E-a] 「图片已到电脑」单独一个**低优先级**通道：连着拍十几张时不该一直响。
+    const val CH_ARRIVED = "photobeam_arrived"
     fun channel(ctx: Context): NotificationManager {
         val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         nm.createNotificationChannel(
             NotificationChannel(CH_EVENTS, "事件通知", NotificationManager.IMPORTANCE_DEFAULT))
+        nm.createNotificationChannel(
+            NotificationChannel(CH_ARRIVED, "图片已到电脑", NotificationManager.IMPORTANCE_LOW))
         return nm
+    }
+
+    /**
+     * [E-a] 图片已到电脑 —— **合并式**通知：
+     *  始终复用同一个通知 id（104），连续到达只更新那一条 → 通知栏里只有一条，
+     *  标题带累计张数、内容带最近一张文件名。
+     *  通道是 IMPORTANCE_LOW → 连续截图**不会**连环响铃/震动（只安静地更新）。
+     */
+    fun arrived(ctx: Context, total: Int, lastName: String) {
+        channel(ctx).notify(104, android.app.Notification.Builder(ctx, CH_ARRIVED)
+            .setContentTitle("已到电脑：$total 张")
+            .setContentText(if (lastName.isEmpty()) "图片已同步到电脑" else "最近一张：$lastName")
+            .setSmallIcon(android.R.drawable.stat_notify_sync).build())
     }
     fun queueOverflow(ctx: Context, dropped: Int) {
         channel(ctx).notify(100, android.app.Notification.Builder(ctx, CH_EVENTS)
@@ -461,6 +478,9 @@ class MainActivity : Activity() {
         statusView.text = "正在发现电脑…"
         Thread {
             var sasTimedOut = false
+            // [Stage 5 第五轮] PC 明确拒绝（H）/ 对方断开
+            var peerRejected = false
+            var peerRejectReason: String? = null
             try {
                 // 手工填的 IP 优先；没填就用上次记录里的
                 val lastIP = manualIP?.takeIf { it.isNotBlank() }
@@ -485,19 +505,55 @@ class MainActivity : Activity() {
                 sock.tcpNoDelay = true
                 sock.connect(java.net.InetSocketAddress(pc.ip, pc.port), 3000)
                 sock.soTimeout = 90_000
-                val res = engine.handshake(sock, sasConfirm = { sas ->
+                val res = engine.handshake(sock, sasConfirm = { sas, peerName ->
                     // UI 线程弹 SAS 比对对话框，同步等待用户确认
                     // [Stage 5 修订] 等待上限 15s → 60s：人眼核对 6 位数字再点按钮，15s 不够
                     //（实测首轮验收时手机端因等待超时直接发出了 pair_reject）。
                     // **两端必须一致**：PC 端向导窗同样是 60s（pc/pairing_windows.go pairTimeout）。
-                    android.util.Log.d("PhotoBeam", "SAS 回调进入: $sas")
+                    android.util.Log.d("PhotoBeam", "SAS 回调进入: $sas (对方电脑=$peerName)")
                     val latch = java.util.concurrent.CountDownLatch(1)
                     var agreed = false
+                    val peerGone = java.util.concurrent.atomic.AtomicBoolean(false)
                     var dlg: android.app.AlertDialog? = null
+                    // [H] 等待期间监测对端是否已断开 ——
+                    // PC 点「不一致」会立刻发 pair_reject 并断连，旧实现下手机端的核对框
+                    // 还要再挂满 60 秒。这里用一个只读探针线程守着 socket：
+                    // 一旦对端发数据或断开 → 立刻关掉核对框（探针只读，不参与协议解析）。
+                    val stopWatch = java.util.concurrent.atomic.AtomicBoolean(false)
+                    val watcher = Thread {
+                        try {
+                            sock.soTimeout = 500
+                            val input = sock.getInputStream()
+                            while (!stopWatch.get()) {
+                                val b = try {
+                                    input.read()
+                                } catch (e: java.net.SocketTimeoutException) {
+                                    continue
+                                } catch (e: Exception) {
+                                    -1
+                                }
+                                if (b < 0) {
+                                    peerGone.set(true) // 对端关闭了连接
+                                    latch.countDown()
+                                    break
+                                }
+                                // 等待期间对端只可能发 pair_reject（还没到 pair_confirm 阶段）
+                                peerGone.set(true)
+                                latch.countDown()
+                                break
+                            }
+                        } catch (e: Exception) {
+                        }
+                    }
+                    watcher.isDaemon = true
+                    watcher.start()
                     runOnUiThread {
                         dlg = AlertDialog.Builder(this)
                             .setTitle("请在电脑上核对数字")
-                            .setMessage("电脑屏幕与手机应显示相同的 6 位数字：\n\n$sas\n\n" +
+                            // [C1] 带上**对方电脑名**：同一局域网里可能跑着别人的 PhotoBeam，
+                            // 用户要能核对「对面那台是不是我的电脑」。
+                            .setMessage("对方电脑：${peerName.ifEmpty { "（名称未知）" }}\n\n" +
+                                "电脑屏幕与手机应显示相同的 6 位数字：\n\n$sas\n\n" +
                                 "两端一致请点『一致』；不一致请点『不一致』。\n" +
                                 "（60 秒内未确认会自动取消）")
                             .setPositiveButton("一致") { _, _ ->
@@ -508,6 +564,10 @@ class MainActivity : Activity() {
                             .show()
                     }
                     val answered = latch.await(60, java.util.concurrent.TimeUnit.SECONDS)
+                    // 探针必须先退出，否则会和后续握手抢同一个 socket
+                    stopWatch.set(true)
+                    try { watcher.join(1500) } catch (e: Exception) { }
+                    sock.soTimeout = 90_000
                     if (!answered) {
                         // [Stage 5 修复] 等待超时后必须把对话框关掉：
                         // 否则屏幕上会留一个已经失效的核对框，用户再点它也没有任何作用。
@@ -516,21 +576,45 @@ class MainActivity : Activity() {
                         runOnUiThread { dlg?.dismiss() }
                         return@handshake SAS_TIMEOUT
                     }
+                    if (peerGone.get()) {
+                        // [H] 对方已经拒绝/断开 → 不再发 pair_reject（连接已经没了）
+                        peerRejected = true
+                        runOnUiThread { dlg?.dismiss() }
+                        return@handshake SAS_TIMEOUT
+                    }
                     if (agreed) SAS_CONFIRM else SAS_REJECT
                 })
+                // [Stage 5 第五轮] PC 可能用 MODE.err 明确拒绝（例如 receiver_not_ready）
+                if (res.versionErr != null) {
+                    peerRejected = true
+                    peerRejectReason = res.versionErr
+                } else {
                 // 设备记录已在 PairingEngine.handshake 内部持久化（协议 §3.3）
                 SenderService.start(applicationContext)
                 runOnUiThread {
                     statusView.text = "配对成功！截图/存图会自动同步到电脑。"
                     refreshStatus()
                 }
+                }
             } catch (e: Exception) {
                 runOnUiThread {
-                    statusView.text = if (sasTimedOut) {
-                        "配对超时：60 秒内没有完成核对。\n请确认电脑上的配对窗口还在，再点一次 ②。"
-                    } else {
-                        // [A10] 原始异常可能是英文/技术串 → 换成中文说明
-                        friendlyPairError(e)
+                    statusView.text = when {
+                        sasTimedOut ->
+                            "配对超时：60 秒内没有完成核对。\n请确认电脑上的配对窗口还在，再点一次 ②。"
+                        peerRejected ->
+                            // [Stage 5 第五轮] PC 明确拒绝了（未在待命态 / 版本不符 / 对方已断开）
+                            when (peerRejectReason) {
+                                "receiver_not_ready" ->
+                                    "对方电脑**没有在等待配对**。\n" +
+                                        "请在电脑上点托盘图标 →「配对新设备」，然后再点一次 ②。"
+                                "version_unsupported" ->
+                                    "对方电脑上的 PhotoBeam 版本太旧，请更新后再试。"
+                                else ->
+                                    "对方电脑已经拒绝或断开了配对（连接已关闭）。\n请重新点一次 ②。"
+                            }
+                        else ->
+                            // [A10] 原始异常可能是英文/技术串 → 换成中文说明
+                            friendlyPairError(e)
                     }
                 }
             }

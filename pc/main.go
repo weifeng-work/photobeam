@@ -26,6 +26,13 @@ func main() {
 		}
 	}()
 
+	// 监护进程模式（隐藏）：只盯着主进程，主进程异常消失就把它拉起来
+	// [Stage 5 第五轮 · L] 不需要注册系统计划任务 → 不需要提权/用户单独授权
+	if len(os.Args) == 2 && os.Args[1] == supervisorFlag {
+		runSupervisor()
+		return
+	}
+
 	// 隐藏自检入口：PhotoBeam.exe --test-clipboard <图片路径>
 	// 直接跑 剪贴板管线（解码→DIB→写入→10 秒还原），结果打印到 stdout
 	if len(os.Args) == 3 && os.Args[1] == "--test-clipboard" {
@@ -43,6 +50,9 @@ func main() {
 	identity = loadOrCreateIdentity()
 	loadSeenIDs()
 	logf("PhotoBeam 启动 · 指纹 %s · 保存目录 %s", identity.FP(), getSaveDir())
+	// [Stage 5 第五轮 · L] 把自己的 PID 写进交接文件，并拉起隐藏的监护进程
+	writeSupervisorPID()
+	startSupervisor()
 
 	// TCP 监听（5416 起探测空闲端口）
 	if err := startTCPServer(); err != nil {
@@ -83,19 +93,52 @@ func main() {
 		}
 	}()
 
+	// [Stage 5 第五轮 · A1′] 首次启动且**尚未配对过任何设备** → 自动进入待命态，
+	// 让第一次配对零学习成本（不用先知道「配对新设备」这个入口）。
+	// 有设备之后就不再自动待命 —— 新增设备必须由用户在托盘里显式点「配对新设备」。
+	if len(cfg.Devices) == 0 {
+		armPairing(pairArmFirstRun)
+		go func() {
+			time.Sleep(1500 * time.Millisecond)
+			messageBox("欢迎使用 PhotoBeam。\n\n"+
+				"现在请在手机上打开 App，点「② 配对电脑」。\n"+
+				"本机已进入「等待新设备」状态（10 分钟内有效），\n"+
+				"手机点完 ② 之后，电脑上会弹出配对确认窗，核对两端的 6 位数字即可。\n\n"+
+				"（之后再加新手机：电脑托盘 →「配对新设备」）", "PhotoBeam")
+		}()
+	}
+
+	// 托盘 tooltip 倒计时刷新（仅在待命态下才动，systray.SetTooltip 内部有锁，跨线程安全）
+	go func() {
+		last := ""
+		for {
+			time.Sleep(time.Second)
+			cur := ""
+			if rem := pairingArmRemaining(); rem > 0 {
+				cur = fmt.Sprintf("等待%d", rem)
+			}
+			if cur != last {
+				last = cur
+				updateTrayTooltip()
+			}
+		}
+	}()
+
 	systray.Run(onReady, onExit)
 }
 
 func onReady() {
 	systray.SetIcon(trayIconIco) // [修复] 此前漏设图标 → 托盘显示空白
-	systray.SetTooltip("PhotoBeam 接收器 · TCP " + fmt.Sprint(cfg.TCPPort) + " · 指纹 " + identity.FP())
+	updateTrayTooltip()
 
 	mOpen := systray.AddMenuItem("打开接收文件夹", "打开 "+getSaveDir())
 	mSetDir := systray.AddMenuItem("接收文件夹…", "更改图片保存目录（立即生效）")
+	mPairNew := systray.AddMenuItem("配对新设备", "允许一台新手机接入（2 分钟内有效；配成即失效）")
 	mRePair := systray.AddMenuItem("重新配对", "清除已配对设备，下次连接重新走配对流程")
 	mDiag := systray.AddMenuItem("导出诊断信息", "生成诊断文本并写入日志目录（不写入剪贴板）")
 	mFW := systray.AddMenuItem("修复防火墙规则", "以管理员权限重建防火墙入站规则")
 	mAuto := systray.AddMenuItemCheckbox("开机自启（登录时启动）", "写入当前用户的启动项", cfg.Autostart)
+	mSuper := systray.AddMenuItemCheckbox("崩溃后自动重启", "主进程异常退出时由隐藏监护进程拉起（不需要管理员权限）", supervisorEnabled())
 	systray.AddSeparator()
 	// [Stage 5 收尾 · 场景D] 剪贴板相关的两项配置原本只能手改 config.json，
 	// 改完还得重启进程才生效 → 现在托盘里直接改，**立即生效**。
@@ -131,7 +174,18 @@ func onReady() {
 			})
 		case <-mRePair.ClickedCh:
 			clearDevices()
-			messageBox("已清除全部配对记录。\n手机下次连接时将重新进入配对流程。", "重新配对")
+			// [Stage 5 第五轮] 重新配对 = 用户明确要接新设备 → 直接进入待命态
+			armPairing(pairArmFirstRun)
+			messageBox("已清除全部配对记录。\n"+
+				"手机下次连接时将重新进入配对流程。\n\n"+
+				"（本机已进入「等待新设备」状态，2 分钟内有效）", "重新配对")
+		case <-mPairNew.ClickedCh:
+			// [Stage 5 第五轮] 显式进入待命态：只有在这个窗口里才接受新设备的配对请求
+			armPairing(pairArmWindow)
+			updateTrayTooltip()
+			messageBox("已进入「等待新设备」状态（2 分钟内有效）。\n\n"+
+				"现在请在手机上点「② 配对电脑」，本机才会弹出配对确认窗。\n"+
+				"（这样可以避免同一局域网里别人的 PhotoBeam 误连到本机）", "配对新设备")
 		case <-mDiag.ClickedCh:
 			// [PC-5] 诊断信息**不再写入剪贴板**（用户已决定），改为写文件
 			go goroutineSafe("export-diagnostics", func() {
@@ -158,6 +212,19 @@ func onReady() {
 			saveConfig(cfg)
 			setAutostart(cfg.Autostart)
 			syncAutostartCheck(mAuto)
+		case <-mSuper.ClickedCh:
+			// [Stage 5 第五轮 · L] 崩溃自动重启开关
+			on := !supervisorEnabled()
+			setSupervisorEnabled(on)
+			setMenuChecked(mSuper, on)
+			if on {
+				startSupervisor() // 立刻拉起一个监护进程
+			}
+			logf("崩溃后自动重启已%s", onOffText(on))
+			messageBox("「崩溃后自动重启」已"+onOffText(on)+"。\n\n"+
+				"开启后：主进程异常退出（崩溃/被任务管理器结束）会被隐藏监护进程拉起。\n"+
+				"关闭后：退出就退出，不会自己回来。\n"+
+				"（用托盘「退出」正常关闭始终不会被拉起）", "PhotoBeam")
 		case <-mClip.ClickedCh:
 			// [场景D] 剪贴板开关：立即生效（写入路径每次都读 cfg）
 			cfg.ClipboardEnabled = !cfg.ClipboardEnabled
@@ -179,6 +246,8 @@ func onReady() {
 		case <-mRestart.ClickedCh:
 			restartSelf()
 		case <-mQuit.ClickedCh:
+			// [Stage 5 第五轮 · L] 标记「主动退出」→ 监护进程不会把它拉回来
+			markCleanExit()
 			systray.Quit()
 		}
 	}
@@ -237,10 +306,17 @@ func restartSelf() {
 		messageBox("重启失败：\n"+err.Error()+"\n\n请手动双击 PhotoBeam.exe。", "PhotoBeam 重启")
 		return
 	}
-	logf("已启动新进程 %s，本进程即将退出", exe)
-	// 给新进程留出绑定端口的时间，再退出旧进程
+	// [L] 等新进程把 PID 写进交接文件后再退出 —— 否则监护进程会以为「主进程崩了」而重复拉起
+	deadline := timeNow().Add(3 * time.Second)
+	for timeNow().Before(deadline) {
+		if p := readSupervisorPID(); p > 0 && p != os.Getpid() {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	logf("已启动新进程 %s（pid=%d），本进程即将退出", exe, cmd.Process.Pid)
 	go func() {
-		time.Sleep(1200 * time.Millisecond)
+		time.Sleep(600 * time.Millisecond)
 		systray.Quit()
 		time.Sleep(300 * time.Millisecond)
 		os.Exit(0)
@@ -248,6 +324,15 @@ func restartSelf() {
 }
 
 func onExit() {}
+
+// updateTrayTooltip：托盘 tooltip 显示当前 TCP 端口、指纹，以及**是否在等待新设备**
+func updateTrayTooltip() {
+	tip := "PhotoBeam 接收器 · TCP " + fmt.Sprint(cfg.TCPPort) + " · 指纹 " + identity.FP()
+	if rem := pairingArmRemaining(); rem > 0 {
+		tip += fmt.Sprintf(" · 等待新设备（%d 秒）", rem)
+	}
+	systray.SetTooltip(tip)
+}
 
 func openFolder(dir string) {
 	go func() {

@@ -342,10 +342,14 @@ class PairingEngine(
      * 执行握手（HELLO → HELLO → MODE → ECDH/SAS → 认证帧）。
      * pairing 模式下，本函数发送 pair_confirm 前会回调 [sasConfirm]
      * （返回 SAS_CONFIRM / SAS_REJECT / SAS_TIMEOUT 三态）。
+     *
+     * [Stage 5 第五轮] 回调多带一个 **peerName**（对端电脑名，来自对端 HELLO 的 dev_name）：
+     * 用户要能核对「对面那台电脑是不是我的电脑」——这在同一个局域网里跑着多对
+     * PhotoBeam 用户时是唯一可靠的锚点（C1）。
      */
     fun handshake(
         sock: Socket,
-        sasConfirm: (sas: String) -> Int,
+        sasConfirm: (sas: String, peerName: String) -> Int,
         allowPairing: Boolean = true
     ): HandshakeResult {
         val inp = sock.getInputStream()
@@ -426,7 +430,7 @@ class PairingEngine(
             // 超时**不发 pair_reject**——pair_reject 的语义是「用户明确拒绝」，
             // 把「用户没来得及看」也当成拒绝，会让 PC 端记成「手机端拒绝配对」并弹错提示。
             // 超时只静默断开，由 PC 自己的 60 秒定时器收尾并提示「配对超时」。
-            when (sasConfirm(sas)) {
+            when (sasConfirm(sas, peerHello.optString("dev_name", ""))) {
                 SAS_CONFIRM -> {
                     ch.writeFrame(out, FRAME_CTRL, org.json.JSONObject()
                         .put("type", "pair_confirm")

@@ -14,7 +14,12 @@ import java.net.Socket
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
-data class FoundPC(val name: String, val ip: String, val port: Int, val fp: String, val paired: Boolean)
+data class FoundPC(
+    val name: String, val ip: String, val port: Int, val fp: String, val paired: Boolean,
+    /** [Stage 5 第五轮] 对方电脑当前**愿意接受新设备配对**（PC 点了「配对新设备」或首次待命窗口内）。
+     *  同一局域网里有多台 PhotoBeam 时，用它挑「正在等你」的那台 —— 避免连错机器。 */
+    val pairReady: Boolean = false
+)
 
 object Discovery {
     const val UDP_PORT = 5416
@@ -31,7 +36,8 @@ object Discovery {
         val o = org.json.JSONObject(String(b, Charsets.UTF_8))
         if (o.optString("type") == "found" && o.optInt("pb") == 1)
             FoundPC(o.optString("name", ""), o.optString("ip", ""), o.optInt("port", 0),
-                o.optString("fp", ""), o.optBoolean("paired", false))
+                o.optString("fp", ""), o.optBoolean("paired", false),
+                o.optBoolean("pair_ready", false))
         else null
     } catch (e: Exception) {
         null
@@ -145,8 +151,9 @@ object Discovery {
         pool.shutdown()
         pool.awaitTermination(6, TimeUnit.SECONDS)
         if (hits.isNotEmpty()) {
-            // 指纹相同的那台优先（同一局域网可能有多台 PhotoBeam PC）
+            // 择优顺序：① 自己那台（指纹匹配）② 正在等待配对的那台 ③ 其余
             return hits.firstOrNull { !knownFP.isNullOrEmpty() && it.fp == knownFP }
+                ?: hits.firstOrNull { it.pairReady }
                 ?: hits.firstOrNull { it.fp.isNotEmpty() && knownIP == null }
                 ?: hits.first()
         }
@@ -160,7 +167,8 @@ object Discovery {
      * 已知 PC 的指纹（knownFP）时：
      *   · 应答来自别的 IP 且指纹不同 → **是别人的机器 → 忽略这条应答，继续等自己那台的**；
      *   · 应答来自别的 IP 但指纹相同 → 同一台 PC 换了 IP → 算命中。
-     * 没有 knownFP（首次配对）→ 首个应答即走（此时没有可比对的指纹；真伪由握手签名把关）。
+     * 没有 knownFP（首次配对）→ 优先取 **pair_ready=true**（对方正在等你配对）的那台；
+     * 找不到 ready 的才退回首个应答（此时 PC 会用 MODE.err 明确回「没在等待配对」）。
      */
     private fun hitViaUDP(target: InetAddress, knownIP: String?, knownFP: String?,
                           perAddrTimeoutMs: Int = 1500): FoundPC? {
@@ -185,9 +193,17 @@ object Discovery {
                     // 手机端手工 IP 兜底时 ip 字段可能为空 → 补 [R-19]
                     val ip = if (found.ip.isNotEmpty()) found.ip else pkt.address.hostAddress
                     if (knownFP.isNullOrEmpty()) {
-                        // 没有可比对的指纹 → 首个应答即走
-                        s.close()
-                        return FoundPC(found.name, ip, found.port, found.fp, found.paired)
+                        // 没有可比对的指纹（首次配对）→ 优先要**正在等待配对**的那台
+                        // （PC 点了「配对新设备」或首次待命窗口内会在 found 里带 pair_ready=true）。
+                        // 没有 ready 的就留着当兜底，继续听有没有 ready 的应答。
+                        if (found.pairReady) {
+                            s.close()
+                            return FoundPC(found.name, ip, found.port, found.fp, found.paired, true)
+                        }
+                        if (fallback == null) {
+                            fallback = FoundPC(found.name, ip, found.port, found.fp, found.paired, false)
+                        }
+                        continue
                     }
                     if (found.fp == knownFP) {
                         // 指纹一致 = 同一台 PC（哪怕 IP 变了）→ 精确命中

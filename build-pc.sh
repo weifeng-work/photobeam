@@ -12,9 +12,11 @@ echo "[1/3] go vet（-unsafeptr=false 豁免：globalAllocCopy/globalRead 的 Gl
       转换是 x/sys 惯用模式，GlobalLock 期间内存被 pin，实为零风险——审查裁定见 stage3-review.md §七①）"
 go vet -unsafeptr=false ./...  # 已在 pc/ 目录
 
-# exe 文件图标：.ico → .syso（源码目录内，go build 自动链接）
-if [ icon.ico -nt rsrc_windows_amd64.syso ]; then
-  "$(go env GOPATH)/bin/rsrc.exe" -ico icon.ico -o rsrc_windows_amd64.syso
+# exe 文件图标 + 应用清单：.ico/.manifest → .syso（源码目录内，go build 自动链接）
+# [Stage 5 第五轮 · J] 清单激活 ComCtl32 v6 → 系统按钮改用 Win11 扁平样式；
+#   同时声明 PerMonitorV2 DPI 感知与长路径支持。rsrc.exe 是纯 Go 工具（无需 Windows SDK/MinGW）。
+if [ ! -f rsrc_windows_amd64.syso ] || [ icon.ico -nt rsrc_windows_amd64.syso ] || [ app.manifest -nt rsrc_windows_amd64.syso ]; then
+  "$(go env GOPATH)/bin/rsrc.exe" -manifest app.manifest -ico icon.ico -o rsrc_windows_amd64.syso
 fi
 
 echo "[2/3] go build（GUI 子系统）"

@@ -576,6 +576,8 @@ class SenderService : Service() {
                 .remove("failed_last_reason")
                 .apply()
             android.util.Log.d("PhotoBeam", "到达回执: $name（累计 $n 张）")
+            // [E-a] 合并式通知：连续到达只更新同一条（低优先级通道，不连环响）
+            try { Notifier.arrived(applicationContext, n, name) } catch (e: Exception) { }
         } catch (e: Exception) { }
     }
 
@@ -732,7 +734,7 @@ class SenderService : Service() {
             sock.tcpNoDelay = true
             sock.connect(java.net.InetSocketAddress(hit.ip, hit.port), 1500)
             sock.soTimeout = 45_000
-            val hs = pairing.handshake(sock, { _ -> SAS_CONFIRM }, allowPairing = false)
+            val hs = pairing.handshake(sock, { _, _ -> SAS_CONFIRM }, allowPairing = false)
             if (hs.mode != "reconnect") {
                 throw java.io.IOException("对端要求重新配对（本端在后台发送路径，已断开）")
             }
