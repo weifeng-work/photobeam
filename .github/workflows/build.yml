@@ -12,6 +12,11 @@ on:
 permissions:
   contents: read
 
+# CI runner 的 Python stdout 默认 cp1252 → 交付校验里打印中文（① 等）会 UnicodeEncodeError
+env:
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: '1'
+
 jobs:
   pc:
     name: PC 端 (Windows exe)
