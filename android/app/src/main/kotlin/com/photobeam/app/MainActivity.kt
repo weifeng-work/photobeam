@@ -313,6 +313,13 @@ class MainActivity : Activity() {
         // 显式起一个 ListView 变量：apply 块内的 this 与 lambda 内的 this 不是同一个，
         // 直接写 adapter/setItemChecked 会解析不到（编译器报 unresolved reference）。
         val lv = ListView(this)
+        // 限制列表最大高度：目录多时列表内部自己滚，不把对话框顶出屏幕
+        // （ListView 默认在自适应高度下会尽量占满，长列表时反而把说明文字挤出视野）。
+        val maxListH = (320 * resources.displayMetrics.density).toInt()
+        lv.layoutParams = ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            if (height > maxListH) height = maxListH
+        }
         lv.adapter = ArrayAdapter(this, android.R.layout.simple_list_item_multiple_choice, labels)
         lv.setOnItemClickListener(object : AdapterView.OnItemClickListener {
             override fun onItemClick(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
