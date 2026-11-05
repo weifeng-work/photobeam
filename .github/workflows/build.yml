@@ -146,7 +146,11 @@ jobs:
 
   # ---------- 产物清理 ----------
   # 每次推送产生 2 个 artifact，不清理会无限堆积（默认保留 90 天也会占空间）。
-  # 策略：CI 跑完后删掉**历史** artifact，保留本次的（否则本次产物也一起没了）。
+  #
+  # 策略：**只删「早于最近一次成功 run」的 artifact**，保留最近两次 run 的产物。
+  #   · 不用「本次 run 之外」——upload-artifact 与清理 job 存在并发竞态，
+  #     实测会把本次刚上传的产物一起删掉（kept 2 但事后查不到）。
+  #   · 改成按 run 时间排序保留最新 2 个 run，最稳且不依赖 run id 比较。
   cleanup-artifacts:
     name: 清理旧产物
     runs-on: ubuntu-latest
@@ -156,28 +160,42 @@ jobs:
       contents: read
     if: always()          # 无论前面成败都清理
     steps:
-      - name: 删除本次 run 之外的历史 artifact
+      # 给 artifact 上传留出收尾时间（upload-artifact 的 finalize 有延迟）
+      - name: 等待产物上传完成
+        run: sleep 30
+
+      - name: 只保留最近 2 个 run 的 artifact
         uses: actions/github-script@v7
         with:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const currentRun = context.runId;
+            const KEEP_RUNS = 2;   // 保留最近 2 个 run 的产物
             const artifacts = await github.paginate(github.rest.actions.listArtifactsForRepo, {
               owner, repo, per_page: 100
             });
-            let n = 0, kept = 0;
+            // 按 workflow_run.id 分组（id 单调递增，大的更新）
+            const byRun = new Map();
             for (const a of artifacts) {
-              // 本次 run 的 artifact 要留着（用户要从 Actions 页面下载本次产物）
-              if (a.workflow_run && a.workflow_run.id === currentRun) { kept++; continue; }
-              try {
-                await github.rest.actions.deleteArtifact({ owner, repo, artifact_id: a.id });
-                n++;
-              } catch (e) {
-                core.warning(`delete artifact ${a.id} failed: ${e.message}`);
+              const rid = a.workflow_run ? a.workflow_run.id : 0;
+              if (!byRun.has(rid)) byRun.set(rid, []);
+              byRun.get(rid).push(a);
+            }
+            const runIds = [...byRun.keys()].sort((x, y) => y - x);
+            const keep = new Set(runIds.slice(0, KEEP_RUNS));
+            let n = 0;
+            for (const [rid, list] of byRun.entries()) {
+              if (keep.has(rid)) continue;
+              for (const a of list) {
+                try {
+                  await github.rest.actions.deleteArtifact({ owner, repo, artifact_id: a.id });
+                  n++;
+                } catch (e) {
+                  core.warning(`delete artifact ${a.id} failed: ${e.message}`);
+                }
               }
             }
-            core.info(`deleted ${n} old artifacts, kept ${kept} from current run`);
+            core.info(`deleted ${n} old artifacts, kept runs: ${[...keep].join(', ')}`);
 
   # ---------- 自动 Release ----------
   # 打 v* tag 触发：重新构建两个产物 → 汇总成 Release（附 apk/exe 下载链接）。
