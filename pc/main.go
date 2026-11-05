@@ -579,7 +579,7 @@ func testClipboard(path string) {
 	}
 	logf("解码 OK: %dx%d dib=%dB png=%dB", w, h, len(dib), len(pngData))
 
-	ok, snapNil := writeClipboardWithRestore(dib, pngData, 10, nil)
+	ok, snapNil := writeClipboardWithRestore(dib, func() []byte { return pngData }, 10, nil)
 	logf("写入返回: %v（无主剪贴板不还原=%v）", ok, snapNil)
 
 	// 读回验证：CF_DIB 尺寸 + 排除标记存在

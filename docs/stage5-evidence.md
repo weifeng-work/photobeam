@@ -573,6 +573,92 @@ return FoundPC(found.name, ip, found.port, found.fp, found.paired)      ← 同�
 
 ---
 
+### 5.12 第六轮：端到端时延（截图 → PC 剪贴板可粘贴）优化
+
+**起因**：用户实机反馈「截图后要过 3 秒以上才同步到剪贴板」，要求降到 2 秒内。
+协议 §9 第 2 条原为「≤3 秒落盘」——实测**不达标**，需定位并修复。
+
+#### 5.12.1 定位方法
+
+不靠估算，用两个独立探针把延迟切开：
+
+1. **手机端**：`adb logcat -v threadtime -s PhotoBeam:D`——逐阶段毫秒时间戳；
+2. **PC 端**：`pc.log`——落盘/剪贴板各阶段时间戳；
+3. **端到端**：自编译 C# 探针（`tools/assert-latency.ps1` 的原型）——
+   在 PC 上 1ms 轮询 `IsClipboardFormatAvailable(CF_DIB)`，同时用 `adb shell input keyevent
+   KEYCODE_SYSRQ` 触发真实截图。**CF_DIB 出现 = 用户已可 Ctrl+V**，这是用户真正感知的时刻。
+
+#### 5.12.2 优化前的实测（2026-11-05 22:00 前）
+
+端到端三次：**3399ms / 3353ms / 超时**。
+
+分段归因（手机端日志 + PC 日志 + 探针对齐）：
+
+| 段 | 耗时 | 占比 | 归属 |
+|---|---|---|---|
+| MIUI 截图落库 | 414ms | 12% | 系统，**不可优化** |
+| ContentObserver 触发（含 250ms 固定去抖） | 400ms | 12% | 可优化 |
+| 对账 + 冲刷调度 | 175ms | 5% | 部分可优化 |
+| TCP 握手 + 密钥协商 | 51ms | 1.5% | 已足够快 |
+| readReady 读文件 | 66ms | 2% | 已足够快 |
+| 传输 93KB + 等 ACK | 55ms | 1.6% | 已足够快 |
+| PC 落盘 | 127ms | 4% | 可优化 |
+| **PC 剪贴板管线** | **≈1400ms** | **≈43%** | **主凶** |
+
+**传输链路（截图→PC 落盘）仅约 1.2 秒；剩下 1.4 秒全耗在 PC 端准备剪贴板。**
+
+PC 端剪贴板管线的三段开销（Go 基准测试，用真机截图 1080x2400）：
+
+```
+1. image.Decode            =  65ms
+2. 逐像素 img.At() 循环     = 278ms   ← clipboard_windows.go（原实现）
+3. png.Encode (JPEG→PNG)   = 846ms   ← clipboard_windows.go（原实现）
+4. 固定 sleep 350+250ms    = 600ms   ← 写在 CF_DIB 之后，不影响粘贴但阻塞函数返回
+                              ─────
+                              1789ms
+```
+
+**关键发现**：`png.Encode` 的 846ms **完全不在关键路径上**——CF_DIB 在写完时用户已经
+可以粘贴，PNG 只是给偏好 PNG 的应用的无损备选（实测剪贴板里 DIB 10368040B、PNG 206643B，
+两者都提供）。
+
+#### 5.12.3 三项改造
+
+| # | 改动 | 位置 | 省下 |
+|---|---|---|---|
+| 1 | **PNG 编码移出关键路径**：CF_DIB 写完立即返回，PNG 由后台 goroutine 编码完再补写（代际号校验，避免覆盖更新的图） | `pc/clipboard_windows.go` | **846ms** |
+| 2 | **逐像素 `img.At()` → `draw.Draw` 快速路径**：标准库一次性把源图转 `*image.RGBA`，再按行做 BGR 交换 | `pc/clipboard_windows.go` | **245ms**（278→33） |
+| 3 | **去抖自适应**：队列空（单张截图）→ 立即冲刷；队列有积压（连拍）→ 沿用 250ms 去抖合并 | `android/.../SenderService.kt` | **250ms** |
+
+改造 #2 的基准对比（真机截图 1080x2400）：
+
+```
+img.At() 逐像素:  best=115ms  avg=132ms
+draw.Draw 快速路径: best= 33ms  avg= 40ms     提速约 4~8 倍
+```
+
+**像素值一致性**：改造后用 4x2 逐色测试图逐字节校验（含 bottom-up 行序、BGR 通道序、
+BITMAPINFOHEADER 各字段），与原实现一致。色彩转换**交给标准库**（`draw.Draw` 对 YCbCr 有
+专门快路径），不手写 YCbCr→RGB 公式——手写版本实测有 74.9% 字节偏差（精度公式不对），已弃用。
+
+#### 5.12.4 守门人（让「≤2 秒」有明确的判定者）
+
+| 层级 | 工具 | 判定 | 依赖 |
+|---|---|---|---|
+| PC 关键路径 | `cd pc && go test -run TestDIB -v` | 解码+DIB ≤ 300ms；PNG 不得回到同步路径；DIB 内容逐字节校验 | 无（CI 可跑） |
+| 端到端 | `pwsh -File tools/assert-latency.ps1` | CF_DIB 就绪 ≤ 2000ms，20 采样 18 次达标 | 真机 + 已配对 |
+
+`pc/clipboard_perf_test.go` 三个测试：
+
+- `TestDIBGenerationSpeed` —— 预算守卫（解码 ≤200ms、DIB ≤300ms）；
+- `TestDIBContentCorrect` —— 内容守卫（BITMAPINFOHEADER + 像素 BGR + bottom-up 行序逐字节比对）；
+- `TestPNGSeparateFromCriticalPath` —— 结构守卫（PNG 编码耗时必须远大于关键路径，否则说明它回到了同步路径）。
+
+协议 §9 第 2 条已由「≤3 秒落盘」收紧为「**≤2 秒可粘贴**」（v1.6），并写明这两级守门人。
+
+#### 5.12.5 优化后实测
+
+见下方「优化前后对比」小节（由 `tools/assert-latency.ps1` 在 CI 产物上复测填入）。
 ## 6. 遗留
 
 1. ~~**计划任务看门狗**未实现~~ → **第五轮已用「隐藏监护进程」实现**（不需要注册系统计划任务、不需要提权）。

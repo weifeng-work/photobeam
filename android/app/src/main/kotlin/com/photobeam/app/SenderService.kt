@@ -210,6 +210,33 @@ class SenderService : Service() {
     /** MediaStore 变更去抖合并用（见 onCreate 里的注释） */
     private val flushRunnable = Runnable { reconcileAndFlush() }
 
+    /**
+     * [Stage 6 · 延迟优化] 自适应去抖：单张截图立即发，连拍仍去抖合并。
+     *
+     * 原实现固定 250ms 去抖（为解决「连拍 N 张 = N 次回调 → 每张单独建连接 →
+     * 180ms/帧的上传动画永远停在第 0 帧」）。但固定 250ms 对**单张截图**是纯浪费：
+     * 实测端到端延迟中，这 250ms 白占了 7%。
+     *
+     * 新策略：观察到一个 MediaStore 变更时，判断「队列里是否已有待发项」——
+     *   · 没有（单张截图，队列空）→ **立即冲刷**，不等去抖 → 单张延迟少 250ms；
+     *   · 有（连拍/积压）→ 沿用 250ms 去抖合并 → 保持「一批图走同一条连接」的行为，
+     *     上传动画不受影响。
+     *
+     * 去抖窗口内的后续回调仍会取消并重排 flushRunnable（见 onCreate），
+     * 所以连拍场景下依然是「最后一次变更后 250ms 冲刷」。
+     */
+    private fun scheduleAdaptiveFlush() {
+        handler.removeCallbacks(flushRunnable)
+        val pending = queue.pendingCount()
+        if (pending == 0) {
+            // 队列空 = 用户刚截了一张图 → 不等去抖，立刻发
+            handler.post(flushRunnable)
+        } else {
+            // 队列有积压 = 连拍/上一批还没发完 → 去抖合并，避免每张单独建连接
+            handler.postDelayed(flushRunnable, 250)
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         running = true
@@ -233,8 +260,7 @@ class SenderService : Service() {
             // 改为 250ms 去抖合并：一次冲刷把这一批图放在同一条连接里发完，
             // uploading 持续数秒 → 4 帧动画真正转起来；
             // 发送延迟 +250ms，仍远在协议 §9「截图 ≤3 秒落盘」之内。
-            handler.removeCallbacks(flushRunnable)
-            handler.postDelayed(flushRunnable, 250)
+            scheduleAdaptiveFlush()
         }
         sync.register() // [E-01/C-04] ContentObserver 推送：截图落库即触发对账（不能只靠 30s 轮询）
         // 网络恢复即对账+发送 [协议 §7.2]

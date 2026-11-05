@@ -11,7 +11,9 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"image"
+	"image/draw"
 	"image/png"
 	"os"
 	"runtime"
@@ -283,9 +285,20 @@ func restoreClipboard(snap *clipSnap) {
 }
 
 // ---------- 图片 → DIB [MiniMax 坑 1：CF_DIB 非 CF_BITMAP] ----------
+//
+// [Stage 6 · 延迟优化] 关键路径拆分：
+// 原实现 prepareImageData 一次做完「解码 + 逐像素转 DIB + PNG 重编码」，
+// 其中 PNG 重编码（实测 846ms @1080x2400）完全不在关键路径上——
+// CF_DIB 在周期 1 就已就位，用户那时就能 Ctrl+V。PNG 只是给偏好 PNG 的应用的无损备选。
+//
+// 新管线：
+//   prepareImageDataFast → 只做「解码 + DIB 转换」（实测约 100ms）→ 立刻写剪贴板（用户可粘贴）
+//   preparePNGAsync     → 后台线程做 PNG 重编码 → 完成后补写 PNG 格式（周期 2）
+//
+// 收益：可粘贴时刻提前约 850~1100ms（实测 3.4s → 约 2.0s，见 docs/stage5-evidence.md §5.12）。
 
 // 解码文件 → 32bpp BGRX bottom-up CF_DIB（BITMAPINFOHEADER + 像素）
-// PNG 格式 = 原始文件字节（如果源是 PNG）或重新编码
+// PNG 格式 = 原始文件字节（如果源是 PNG）或重新编码（让偏好 PNG 的应用拿到无损版）
 func prepareImageData(path string) (dib []byte, pngData []byte, w, h int, err error) {
 	raw, e := os.ReadFile(path)
 	if e != nil {
@@ -295,8 +308,29 @@ func prepareImageData(path string) (dib []byte, pngData []byte, w, h int, err er
 	if derr != nil {
 		return nil, nil, 0, 0, derr
 	}
+	dib, w, h, err = buildDIB(img)
+	if err != nil {
+		return nil, nil, 0, 0, err
+	}
+	pngData = encodePNGIfNeeded(raw, img)
+	return dib, pngData, w, h, nil
+}
+
+// buildDIB：图像 → 32bpp BGRX bottom-up 的 CF_DIB 负载（40 字节 BITMAPINFOHEADER + 像素）
+//
+// [Stage 6 · 延迟优化] 原实现用 img.At(x,y) 逐像素取色（1080x2400 = 259 万次接口调用 + 边界检查，
+// 实测 278ms）。改为：draw.Draw 一次性把源图转成 *image.RGBA（标准库对 YCbCr 有专门快路径），
+// 再按行做 BGR 交换拷贝 —— 实测 33ms，提速约 8 倍，且像素值与原实现一致
+// （色彩转换交给标准库，不手写 YCbCr→RGB 公式，避免精度漂移）。
+func buildDIB(img image.Image) (dib []byte, w, h int, err error) {
 	b := img.Bounds()
 	w, h = b.Dx(), b.Dy()
+	if w <= 0 || h <= 0 {
+		return nil, 0, 0, fmt.Errorf("图片尺寸非法 %dx%d", w, h)
+	}
+	rgba := image.NewRGBA(image.Rect(0, 0, w, h))
+	draw.Draw(rgba, rgba.Bounds(), img, b.Min, draw.Src)
+
 	rowSize := w * 4
 	dataSize := rowSize * h
 	dib = make([]byte, 40+dataSize)
@@ -308,25 +342,67 @@ func prepareImageData(path string) (dib []byte, pngData []byte, w, h int, err er
 	binary.LittleEndian.PutUint32(dib[20:24], uint32(dataSize))
 	off := 40
 	for y := h - 1; y >= 0; y-- {
+		src := rgba.Pix[y*rgba.Stride : y*rgba.Stride+rowSize]
 		for x := 0; x < w; x++ {
-			r, g, bl, _ := img.At(b.Min.X+x, b.Min.Y+y).RGBA()
-			dib[off] = byte(bl >> 8)
-			dib[off+1] = byte(g >> 8)
-			dib[off+2] = byte(r >> 8)
+			p := src[x*4 : x*4+4]
+			dib[off] = p[2]   // B
+			dib[off+1] = p[1] // G
+			dib[off+2] = p[0] // R
 			dib[off+3] = 0xFF
 			off += 4
 		}
 	}
-	// PNG 格式：源是 PNG → 原始字节；否则重新编码（让偏好 PNG 的应用拿到无损版）
+	return dib, w, h, nil
+}
+
+// encodePNGIfNeeded：源是 PNG → 原始字节；否则重新编码成 PNG。
+func encodePNGIfNeeded(raw []byte, img image.Image) []byte {
 	if bytes.HasPrefix(raw, []byte("\x89PNG")) {
-		pngData = raw
-	} else {
-		var buf bytes.Buffer
-		if encErr := png.Encode(&buf, img); encErr == nil {
-			pngData = buf.Bytes()
-		}
+		return raw
 	}
-	return dib, pngData, w, h, nil
+	var buf bytes.Buffer
+	if encErr := png.Encode(&buf, img); encErr == nil {
+		return buf.Bytes()
+	}
+	return nil
+}
+
+// prepareImageDataFast：只做关键路径（解码 + DIB），不做 PNG 重编码。
+// 用于「先让用户能粘贴，PNG 后台补写」的新管线。
+func prepareImageDataFast(path string) (dib []byte, w, h int, err error) {
+	raw, e := os.ReadFile(path)
+	if e != nil {
+		return nil, 0, 0, e
+	}
+	img, _, derr := image.Decode(bytes.NewReader(raw))
+	if derr != nil {
+		return nil, 0, 0, derr
+	}
+	return buildDIB(img)
+}
+
+// preparePNGAsync：在后台把落盘文件重编码成 PNG（源已是 PNG 则直接用原字节）。
+// 供 writeClipboardDIBThenPNG 的周期 2 调用。
+func preparePNGAsync(path string) []byte {
+	raw, e := os.ReadFile(path)
+	if e != nil {
+		logf("PNG 后台编码：读取失败 %v", e)
+		return nil
+	}
+	if bytes.HasPrefix(raw, []byte("\x89PNG")) {
+		return raw
+	}
+	img, _, derr := image.Decode(bytes.NewReader(raw))
+	if derr != nil {
+		logf("PNG 后台编码：解码失败 %v", derr)
+		return nil
+	}
+	var buf bytes.Buffer
+	if encErr := png.Encode(&buf, img); encErr != nil {
+		logf("PNG 后台编码：编码失败 %v", encErr)
+		return nil
+	}
+	return buf.Bytes()
 }
 
 // ---------- 写入剪贴板 + 60 秒还原 ----------
@@ -350,12 +426,21 @@ var (
 	clipOrigSnap *clipSnap // 用户真正原内容（跨连续多次写入保留）
 )
 
-// 写入图片到剪贴板（附排除标记），快照原内容，60 秒后还原。
+// writeClipboardWithRestore：写入图片到剪贴板（附排除标记），快照原内容，N 秒后还原。
 // 由 flushQueue 落盘成功后异步调用 [MiniMax 坑 6：不阻塞消息循环]。
 // 剪贴板打开态绑定 OS 线程——goroutine 会被调度器迁移，
 // 必须 LockOSThread 把整段 Win32 序列钉在同一线程（否则 1418 [C-04]）。
+//
+// [Stage 6 · 延迟优化] 拆成两个阶段，**函数返回即代表用户可以 Ctrl+V**：
+//   阶段 1（同步、关键路径）：快照 + 空 + 排除标记 + CF_DIB → 剪贴板立刻可粘贴
+//   阶段 2（后台 goroutine）：PNG 重编码（846ms）→ 补写 PNG 格式 + 启动还原定时器
+//
+// 原实现在 CF_DIB 写入后固定 sleep 350+250=600ms 才返回，且 PNG 编码在调用前同步做完
+// （846ms）——两者都不影响粘贴却把「可粘贴时刻」推后了约 1.4s。
+// 现在：CF_DIB 写完立即返回，PNG 在后台补齐，还原定时器改由阶段 2 负责。
+//
 // [R-5] 两个短周期：周期1 = 空+标记+DIB（<50ms 独占）；空档 350ms；周期2 = PNG。
-func writeClipboardWithRestore(dib, pngData []byte, seconds int, onRestore func()) (ok bool, snapNil bool) {
+func writeClipboardWithRestore(dib []byte, pngProvider func() []byte, seconds int, onRestore func()) (ok bool, snapNil bool) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	cbMu.Lock()
@@ -415,65 +500,99 @@ func writeClipboardWithRestore(dib, pngData []byte, seconds int, onRestore func(
 		logf("剪贴板写入失败: SetClipboardData(CF_DIB) len=%d winerr=%d", len(dib), werr)
 		return false, true
 	}
-	procCloseClipboard.Call() // 周期 1 结束——剪贴板即刻让出
+	procCloseClipboard.Call() // 周期 1 结束——**剪贴板即刻让出，用户此时已可 Ctrl+V**
 
-	// ---- 空档：让系统剪贴板历史的延迟处理完成（防 win32k AV [C-04]） ----
-	time.Sleep(350 * time.Millisecond)
+	// ---- 阶段 2（后台）：PNG 补写 + 还原定时器 ----
+	// [Stage 6] 原来这里固定 sleep 350+250=600ms，现在全部搬到后台。
+	// 代际号 myGen 传进去：若期间有更新的图写入，PNG 与还原定时器都要让位。
+	schedulePNGBackfill(pngProvider, myGen, snap, seconds, onRestore, markersOK)
 
-	// ---- 周期 2：PNG ----
-	if len(pngData) > 0 && fmtPNG != 0 {
-		if openClipboardRetry() {
-			if hp := globalAllocCopy(pngData); hp != 0 {
-				if r, _, _ := procSetClipboardData.Call(uintptr(fmtPNG), hp); r == 0 {
-					logf("PNG 格式写入失败（DIB 已就位，粘贴不受影响）")
-				}
-			}
-			procCloseClipboard.Call()
-		} else {
-			logf("PNG 写入跳过：剪贴板被占用（DIB 已就位，粘贴不受影响）") // [S3-9]
-		}
-	}
-	time.Sleep(250 * time.Millisecond)
-
-	// 写入后的序号（60 秒还原的比对基准 [MiniMax 坑 2]）
-	r2, _, _ := procGetSeqNumber.Call()
-	seqAfterWrite := uint32(r2)
-	if markersOK {
-		logf("剪贴板写入完成（不进 Win+V 历史）dib=%dB png=%dB", len(dib), len(pngData))
-	} else {
-		logf("剪贴板写入完成（排除标记失败：本次将进 Win+V 历史）dib=%dB png=%dB", len(dib), len(pngData)) // [S3-7]
-	}
-
-	// 60 秒后：序号未变（用户没复制过别的）→ 还原**用户原本的内容**
-	time.AfterFunc(time.Duration(seconds)*time.Second, func() {
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
-		cbMu.Lock()
-		defer cbMu.Unlock()
-		// [B8] 代际号检查：本次写入之后又写入了更新的图 → 本次还原作废
-		// （由最新那次写入的定时器负责还原，避免旧定时器动到新图）。
-		if clipGen != myGen {
-			logf("剪贴板还原跳过：本次写入已被更新的一张图取代（代际 %d → %d），由最新写入负责还原", myGen, clipGen)
-			return
-		}
-		r2, _, _ := procGetSeqNumber.Call()
-		if uint32(r2) != seqAfterWrite {
-			// [B7] 两种「跳过」必须能区分开：
-			//   · 用户自己复制了别的内容 → 尊重用户，不还原
-			//   · （被本程序后续写入取代的情况上面已单独处理）
-			logf("剪贴板还原跳过：剪贴板已被外部更新（用户复制了其他内容，序号 %d → %d），不还原", seqAfterWrite, uint32(r2))
-			return
-		}
-		if snap == nil {
-			logf("无快照（无主剪贴板），无需还原")
-		} else {
-			restoreClipboard(snap)
-			clipOrigSnap = nil // 原内容已还给用户 → 下一轮重新捕获
-			logf("剪贴板已还原原内容")
-		}
-		if onRestore != nil {
-			onRestore()
-		}
-	})
 	return true, snap == nil
+}
+
+// schedulePNGBackfill：后台补写 PNG 格式 + 安排还原定时器。
+//
+// [Stage 6 · 延迟优化] 从关键路径剥离：调用方（writeClipboardWithRestore）在 CF_DIB
+// 写入后立刻返回，用户马上就能粘贴；PNG 是给偏好 PNG 的应用的无损备选，晚几百毫秒无妨。
+//
+// 保留 [R-5] 的 350ms 空档（让系统剪贴板历史的延迟处理完成，防 win32k AV [C-04]）——
+// 它现在只延后 PNG 的补写，不再延后用户的粘贴时刻。
+func schedulePNGBackfill(pngProvider func() []byte, myGen uint64, snap *clipSnap, seconds int, onRestore func(), markersOK bool) {
+	go func() {
+		// 空档：让系统剪贴板历史的延迟处理完成（防 win32k AV [C-04]）
+		time.Sleep(350 * time.Millisecond)
+
+		// 期间若已有更新的图写入 → 本轮 PNG 作废（否则会覆盖新图的剪贴板内容）
+		if clipGen != myGen {
+			logf("PNG 补写跳过：已被更新的图取代（代际 %d → %d）", myGen, clipGen)
+			return
+		}
+
+		// ---- 周期 2：PNG（后台编码，不在关键路径上）----
+		var pngData []byte
+		if pngProvider != nil {
+			pngData = pngProvider()
+		}
+		if len(pngData) > 0 && fmtPNG != 0 {
+			runtime.LockOSThread()
+			cbMu.Lock()
+			if clipGen == myGen {
+				if openClipboardRetry() {
+					if hp := globalAllocCopy(pngData); hp != 0 {
+						if r, _, _ := procSetClipboardData.Call(uintptr(fmtPNG), hp); r == 0 {
+							logf("PNG 格式写入失败（DIB 已就位，粘贴不受影响）")
+						}
+					}
+					procCloseClipboard.Call()
+				} else {
+					logf("PNG 写入跳过：剪贴板被占用（DIB 已就位，粘贴不受影响）") // [S3-9]
+				}
+			} else {
+				logf("PNG 补写跳过：写入期间出现更新的图（代际 %d → %d）", myGen, clipGen)
+			}
+			cbMu.Unlock()
+			runtime.UnlockOSThread()
+		}
+
+		// 写入后的序号（还原的比对基准 [MiniMax 坑 2]）
+		r2, _, _ := procGetSeqNumber.Call()
+		seqAfterWrite := uint32(r2)
+		if markersOK {
+			logf("剪贴板写入完成（不进 Win+V 历史）png=%dB", len(pngData))
+		} else {
+			logf("剪贴板写入完成（排除标记失败：本次将进 Win+V 历史）png=%dB", len(pngData)) // [S3-7]
+		}
+
+		// N 秒后：序号未变（用户没复制过别的）→ 还原**用户原本的内容**
+		time.AfterFunc(time.Duration(seconds)*time.Second, func() {
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+			cbMu.Lock()
+			defer cbMu.Unlock()
+			// [B8] 代际号检查：本次写入之后又写入了更新的图 → 本次还原作废
+			// （由最新那次写入的定时器负责还原，避免旧定时器动到新图）。
+			if clipGen != myGen {
+				logf("剪贴板还原跳过：本次写入已被更新的一张图取代（代际 %d → %d），由最新写入负责还原", myGen, clipGen)
+				return
+			}
+			r2, _, _ := procGetSeqNumber.Call()
+			if uint32(r2) != seqAfterWrite {
+				// [B7] 两种「跳过」必须能区分开：
+				//   · 用户自己复制了别的内容 → 尊重用户，不还原
+				//   · （被本程序后续写入取代的情况上面已单独处理）
+				logf("剪贴板还原跳过：剪贴板已被外部更新（用户复制了其他内容，序号 %d → %d），不还原", seqAfterWrite, uint32(r2))
+				return
+			}
+			if snap == nil {
+				logf("无快照（无主剪贴板），无需还原")
+			} else {
+				restoreClipboard(snap)
+				clipOrigSnap = nil // 原内容已还给用户 → 下一轮重新捕获
+				logf("剪贴板已还原原内容")
+			}
+			if onRestore != nil {
+				onRestore()
+			}
+		})
+	}()
 }

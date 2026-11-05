@@ -492,14 +492,25 @@ func handleConn(conn net.Conn) {
 			if !cfg.ClipboardEnabled {
 				return
 			}
-			dib, pngData, imgW, imgH, err := prepareImageData(destPath)
+			// [Stage 6 · 延迟优化] 只做关键路径：解码 + DIB（约 100ms）。
+			// PNG 重编码（846ms）由 writeClipboardWithRestore 的后台阶段完成——
+			// CF_DIB 写入后用户立刻就能 Ctrl+V。
+			t0 := timeNow()
+			dib, imgW, imgH, err := prepareImageDataFast(destPath)
 			if err != nil {
 				logf("图片解码失败: %v", err)
 				return
 			}
+			tDIB := timeNow()
 			initClipboardFormats()
 			// 写入成功才弹窗承诺 [F-03]：失败只弹"写入失败"提示，绝不假承诺可粘贴
-			ok, snapNil := writeClipboardWithRestore(dib, pngData, cfg.ClipboardSeconds, nil)
+			// PNG 编码交给后台阶段（代际号校验，避免覆盖更新的图）
+			ok, snapNil := writeClipboardWithRestore(dib, func() []byte {
+				return preparePNGAsync(destPath)
+			}, cfg.ClipboardSeconds, nil)
+			tClip := timeNow()
+			logf("剪贴板关键路径: 解码+DIB=%v 写入=%v（PNG 后台补写）",
+				tDIB.Sub(t0), tClip.Sub(tDIB))
 			name := origName
 			if name == "" {
 				name = filepath.Base(destPath)
