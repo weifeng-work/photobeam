@@ -776,6 +776,98 @@ _id=1424..1429 size=408076  （6 张全部相同大小）→ PC 收到过，但�
 - 修复后：手机端正常发出，PC 收到（哈希进幂等集合）→ 因内容与已落盘图相同而未重复落盘。
 
 即**「送达」从「丢失」变成了「幂等跳过」**——照片没丢，只是不重复存一份。
+### 5.14 第七轮：保留手机端目录结构（协议 v1.7 · 延后项 A 转正）
+
+**目标**：手机 `Pictures/Screenshots/` 落到 PC 的 `Received/Screenshots/`，
+而不是全部拍平到 `Received/`（协议 §10 延后项 A 的原定目标）。
+
+#### 5.14.1 实现
+
+协议 v1.6 → **v1.7**：`file_meta` 新增 `rel_path` 字段。
+手机端 `MediaStoreSync` 早已在本地读取 `RELATIVE_PATH`（`QueueItem.relPath`），
+只是发送时丢弃了 —— 本轮把它带上线。
+
+PC 端（`pc/relpath.go` 新增）：
+
+- **顶层媒体桶剥离**：`DCIM` / `Pictures` / `Download` / `Documents` / `Movies` /
+  `Music` / `Podcasts` 去掉第一层 → 手机的 `Pictures/Screenshots/` 落在
+  `Received\Screenshots\`；更深的层级完整保留；
+- **`rel_path` 按不可信输入处理**（对端可控 → 路径穿越风险）：
+  `sanitizeRelPath` 丢弃 `..` 分量、剥离绝对路径前缀与盘符、拒绝 Windows 保留
+  设备名（CON/NUL/COM1…）、去控制字符与非法字符、限制单级长度(100)与总深度(8)；
+  `resolveSaveSubDir` 再做**二次逃逸检查**（拼出的路径必须在接收目录之下）；
+- 清洗只做安全处理、**不丢层级**；清洗后为空则落平到接收目录根（不因此拒收整张图）；
+- 落盘名规则不变（`<unixMs>_<消毒文件名>`，冲突加 `-1`/`-2`）；
+- **幂等键不变**：仍是 `file_id`（内容 SHA-256），与目录无关 ——
+  同一张图不因来源目录不同而落两份。
+
+#### 5.14.2 单元测试（`pc/relpath_test.go`，9 组用例全部通过）
+
+```
+TestSanitizeRelPathNormal          正常路径保留结构
+TestSanitizeRelPathTopLevelStrip   顶层桶剥离的边界（单层不剥 / 非媒体桶不剥 / 小写也认）
+TestSanitizeRelPathTraversal       路径穿越必须被挡住
+TestSanitizeRelPathAbsolute        绝对路径与盘符必须被剥掉
+TestSanitizeRelPathReserved        Windows 保留设备名必须被规避
+TestSanitizeRelPathIllegalChars    控制字符与 Windows 非法字符必须被去掉
+TestSanitizeRelPathLimits          长度与深度上限
+TestResolveSaveSubDirEscape        不变式：拼出来一定在接收目录之下
+TestResolveSaveSubDirNormal        正常路径应生成子目录
+```
+
+**测试抓到的真 bug**：`mediaTopDirs` 的 map 键最初写成混合大小写（`"Pictures"`），
+而比较时用 `strings.ToUpper` 归一化 → `"PICTURES"` 匹配不上 `"Pictures"` →
+顶层桶没被剥掉。Go 的 map 键区分大小写，这个坑很隐蔽。现统一为全大写键，
+并有 `TestSanitizeRelPathTopLevelStrip` 覆盖。
+
+#### 5.14.3 实机验证（CI 产物，<PHONE-MODEL> / MIUI + Windows）
+
+造三张**内容不同**的图片放在手机三个不同目录（内容必须不同 —— 内容相同会被
+幂等去重判为 duplicate，属协议 §9 第 11 条设计行为，不是丢图）：
+
+| 手机 `relative_path` | PC 落盘位置 | 结果 |
+|---|---|---|
+| `Pictures/PhotoBeamTest/` | `Received\PhotoBeamTest\1793898251906_v1.jpg` | ✓ 顶层 Pictures 已剥离 |
+| `DCIM/Camera/SubDir/` | `Received\Camera\SubDir\1793898252353_v2.jpg` | ✓ 顶层 DCIM 已剥离 + 两层保留 |
+| `Download/PBTest/` | `Received\PBTest\1793898252522_v3.jpg` | ✓ |
+| `DCIM/Screenshots/`（真实截图） | `Received\Screenshots\1793898335816_...jpg` | ✓ 正是延后项 A 的目标 |
+
+PC 端日志（新增 `dir=` 字段，一眼可看出落位）：
+
+```
+[2026-11-06 01:04:11] [INFO] PhotoBeam 接收文件: v1.jpg (1851081 bytes) batch=b220 dir=PhotoBeamTest
+[2026-11-06 01:04:11] [INFO] PhotoBeam 落盘完成: ...\Received\PhotoBeamTest\1793898251906_v1.jpg
+[2026-11-06 01:04:12] [INFO] PhotoBeam 接收文件: v2.jpg (1847293 bytes) batch=b220 dir=Camera\SubDir
+[2026-11-06 01:04:12] [INFO] PhotoBeam 落盘完成: ...\Received\Camera\SubDir\1793898252353_v2.jpg
+[2026-11-06 01:04:12] [INFO] PhotoBeam 接收文件: v3.jpg (1856113 bytes) batch=b220 dir=PBTest
+[2026-11-06 01:04:12] [INFO] PhotoBeam 落盘完成: ...\Received\PBTest\1793898252522_v3.jpg
+[2026-11-06 01:05:35] [INFO] PhotoBeam 接收文件: Screenshot_2026-11-06-01-05-35-290_....jpg batch=b221 dir=Screenshots
+```
+
+#### 5.14.4 时延无退化
+
+`tools/assert-latency.ps1`（6 轮，CI 产物）：
+
+```
+第 1 轮: 落盘→可粘贴 = 269ms  OK   系统段(截图→可粘贴)=750ms
+第 2 轮: 落盘→可粘贴 = 256ms  OK   系统段(截图→可粘贴)=767ms
+第 5 轮: 落盘→可粘贴 = 324ms  OK   系统段(截图→可粘贴)=800ms
+第 6 轮: 落盘→可粘贴 = 317ms  OK   系统段(截图→可粘贴)=754ms
+→ 达标 6/6，平均 292ms，最大 324ms（阈值 2000ms）
+```
+
+**用户真实感知（截图→可粘贴）约 750~800ms**，比 v1.6 时的约 1.2s 还快一点
+（落盘路径变短，少了一次路径处理）。
+
+**守门人脚本同步适配**：v1.7 起落盘文件在子目录里，探针查找落盘文件必须**递归**
+（`Get-ChildItem -Recurse`）—— 否则会匹配到很早的旧文件，测出 2722708ms 这种
+离谱的假值。判据与被测量同源这条原则再次生效。
+
+#### 5.14.5 向后兼容
+
+`rel_path` 字段缺失（旧版手机端）→ 落平到接收目录根，行为与 v1.6 完全一致，
+混版不会出错，只是旧手机端拿不到目录结构。单测
+`TestResolveSaveSubDirNormal` 的「空 rel_path → 根目录」用例覆盖该路径。
 ## 6. 遗留
 
 1. ~~**计划任务看门狗**未实现~~ → **第五轮已用「隐藏监护进程」实现**（不需要注册系统计划任务、不需要提权）。

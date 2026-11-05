@@ -96,7 +96,7 @@ if ($Serial) { $adbArgs = @('-s', $Serial) + $adbArgs }
 $results = @()
 for ($i = 1; $i -le $Rounds; $i++) {
   $before = @{}
-  Get-ChildItem $ReceivedDir -File | ForEach-Object { $before[$_.Name] = $true }
+  Get-ChildItem $ReceivedDir -File -Recurse | ForEach-Object { $before[$_.FullName] = $true }
 
   $outFile = Join-Path $work ("out_$i.txt")
   $proc = Start-Process -FilePath $exe -ArgumentList '20000' -PassThru -NoNewWindow -RedirectStandardOutput $outFile -RedirectStandardError (Join-Path $work "err_$i.txt")
@@ -126,7 +126,7 @@ for ($i = 1; $i -le $Rounds; $i++) {
     # 会改它——之前用它导致把上一轮的旧文件误判成"本轮收到"）。
     $recvNew = $false
     $newestLand = -1
-    Get-ChildItem $ReceivedDir -File | ForEach-Object {
+    Get-ChildItem $ReceivedDir -File -Recurse | ForEach-Object {
       $st = [regex]::Match($_.Name, '^(\d{13})')
       if ($st.Success) {
         $land = [int64]$st.Groups[1].Value
@@ -157,7 +157,7 @@ for ($i = 1; $i -le $Rounds; $i++) {
   $newFile = $null
   $landMs = -1
   for ($w = 0; $w -lt 60 -and -not $newFile; $w++) {
-    $cands = Get-ChildItem $ReceivedDir -File | ForEach-Object {
+    $cands = Get-ChildItem $ReceivedDir -File -Recurse | ForEach-Object {
       $st = [regex]::Match($_.Name, '^(\d{13})')
       if ($st.Success) {
         $land = [int64]$st.Groups[1].Value
