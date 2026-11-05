@@ -62,7 +62,7 @@ class MediaStoreSync(
         // 只取 _id > lastMaxId 的行 [P0-09]
         //
         // [Stage 6 · 缺陷修复] is_pending 的处理方式改了：
-        // 原实现在 SQL 的 WHERE 里过滤 `is_pending = 0`，**但水位仍会被后面已就绪的行推过去**。
+        // 原测现在 SQL 的 WHERE 里过滤 `is_pending = 0`，**但水位仍会被后面已就绪的行推过去**。
         // 实测（<PHONE-MODEL> / MIUI，2026-11-05）：截图落库瞬间 is_pending=1，
         // 若此时后续 _id 的行已就绪，水位就会越过这张 pending 图 → 它永远落在水位之下，
         // 再也扫不到 → **该照片静默丢失**（实测 10 轮里丢 2 张）。

@@ -36,7 +36,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$ReceivedDir = 'C:\Users\<user>\AppData\Local\PhotoBeam\Received'
+$ReceivedDir = Join-Path $env:LOCALAPPDATA 'PhotoBeam\Received'
 
 # ---------- 探针：等 CF_DIB 就位，输出就位的 unix 毫秒 ----------
 $csc = 'C:\WINDOWS\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
