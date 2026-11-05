@@ -19,9 +19,12 @@ import android.provider.Settings
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ListView
 import android.widget.TextView
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -279,13 +282,38 @@ class MainActivity : Activity() {
         val checked = BooleanArray(dirs.size) { i ->
             SyncDirs.selected(this).contains(dirs[i].first)
         }
-        val dlg = AlertDialog.Builder(this)
-            .setTitle(if (firstRun) "选择要同步的文件夹" else "选择要同步的文件夹")
-            .setMessage("勾选需要同步到电脑的相册文件夹（可多选）。\n\n" +
-                "· 勾选某个文件夹会**连同它的子文件夹**一起同步。\n" +
+        // [Stage 8 · UI 修正] 不用 setMessage + setMultiChoiceItems ——
+        // AlertDialog 里 setMessage 会**覆盖掉** setMultiChoiceItems 的列表（只显示说明文字，
+        // 目录一项都不出来）。改用 setView 自定义布局：说明 TextView + ListView。
+        val pad = (12 * resources.displayMetrics.density).toInt()
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad, pad, 0)
+        }
+        container.addView(TextView(this).apply {
+            text = "勾选需要同步到电脑的相册文件夹（可多选）。\n" +
+                "· 勾选某个文件夹会连同它的子文件夹一起同步。\n" +
                 "· 未勾选任何文件夹 = 不同步任何图片。\n" +
-                "· 只有**之后新增**的图片会被同步，历史图片不会补传。")
-            .setMultiChoiceItems(labels, checked) { _, which, isChecked -> checked[which] = isChecked }
+                "· 只有之后新增的图片会被同步，历史图片不会补传。"
+            setPadding(0, 0, 0, pad)
+        })
+        // 显式起一个 ListView 变量：apply 块内的 this 与 lambda 内的 this 不是同一个，
+        // 直接写 adapter/setItemChecked 会解析不到（编译器报 unresolved reference）。
+        val lv = ListView(this)
+        lv.adapter = ArrayAdapter(this, android.R.layout.simple_list_item_multiple_choice, labels)
+        lv.setOnItemClickListener(object : AdapterView.OnItemClickListener {
+            override fun onItemClick(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                val which = position
+                checked[which] = !checked[which]
+                for (i in labels.indices) lv.setItemChecked(i, checked[i])
+            }
+        })
+        for (i in labels.indices) lv.setItemChecked(i, checked[i])
+        container.addView(lv)
+
+        val dlg = AlertDialog.Builder(this)
+            .setTitle("选择要同步的文件夹")
+            .setView(container)
             .setPositiveButton("保存") { _, _ ->
                 val chosen = HashSet<String>()
                 for (i in dirs.indices) if (checked[i]) chosen.add(dirs[i].first)
