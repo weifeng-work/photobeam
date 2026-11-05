@@ -1045,6 +1045,115 @@ Download/             :   1   →  （PC 端无此目录）    ✓ 未选，不�
 ```
 
 UI 修复不影响传输链路（ScrollView 只是包了一层容器）。
+### 5.17 第十轮：多机设备目录隔离（协议 v1.9 · Stage 10）
+
+**起因**：用户问「两个手机都连这台电脑，会同步到不同的文件夹吗，有一级文件夹区分吗」。
+
+**答案（改之前）：不会，而且有更严重的问题。**
+
+#### 5.17.1 改之前的两个缺陷
+
+**缺陷一：落盘路径不含设备维度**（`server.go` 原实现）：
+
+```go
+destDir := saveDir
+if rx.relPath != "" {
+    destDir = filepath.Join(saveDir, rx.relPath)   // ← 只有 rel_path，没有设备维度
+}
+```
+
+两台手机都传 `DCIM/Screenshots/` → 落到**同一个** `Received\Screenshots\`，用户分不清
+哪张图来自哪台手机。
+
+**缺陷二（更严重）：幂等键只用 file_id → 静默丢图**
+
+幂等集合存的是 `file_id` = 文件内容的 SHA-256，**与设备无关**：
+
+```
+手机 A 传 图X（内容 H）→ file_id=H → PC 落盘，seen_ids 加入 H
+手机 B 传 图X（内容 H，同一张图）→ file_id=H → 命中幂等 → ack "duplicate" → 跳过
+```
+
+结果：**手机 B 的那张图在 PC 上根本不存在**，而且手机 B 收到的是「已送达」的成功回执
+——**静默丢失，用户完全无感**。
+
+#### 5.17.2 改动（协议 v1.9）
+
+| 项 | 改动 |
+|---|---|
+| 设备目录名 | `<设备名>-<指纹前 8 位>`，如 `<PHONE-MODEL>-<fp8>`（新增 `pc/devdir.go`） |
+| 落盘路径 | `Received\<设备名>-<fp8>\<相册目录>\<unixMs>_<文件名>` —— 设备目录是**第一级** |
+| 幂等键 | `seenKeyFor(fp, fileID)` = `<senderFP>:<file_id>` —— 两台手机传同一张图**各存一份** |
+| `dev_dir` 回传 | `pair_ok` / `auth_ok` 里回传，**不参与 transcript**（密码学中性，不触发重新配对，向后兼容） |
+| 手机端显示 | 状态区新增「我的照片在电脑：xxx」 |
+
+**指纹后缀的作用**：家里两台同型号手机（如两台小米）设备名相同，靠指纹后缀保证目录唯一，
+同时保留设备名主体让用户一眼认得出。
+
+**设备名按不可信输入处理**：设备名来自对端 HELLO 的 `dev_name`，可能含路径分隔符、
+盘符、`..`、Windows 保留设备名（CON/NUL/COM1…）→ 清洗 + 二次逃逸检查。
+
+#### 5.17.3 测试抓出来的**真安全漏洞**
+
+新增的 `TestDeviceDirNameSanitized` / `TestDeviceDirNameEscapes` 直接失败：
+
+```
+deviceDirName("..\\..\\Windows") = "\\..\\Windows-<fp8>" 含路径分隔符
+deviceDirName("../../etc")        = "/../etc-<fp8>" 含 '..'
+deviceDirName("../../etc") 拼出的路径 "...\\PhotoBeam\\etc-<fp8>" 逃出了接收目录
+```
+
+**根因**：`pc/relpath.go` 的 `cleanPathSegment` 原先只去**首尾**的点，中间的 `/` `\` 留着。
+`rel_path` 因为在 `sanitizeRelPath` 里按 `/` 切分过，所以侥幸没事；但**设备名是整体传进来的**
+——`../../etc` 清洗后仍是 `/../etc`，`filepath.Join` 会解析 `..` → **逃出接收目录**（路径穿越）。
+
+**修法**：`cleanPathSegment` 增加「去掉路径分隔符」，同时加固了 `rel_path` 的清洗路径。
+
+#### 5.17.4 实测（CI 产物 APK + EXE）
+
+**手机端状态区**（实机截图确认）：
+
+```
+同步目录：1 个（DCIM/Screenshots）
+我的照片在电脑：<PHONE-MODEL>-<fp8>\
+电脑：<PC-NAME>
+```
+
+**手机端日志**（自动取回 dev_dir 的完整链路）：
+
+```
+05:36:17.167  收到取 dev_dir 请求
+05:36:17.252  握手: auth_ok dev_dir=<PHONE-MODEL>-<fp8>
+05:36:17.255  已取回 dev_dir
+```
+
+**PC 端落盘**（截图触发后）：
+
+```
+<Received>\<PHONE-MODEL>-<fp8>\Screenshots\1793914588892_Screenshot_2026-11-06-05-36-28-382_com.photobeam.app.jpg
+```
+
+**一级目录**（升级后新目录从 0 开始）：
+
+```
+[.tmp]              0 files
+[Camera]            1 files
+[<PHONE-MODEL>-<fp8>]  1 files    ← 新设备目录
+[PBTest]            1 files
+[PhotoBeamTest]     1 files
+[Screenshots]      22 files     ← 升级前的旧文件（不迁移）
+```
+
+> **历史文件不迁移**：升级前的图留在旧的 `Screenshots\` 里。这是**有意的**——
+> 自动迁移会移动用户已有文件，风险大于收益。旧目录保留即可。
+
+#### 5.17.5 双机模拟测试（`pc/devdir_dual_test.go`）
+
+真机只有一台手机，所以用**纯逻辑测试**覆盖双机语义（20 个 Go 测试全过）：
+
+- `TestDualPhoneDirsSeparate`：两台手机 → 不同设备目录，都在接收目录之下；
+- `TestDualPhoneSameImageBothStored`：两台手机传**同一张图** → 新幂等键不同 →
+  第二台不命中 → **两台各存一份**；同设备重传 → 仍然幂等跳过。
 ## 6. 遗留
 
 1. ~~**计划任务看门狗**未实现~~ → **第五轮已用「隐藏监护进程」实现**（不需要注册系统计划任务、不需要提权）。
