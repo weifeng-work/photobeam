@@ -10,6 +10,7 @@ package main
 //   3. 同一台手机重传同一张图 → 仍然幂等跳过（不重复落盘）。
 //
 // 这些是**纯逻辑**测试（不碰网络与磁盘），保证核心语义不回归。
+// 测试数据用中性虚构值（真实设备名/指纹不应进仓库）。
 
 import (
 	"path/filepath"
@@ -20,8 +21,8 @@ import (
 func TestDualPhoneDirsSeparate(t *testing.T) {
 	const saveDir = `C:\Users\<user>\AppData\Local\PhotoBeam\Received`
 
-	phoneA := deviceDirName("<PHONE-MODEL>", "<PHONE-FP>")
-	phoneB := deviceDirName("<PHONE-MODEL2>", "<PHONE-FP2>")
+	phoneA := deviceDirName("PhoneA", tFP1)
+	phoneB := deviceDirName("PhoneB", tFP2)
 
 	dirA := resolveDeviceDir(saveDir, phoneA)
 	dirB := resolveDeviceDir(saveDir, phoneB)
@@ -29,11 +30,11 @@ func TestDualPhoneDirsSeparate(t *testing.T) {
 	if dirA == dirB {
 		t.Fatalf("两台手机落到同一目录：%q", dirA)
 	}
-	if filepath.Base(dirA) != "<PHONE-MODEL>-<fp8>" {
-		t.Errorf("手机 A 目录名 = %q，期望 <PHONE-MODEL>-<fp8>", filepath.Base(dirA))
+	if filepath.Base(dirA) != "PhoneA-01234567" {
+		t.Errorf("手机 A 目录名 = %q，期望 PhoneA-01234567", filepath.Base(dirA))
 	}
-	if filepath.Base(dirB) != "<PHONE-MODEL2>-<fp8>" {
-		t.Errorf("手机 B 目录名 = %q，期望 <PHONE-MODEL2>-<fp8>", filepath.Base(dirB))
+	if filepath.Base(dirB) != "PhoneB-fedcba98" {
+		t.Errorf("手机 B 目录名 = %q，期望 PhoneB-fedcba98", filepath.Base(dirB))
 	}
 	// 都在接收目录之下
 	base := filepath.Clean(saveDir)
@@ -51,8 +52,8 @@ func TestDualPhoneSameImageBothStored(t *testing.T) {
 	// 旧实现：只用 file_id 做键 → 两台手机命中同一个键 → 第二台被吞
 	oldKey := fileID
 	// 新实现：设备指纹 + file_id
-	newKeyA := seenKeyFor("<PHONE-FP>", fileID)
-	newKeyB := seenKeyFor("<PHONE-FP2>", fileID)
+	newKeyA := seenKeyFor(tFP1, fileID)
+	newKeyB := seenKeyFor(tFP2, fileID)
 
 	if oldKey == newKeyA {
 		t.Errorf("旧键与新键相同 —— 加设备维度没起作用")
@@ -68,7 +69,7 @@ func TestDualPhoneSameImageBothStored(t *testing.T) {
 	}
 	// 同设备重传 → 命中（幂等仍有效）
 	seen[newKeyA] = true
-	if !seen[seenKeyFor("<PHONE-FP>", fileID)] {
+	if !seen[seenKeyFor(tFP1, fileID)] {
 		t.Errorf("同设备同图应命中幂等")
 	}
 }
