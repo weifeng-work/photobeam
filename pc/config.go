@@ -166,6 +166,19 @@ func loadSeenIDs() {
 	}
 }
 
+// seenKeyFor：幂等键 = 设备指纹 + 文件 ID（Stage 10）
+//
+// [Stage 10] 原实现只用 file_id（内容 SHA-256）做幂等键 —— 两台手机传**同一张图**
+// （内容相同 → file_id 相同）时，第二台会被判 duplicate 而**静默丢图**。
+// 加入设备维度后：同一张图从两台手机传来，各存一份（落在各自的设备目录下）。
+//
+// 键的格式：`fp16:fileID64`，两者都用固定分隔符，避免拼接歧义。
+// 旧版本写入的纯 file_id 键仍然留在 received_ids.json 里 —— 它们不再匹配新键，
+// 只会让集合略微膨胀（上限 5000 会自动裁剪），不影响正确性。
+func seenKeyFor(fp, fileID string) string {
+	return fp + ":" + fileID
+}
+
 func addSeenID(id string) {
 	seenMu.Lock()
 	if seenIDs[id] {

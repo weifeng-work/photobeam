@@ -275,7 +275,12 @@ func handleConn(conn net.Conn) {
 				dev != nil && ed25519.Verify(ed25519.PublicKey(edRaw), th, mustDecode(m.Sig)))
 			if dev != nil && ed25519.Verify(ed25519.PublicKey(edRaw), th, mustDecode(m.Sig)) {
 				okSig := ed25519.Sign(identity.EdPriv, th)
-				if err := sendCtrl(conn, keys.Session, map[string]any{"type": "auth_ok", "sig": b64encode(okSig)}); err != nil {
+				// [Stage 10] 回传 dev_dir：手机端据此显示「我的照片在电脑的 <dev_dir> 目录」。
+				// **不参与 transcript**（与 pair_intent 同理）→ 不影响签名、不影响 SAS、
+				// 不触发重新配对；旧版手机端收到多出的字段会直接忽略（向后兼容）。
+				if err := sendCtrl(conn, keys.Session, map[string]any{
+					"type": "auth_ok", "sig": b64encode(okSig), "dev_dir": deviceDirName(dev.DevName, senderFP),
+				}); err != nil {
 					return
 				}
 				ip, portStr, _ := net.SplitHostPort(remoteOf(conn))
@@ -467,14 +472,18 @@ func handleConn(conn net.Conn) {
 		}
 		authStats.ok()
 		okSig := ed25519.Sign(identity.EdPriv, th)
-		if err := sendCtrl(conn, keys.Session, map[string]any{"type": "pair_ok", "sig": b64encode(okSig)}); err != nil {
+		// [Stage 10] 回传 dev_dir（不参与 transcript，密码学中性，向后兼容）
+		pairDevName := firstNonEmpty(m.DevName, senderHello.DevName)
+		if err := sendCtrl(conn, keys.Session, map[string]any{
+			"type": "pair_ok", "sig": b64encode(okSig), "dev_dir": deviceDirName(pairDevName, senderFP),
+		}); err != nil {
 			return
 		}
 		ip, portStr, _ := net.SplitHostPort(remoteOf(conn))
 		var pn int
 		fmt.Sscanf(portStr, "%d", &pn)
 		upsertDevice(Device{FP: senderFP, EdPub: senderHello.EdPub, XIDPub: senderHello.X25519IDPub,
-			DevName: firstNonEmpty(m.DevName, senderHello.DevName), LastIP: ip, LastPort: cfg.TCPPort})
+			DevName: pairDevName, LastIP: ip, LastPort: cfg.TCPPort})
 		// [Stage 5 第五轮] 配对待命**一次性消耗**：成功接上一台新设备就退出待命。
 		// 这样「每加一台手机都要显式点一次『配对新设备』」—— 避免陌生人随时蹭配对。
 		disarmPairing()
@@ -527,7 +536,16 @@ func handleConn(conn net.Conn) {
 			}
 		})
 	}
-	messageLoop(conn, keys.Session, senderFP, onFile)
+	// [Stage 10] 设备目录名：<设备名>-<指纹前8位>
+	// 手机端会收到这个值并显示出来，用户据此知道「我这台手机的图在电脑哪个目录」。
+	// 设备名从已配对设备记录取（配对成功后 upsertDevice 已入库；重连时更是现成的）。
+	devName := senderHello.DevName
+	if d := findDevice(senderFP); d != nil && d.DevName != "" {
+		devName = d.DevName
+	}
+	devDir := deviceDirName(devName, senderFP)
+	logf("设备目录: %s", devDir)
+	messageLoop(conn, keys.Session, senderFP, devDir, onFile)
 }
 
 // abortConn：把连接截止时间推到过去 → 阻塞中的读立即返回
@@ -550,9 +568,11 @@ type rxFile struct {
 	written  int64
 	skip     bool   // 幂等命中：吞掉剩余块
 	relPath  string // [Stage 7] 清洗后的相对目录（落盘子目录），空 = 落在接收目录根
+	devDir   string // [Stage 10] 设备目录名（<设备名>-<fp8>），多机隔离用
+	senderFP string // [Stage 10] 发送方指纹（幂等键的设备维度）
 }
 
-func messageLoop(conn net.Conn, key []byte, senderFP string, onFileReceived func(string, string, string)) {
+func messageLoop(conn net.Conn, key []byte, senderFP string, devDir string, onFileReceived func(string, string, string)) {
 	var rx *rxFile
 	for {
 		conn.SetDeadline(timeNow().Add(frameTimeout))
@@ -603,7 +623,7 @@ func messageLoop(conn net.Conn, key []byte, senderFP string, onFileReceived func
 				if parseJSONInto(pt, &meta) != nil {
 					return
 				}
-				rx = handleFileMeta(conn, key, &meta)
+				rx = handleFileMeta(conn, key, senderFP, devDir, &meta)
 			case "file_end":
 				if rx == nil {
 					return
@@ -622,7 +642,7 @@ func messageLoop(conn net.Conn, key []byte, senderFP string, onFileReceived func
 	}
 }
 
-func handleFileMeta(conn net.Conn, key []byte, meta *struct {
+func handleFileMeta(conn net.Conn, key []byte, senderFP string, devDir string, meta *struct {
 	Type            string `json:"type"`
 	FileID          string `json:"file_id"`
 	Name            string `json:"name"`
@@ -641,8 +661,11 @@ func handleFileMeta(conn net.Conn, key []byte, meta *struct {
 		})
 	}
 	// 幂等检查（第一优先）[R-15]
+	// [Stage 10] 幂等键含设备维度：两台手机传同一张图（内容相同 → file_id 相同）时
+	// 各存一份，互不吞；否则第二台手机的那张图会被静默丢弃（还回「已送达」的成功回执）。
+	seenKey := seenKeyFor(senderFP, meta.FileID)
 	seenMu.Lock()
-	dup := seenIDs[meta.FileID]
+	dup := seenIDs[seenKey]
 	seenMu.Unlock()
 	if dup {
 		sendAck("ok", "duplicate", "permanent")
@@ -707,7 +730,7 @@ func handleFileMeta(conn net.Conn, key []byte, meta *struct {
 	}
 	logf("接收文件: %s (%d bytes) batch=%s dir=%s", clean, meta.Size, meta.BatchID, dirLabel)
 	return &rxFile{fileID: meta.FileID, name: clean, origName: meta.Name, size: meta.Size, part: part,
-		hasher: sha256.New(), relPath: relSub}
+		hasher: sha256.New(), relPath: relSub, devDir: devDir, senderFP: senderFP}
 }
 
 // notifyRecvFailure：接收失败的用户提示 —— 合并同类 + 限流 [PC-6]
@@ -777,10 +800,24 @@ func finalizeFile(conn net.Conn, key []byte, rx *rxFile, onFileReceived func(str
 		return
 	}
 	// [Stage 7] 落在手机端对应的子目录（relPath 空 = 接收目录根）
+	// [Stage 10] **设备目录作为第一级**：Received\<设备名>-<fp8>\<相册目录>\
+	//             多台手机同步到同一台 PC 时物理隔离，用户一眼分得出哪张图来自哪台手机。
 	saveDir := getSaveDir()
-	destDir := saveDir
+	devDirPath := resolveDeviceDir(saveDir, rx.devDir)
+	destDir := devDirPath
 	if rx.relPath != "" {
-		destDir = filepath.Join(saveDir, rx.relPath)
+		destDir = filepath.Join(devDirPath, rx.relPath)
+	}
+	// 设备目录 / 子目录可能还不存在 → 建出来
+	if destDir != saveDir {
+		if err := os.MkdirAll(destDir, 0o755); err != nil {
+			rx.part.Close()
+			os.Remove(rx.part.Name())
+			finalize("error", "io_error", "transient")
+			logErr("创建设备/子目录失败: %v", err)
+			notifyRecvFailure("io_error", "无法创建目录: "+err.Error())
+			return
+		}
 	}
 	finalName := fmt.Sprintf("%d_%s", timeNow().UnixMilli(), rx.name)
 	dest := filepath.Join(destDir, finalName)
@@ -797,7 +834,7 @@ func finalizeFile(conn net.Conn, key []byte, rx *rxFile, onFileReceived func(str
 		notifyRecvFailure("io_error", "落盘失败: "+err.Error())
 		return
 	}
-	addSeenID(rx.fileID)
+	addSeenID(seenKeyFor(rx.senderFP, rx.fileID))
 	finalize("ok", "ok", "permanent")
 	logf("落盘完成: %s", dest)
 	resetRecvFailState() // 成功一次 → 清掉限流状态（下次出错重新提示）[PC-6]

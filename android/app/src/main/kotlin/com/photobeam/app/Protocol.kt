@@ -294,8 +294,10 @@ class PairingEngine(
     private val myName: String
 ) {
     // 已配对设备记录（从 prefs 读）
+    // [Stage 10] 新增 devDir：PC 端为本机分配的落盘目录名（<设备名>-<fp8>），
+    // 用于在界面上告诉用户「我这台手机的照片在电脑的哪个目录」。
     data class PairedPC(val fp: String, val edPubRaw: ByteArray, val name: String,
-        val lastIP: String, val lastPort: Int)
+        val lastIP: String, val lastPort: Int, val devDir: String = "")
 
     fun loadPairedPC(): PairedPC? {
         val fp = prefs.getString("pc_fp", null)
@@ -303,11 +305,11 @@ class PairingEngine(
         if (fp == null) return null
         return PairedPC(fp, b64d(prefs.getString("pc_edpub", "")!!),
             prefs.getString("pc_name", "") ?: "", prefs.getString("pc_ip", "") ?: "",
-            prefs.getInt("pc_port", 0))
+            prefs.getInt("pc_port", 0), prefs.getString("pc_dev_dir", "") ?: "")
     }
 
     fun savePairedPC(pc: PairedPC) {
-        android.util.Log.d("PhotoBeam", "savePairedPC: fp=${pc.fp} name=${pc.name} prefs=$prefs")
+        android.util.Log.d("PhotoBeam", "savePairedPC: fp=${pc.fp} name=${pc.name} devDir=${pc.devDir} prefs=$prefs")
         // [A4] 记录配对时间（诊断信息用）：只在**首次**配对时写入，
         // 之后 updateLastConnection 的重写不能覆盖它。
         val pairedAt = try {
@@ -318,6 +320,8 @@ class PairingEngine(
             .putString("pc_fp", pc.fp).putString("pc_edpub", b64e(pc.edPubRaw))
             .putString("pc_name", pc.name).putString("pc_ip", pc.lastIP)
             .putInt("pc_port", pc.lastPort).putLong("pc_paired_at", pairedAt)
+            // [Stage 10] PC 端分配给本机的落盘目录名（老版本 PC 不给 → 空 → 界面不显示）
+            .putString("pc_dev_dir", pc.devDir)
             .commit() // [B-09] 同步落盘
     }
 
@@ -464,9 +468,12 @@ class PairingEngine(
             val peerSig = b64d(ok.getString("sig"))
             require(IdentityKeys.verify(peerEdRaw, transcript, peerSig)) { "电脑签名校验失败" }
             val name = ok.optString("dev_name").ifEmpty { peerHello.getString("dev_name") }
+            // [Stage 10] PC 端回传本机的落盘目录名（老版本 PC 没有这个字段 → 空）
+            val devDir = ok.optString("dev_dir", "")
+            dbg("pair_ok dev_dir=$devDir")
             // 配对成功持久化（协议 §3.3）：双方各自保存
             savePairedPC(PairedPC(peerFP, peerEdRaw, name,
-                sock.inetAddress.hostAddress ?: "", sock.port))
+                sock.inetAddress.hostAddress ?: "", sock.port, devDir))
             return HandshakeResult(ch, mode, name, peerFP, peerEdRaw, sas, transcript, null)
         } else {
             // 重连：PC 已 pin 本端。本端 pin 丢失（重装/清数据）→ 按协议 §3.2
@@ -485,8 +492,14 @@ class PairingEngine(
             require(ok.optString("type") == "auth_ok") { "认证流程异常" }
             val peerSig = b64d(ok.getString("sig"))
             require(IdentityKeys.verify(known.edPubRaw, transcript, peerSig)) { "电脑签名校验失败" }
+            // [Stage 10] 重连时 PC 也会回传 dev_dir（老版本 PC 没有 → 空，保留旧值）
+            val devDir = ok.optString("dev_dir", "")
+            if (devDir.isNotEmpty()) {
+                dbg("auth_ok dev_dir=$devDir")
+            }
             savePairedPC(known.copy(lastIP = sock.inetAddress.hostAddress ?: known.lastIP,
-                lastPort = sock.port))
+                lastPort = sock.port,
+                devDir = devDir.ifEmpty { known.devDir }))
             return HandshakeResult(ch, mode,
                 peerHello.optString("dev_name", ""), peerFP, peerEdRaw, sas, transcript, null)
         }

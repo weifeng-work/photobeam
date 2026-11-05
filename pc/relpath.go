@@ -119,6 +119,16 @@ func cleanPathSegment(seg string) string {
 		}
 		return r
 	}, seg)
+	// [Stage 10 · 安全加固] 去掉**路径分隔符**。
+	// 原实现只去首尾的点，中间的 `/` `\` 会留下 —— 对 rel_path 无害（它按 / 切分过），
+	// 但设备名是**整体**传进来的：`../../etc` 清洗后仍是 `/../etc`，
+	// 拼到接收目录时 filepath.Join 会解析 `..` → **逃出接收目录**（路径穿越）。
+	seg = strings.Map(func(r rune) rune {
+		if r == '/' || r == '\\' {
+			return -1
+		}
+		return r
+	}, seg)
 	// 去掉首尾空格与点（Windows 会自动去掉尾部的点和空格，导致名字变形）
 	seg = strings.TrimSpace(seg)
 	seg = strings.Trim(seg, ".")

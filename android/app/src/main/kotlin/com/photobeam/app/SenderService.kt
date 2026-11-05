@@ -35,7 +35,13 @@ class SenderService : Service() {
         const val ACTION_ENSURE_FGS = "photobeam.ensure.fgs"
         /** ③ 立即同步 → 立刻跑一轮对账+冲刷，并把结果写回 prefs 供 UI 回显 [A3] */
         const val ACTION_SYNC_NOW = "photobeam.sync.now"
+    /** [Stage 10] 只取回 PC 端分配给本机的落盘目录名（dev_dir）——不触发对账/发送。
+     *  用于：PC 端升级后（新增 dev_dir 字段）手机端还没存过 → 主动取一次，
+     *  用户就能在界面看到「我的照片在电脑：xxx」。 */
+    const val ACTION_FETCH_DEVDIR = "photobeam.fetch.devdir"
         /** 正规前台服务通知 id */
+    /** [Stage 10] 内部广播：dev_dir 已更新（UI 据此刷新状态区） */
+    const val ACTION_DEVDIR_UPDATED = "photobeam.devdir.updated"
         const val NOTI_ID = 1
         /** 降级（普通通知）id：必须与 NOTI_ID 分离。
          *  [修复 2026-11-02 v2] 被系统"静默拒绝"的 startForeground 会**异步 cancel 掉同 id 的通知**，
@@ -308,6 +314,11 @@ class SenderService : Service() {
         if (intent?.action == ACTION_SYNC_NOW) {
             android.util.Log.d("PhotoBeam", "收到立即同步请求")
             reconcileAndFlush(manual = true)
+        }
+        // [Stage 10] 取回 PC 端分配的落盘目录名（dev_dir）：只握手，不对账、不发送。
+        if (intent?.action == ACTION_FETCH_DEVDIR) {
+            android.util.Log.d("PhotoBeam", "收到取 dev_dir 请求")
+            fetchDevDirAsync()
         }
         // [修复 2026-11-02] 服务已在跑时再被拉起（用户打开应用 / ④ 按钮 / 闹钟），
         // 重新发一次状态通知：若之前是"后台被拒"的降级态，此时应用在前台，
@@ -628,6 +639,34 @@ class SenderService : Service() {
                 .apply()
             android.util.Log.w("PhotoBeam", "失败回执: $name reason=$reason")
         } catch (e: Exception) { }
+    }
+
+    /**
+     * [Stage 10] 取回 PC 端分配给本机的落盘目录名（dev_dir）。
+     *
+     * 只做「发现 + 连接 + 握手」，握手时 PC 会在 auth_ok 里回传 dev_dir 并由
+     * PairingEngine 保存到 prefs；**不对账、不发送任何图片**。
+     * PC 端是旧版本（没有 dev_dir 字段）时字段为空 → 界面不显示这一行，行为不变。
+     */
+    private fun fetchDevDirAsync() {
+        Thread {
+            try {
+                val pc = pairing.loadPairedPC() ?: return@Thread
+                val hit = Discovery.resolve(this, pc.lastIP, pc.lastPort, pc.fp) ?: return@Thread
+                val sock = Socket()
+                sock.tcpNoDelay = true
+                sock.connect(java.net.InetSocketAddress(hit.ip, hit.port), 1500)
+                sock.soTimeout = 20_000
+                val hs = pairing.handshake(sock, { _, _ -> SAS_CONFIRM }, allowPairing = false)
+                if (hs.mode != "reconnect") return@Thread
+                sock.close()
+                android.util.Log.d("PhotoBeam", "已取回 dev_dir")
+                // 通知 UI 刷新（状态区要显示新目录名）
+                sendBroadcast(Intent(ACTION_DEVDIR_UPDATED).setPackage(packageName))
+            } catch (e: Exception) {
+                android.util.Log.w("PhotoBeam", "取 dev_dir 失败: ${e.message}")
+            }
+        }.start()
     }
 
     private fun doReconcileAndFlush(manual: Boolean = false) {

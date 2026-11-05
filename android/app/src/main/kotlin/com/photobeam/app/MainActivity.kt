@@ -9,6 +9,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -100,6 +101,15 @@ class MainActivity : Activity() {
     /** UI 线程 Handler：只用于「③ 立即同步」的轮询回显 [A3] */
     private val uiHandler = Handler(Looper.getMainLooper())
     private var syncPolling = false
+
+    // [Stage 10] dev_dir 更新广播接收器：PC 端分配给本机的落盘目录名拿到后刷新状态区
+    private val devDirReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == SenderService.ACTION_DEVDIR_UPDATED) {
+                runOnUiThread { refreshStatus() }
+            }
+        }
+    }
 
     /**
      * 需要申请的运行时权限 [协议 §7.7]
@@ -263,6 +273,19 @@ class MainActivity : Activity() {
         requestPermissions(needed.toTypedArray(), 100)
         refreshStatus()
 
+        // [Stage 10] 注册 dev_dir 广播（PC 端分配目录名后刷新状态区）
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(devDirReceiver, IntentFilter(SenderService.ACTION_DEVDIR_UPDATED),
+                    Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("UnspecifiedRegisterReceiverFlag")
+                registerReceiver(devDirReceiver, IntentFilter(SenderService.ACTION_DEVDIR_UPDATED))
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("PhotoBeam", "注册 dev_dir 广播失败: ${e.message}")
+        }
+
         // [Stage 8] 首次启动引导：必须先选同步目录，否则**一张图都不会同步**
         //（隐私默认拒绝）。已选过就不再弹（用户随时可用 ⑧ 改）。
         if (!SyncDirs.hasPicked(this)) {
@@ -372,6 +395,13 @@ class MainActivity : Activity() {
         // 顺便把"降级态"（startForeground 被拒）自动恢复成正规前台服务通知。
         SenderService.start(this, SenderService.ACTION_ENSURE_FGS)
         refreshStatus()
+        // [Stage 10] PC 端升级后才有 dev_dir；本机还没存过 → 主动取一次，
+        // 用户就能看到「我的照片在电脑：xxx」。
+        val pcFp = prefs.getString("pc_fp", null)
+        val devDir = prefs.getString("pc_dev_dir", "") ?: ""
+        if (pcFp != null && devDir.isEmpty()) {
+            SenderService.start(this, SenderService.ACTION_FETCH_DEVDIR)
+        }
     }
 
     override fun onPause() {
@@ -383,6 +413,8 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         super.onDestroy()
         stopSyncPolling()
+        // [Stage 10] 注销 dev_dir 广播
+        try { unregisterReceiver(devDirReceiver) } catch (e: Exception) { }
     }
 
     // ---------- 状态区 ----------
@@ -402,9 +434,15 @@ class MainActivity : Activity() {
         // [Stage 8] 同步目录状态：让用户一眼看出"现在到底在同步什么"
         // 注意：必须在 buildString 之外取 —— buildString 里 this 是 StringBuilder，不是 Context
         val selDirs = SyncDirs.selected(this)
+        // [Stage 10] PC 端分配给本机的落盘目录名（多机同步时用户据此找自己的图）
+        val devDir = prefs.getString("pc_dev_dir", "") ?: ""
         statusView.text = buildString {
             appendLine(if (selDirs.isEmpty()) "同步目录：未选择（不同步任何图片）"
                        else "同步目录：${selDirs.size} 个（${selDirs.joinToString(", ")}）")
+            // [Stage 10] 让用户知道「我这台手机的照片在电脑的哪个目录」
+            if (devDir.isNotEmpty()) {
+                appendLine("我的照片在电脑：$devDir\\")
+            }
             append("电脑：${paired ?: "未配对"}\n")
             append("待发送：$pending 张\n")
             append("服务：${serviceStateText(alarmOnly)}\n")
