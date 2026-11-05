@@ -62,15 +62,29 @@ class MediaStoreSync(
         // 只取 _id > lastMaxId 的行 [P0-09]
         //
         // [Stage 6 · 缺陷修复] is_pending 的处理方式改了：
-        // 原测现在 SQL 的 WHERE 里过滤 `is_pending = 0`，**但水位仍会被后面已就绪的行推过去**。
+        // 原实现在 SQL 的 WHERE 里过滤 `is_pending = 0`，**但水位仍会被后面已就绪的行推过去**。
         // 实测（<PHONE-MODEL> / MIUI，2026-11-05）：截图落库瞬间 is_pending=1，
         // 若此时后续 _id 的行已就绪，水位就会越过这张 pending 图 → 它永远落在水位之下，
         // 再也扫不到 → **该照片静默丢失**（实测 10 轮里丢 2 张）。
         //
         // 修法：**水位不得越过任何 pending 行**。pending 行本身这轮不入队，
         // 等 MediaStore 把 is_pending 清零后由 ContentObserver 再次触发对账补上。
-        val sel = "_id > ?"
-        val args = arrayOf(queue.lastMaxId.toString())
+        //
+        // [Stage 8 · 目录筛选] 目录过滤必须在 **SQL 层**做，不能查全量再在内存里过滤——
+        // 否则未选中目录里的行也会推进水位，把用户没选的目录的图「顺带」扫掉，
+        // 也可能越过已选目录里的 pending 行。
+        val sel: String
+        val args: Array<String>
+        val dirFilter = SyncDirs.buildSelectionSql(ctx)
+        if (dirFilter == null) {
+            // [Stage 8] 未选任何目录 → **不同步任何东西**（隐私默认拒绝）。
+            // 注意：这里直接返回，水位**不推进**——等用户选了目录后再从原水位继续，
+            // 否则用户选完目录后，那段区间的图就永远扫不到了。
+            android.util.Log.d("PhotoBeam", "对账跳过：未选择任何同步目录")
+            return 0
+        }
+        sel = "_id > ? AND ($dirFilter)"
+        args = arrayOf(queue.lastMaxId.toString())
         var upper = queue.lastMaxId
         // pendingBarrier：遇到的第一个 pending 行的 _id。水位不得越过它。
         var pendingBarrier = -1L

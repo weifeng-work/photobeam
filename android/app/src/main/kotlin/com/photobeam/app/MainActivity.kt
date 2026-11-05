@@ -166,6 +166,8 @@ class MainActivity : Activity() {
         val bBattery = btn("⑤ 允许后台常驻（关闭电池优化）")
         val bStop = btn("⑥ 停止同步服务")
         val bDiag = btn("⑦ 导出诊断信息")
+        // [Stage 8] 同步目录筛选：用户选择哪些手机相册目录参与同步
+        val bDirs = btn("⑧ 选择同步文件夹（默认不同步任何目录）")
 
         root.addView(title)
         root.addView(statusView)
@@ -178,6 +180,7 @@ class MainActivity : Activity() {
         root.addView(bBattery)
         root.addView(bStop)
         root.addView(bDiag)
+        root.addView(bDirs)
         setContentView(root)
 
         bPerm.setOnClickListener {
@@ -239,9 +242,74 @@ class MainActivity : Activity() {
             uiHandler.postDelayed({ refreshStatus() }, 1500)
         }
         bDiag.setOnClickListener { exportDiagnostics() }
+        bDirs.setOnClickListener { showDirPicker(firstRun = false) }
 
         requestPermissions(needed.toTypedArray(), 100)
         refreshStatus()
+
+        // [Stage 8] 首次启动引导：必须先选同步目录，否则**一张图都不会同步**
+        //（隐私默认拒绝）。已选过就不再弹（用户随时可用 ⑧ 改）。
+        if (!SyncDirs.hasPicked(this)) {
+            root.post { showDirPicker(firstRun = true) }
+        }
+    }
+
+    // ---------- 同步目录选择 [Stage 8] ----------
+
+    /**
+     * 目录选择对话框：列出手机上有图片的目录，多选。
+     *
+     * 不用 SAF 目录授权：MediaStore 的 RELATIVE_PATH 已经给出全部图片目录，
+     * 现有「允许访问所有照片」权限就够读目录名 —— 不给用户额外的授权弹窗。
+     *
+     * @param firstRun 首次引导（说明"不选就不同步"）；平时从 ⑧ 进入
+     */
+    private fun showDirPicker(firstRun: Boolean) {
+        val dirs = SyncDirs.listDirs(this)
+        if (dirs.isEmpty()) {
+            // 手机里还没有任何图片 → 没有可选目录，提示去拍照/截图
+            AlertDialog.Builder(this)
+                .setTitle(if (firstRun) "选择要同步的文件夹" else "选择要同步的文件夹")
+                .setMessage("手机相册里还没有图片。\n\n先截几张图或拍几张照片，再回到这里选择要同步的文件夹。\n\n" +
+                    "（未选择任何文件夹时，PhotoBeam 不会同步任何图片——这是默认的隐私保护。）")
+                .setPositiveButton("好", null).show()
+            return
+        }
+        val labels = dirs.map { "${it.first}（${it.second} 张）" }.toTypedArray()
+        val checked = BooleanArray(dirs.size) { i ->
+            SyncDirs.selected(this).contains(dirs[i].first)
+        }
+        val dlg = AlertDialog.Builder(this)
+            .setTitle(if (firstRun) "选择要同步的文件夹" else "选择要同步的文件夹")
+            .setMessage("勾选需要同步到电脑的相册文件夹（可多选）。\n\n" +
+                "· 勾选某个文件夹会**连同它的子文件夹**一起同步。\n" +
+                "· 未勾选任何文件夹 = 不同步任何图片。\n" +
+                "· 只有**之后新增**的图片会被同步，历史图片不会补传。")
+            .setMultiChoiceItems(labels, checked) { _, which, isChecked -> checked[which] = isChecked }
+            .setPositiveButton("保存") { _, _ ->
+                val chosen = HashSet<String>()
+                for (i in dirs.indices) if (checked[i]) chosen.add(dirs[i].first)
+                SyncDirs.save(this, chosen)
+                android.util.Log.d("PhotoBeam", "同步目录已保存：${chosen.size} 个（$chosen）")
+                if (chosen.isEmpty()) {
+                    statusView.text = "已保存：未选择任何文件夹 → 当前不会同步任何图片"
+                } else {
+                    statusView.text = "已保存：${chosen.size} 个文件夹参与同步 → ${chosen.joinToString(", ")}"
+                }
+                // 立刻触发一次对账（让新选的目录里的新图马上能发出去）
+                SenderService.start(this, SenderService.ACTION_SYNC_NOW)
+                startSyncPolling()
+            }
+            .setNegativeButton(if (firstRun) "暂不选择（不同步任何图片）" else "取消") { _, _ ->
+                if (firstRun) {
+                    // 首次引导取消 = 明确保持"不同步任何东西"，并标记已做过选择
+                    // （避免每次启动都弹窗骚扰；用户随时可从 ⑧ 改）。
+                    SyncDirs.save(this, emptySet())
+                    statusView.text = "当前不会同步任何图片。可点「⑧ 选择同步文件夹」随时开启。"
+                }
+            }
+            .create()
+        dlg.show()
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
@@ -283,7 +351,12 @@ class MainActivity : Activity() {
         val exempt = isIgnoringBatteryOptimizations()
         // [A6] 仅闹钟降级态：前台服务被系统连续超时停止后，不再申请前台服务身份
         val alarmOnly = SenderService.alarmOnlyMode || prefs.getBoolean(SenderService.PREFS_ALARM_ONLY, false)
+        // [Stage 8] 同步目录状态：让用户一眼看出"现在到底在同步什么"
+        // 注意：必须在 buildString 之外取 —— buildString 里 this 是 StringBuilder，不是 Context
+        val selDirs = SyncDirs.selected(this)
         statusView.text = buildString {
+            appendLine(if (selDirs.isEmpty()) "同步目录：未选择（不同步任何图片）"
+                       else "同步目录：${selDirs.size} 个（${selDirs.joinToString(", ")}）")
             append("电脑：${paired ?: "未配对"}\n")
             append("待发送：$pending 张\n")
             append("服务：${serviceStateText(alarmOnly)}\n")
