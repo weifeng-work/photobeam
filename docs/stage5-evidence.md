@@ -868,6 +868,122 @@ PC 端日志（新增 `dir=` 字段，一眼可看出落位）：
 `rel_path` 字段缺失（旧版手机端）→ 落平到接收目录根，行为与 v1.6 完全一致，
 混版不会出错，只是旧手机端拿不到目录结构。单测
 `TestResolveSaveSubDirNormal` 的「空 rel_path → 根目录」用例覆盖该路径。
+### 5.15 第八轮：同步目录筛选（协议 v1.8 · Stage 8）
+
+**需求**：不是所有照片都该同步到电脑 —— 用户要能选择**哪几个文件夹**参与同步，
+并且**第一次使用就要选**；没选的情况下**一个目录都不该同步**（隐私默认拒绝）。
+
+#### 5.15.1 实现要点
+
+- **新增 `android/.../SyncDirs.kt`**：选中目录的持久化（SharedPreferences）、
+  列出有图的目录（按图数降序）、前缀匹配判定、生成 SQL 过滤条件。
+- **过滤在 SQL 层**（`MediaStoreSync.kt`）：`_id > ? AND (relative_path LIKE ? OR ...)`。
+  **不能**先查全量再内存筛 —— 否则未选中目录的行也会推进 `_id` 水位，
+  把用户没选的目录「顺带」扫掉，也可能越过已选目录里的 pending 行
+  （Stage 6 修过的丢图缺陷会复发）。
+- **空选时直接返回且水位不推进** → 用户选完目录后从原水位继续，
+  避免「选之前那段区间的图永远扫不到」。
+- **不需要 SAF 目录授权**：目录名来自 MediaStore 的 `RELATIVE_PATH`，
+  现有「允许访问所有照片」权限即可读取 —— 不给用户额外的授权弹窗。
+- **仍然是增量**：只有选完之后**新增**的图片会被同步，历史图不补传。
+- 纯手机端本地行为，Receiver 无需感知 → **不涉及协议字段变更**，两端无需同版本。
+
+#### 5.15.2 实测发现并修掉的 UI 缺陷
+
+实机第一次跑就发现：**弹窗只有说明文字，目录列表一项都没出来**。
+
+原因：Android `AlertDialog` 里 `setMessage` 与 `setMultiChoiceItems` 同用时，
+**`setMessage` 会覆盖掉多选列表**（AlertDialog 的既有行为）。
+
+修法：改用 `setView` 自定义布局（说明 `TextView` + `ListView`）。
+两个配套的类型坑（该 kotlinc 版本）：
+- `apply` 块内的 `this` 与 lambda 内的 `this` 不是同一个 → 直接写 `adapter` /
+  `setItemChecked` 会 `unresolved reference` → 改用显式变量 `lv` 引用；
+- `setOnItemClickListener { _, _, which, _ -> ... }` 的 SAM 转换推断不出参数类型
+  → 改用 `object : AdapterView.OnItemClickListener { ... }`。
+
+#### 5.15.3 实测（CI 产物 APK，<PHONE-MODEL> / MIUI）
+
+**A. 首次启动引导**（实机截图确认）：
+
+```
+选择要同步的文件夹
+勾选需要同步到电脑的相册文件夹（可多选）。
+· 勾选某个文件夹会连同它的子文件夹一起同步。
+· 未勾选任何文件夹 = 不同步任何图片。
+· 只有之后新增的图片会被同步，历史图片不会补传。
+
+  DCIM/Screenshots（224 张）      ← 列表正常显示，带每目录图片数
+  DCIM/Camera/SubDir（3 张）
+  Download/PBTest（3 张）
+  Pictures/PhotoBeamTest（3 张）
+  ...
+  [暂不选择（不同步任何图片）]  [保存]
+```
+
+主界面状态区第一行：`同步目录：未选择（不同步任何图片）`。
+
+**B. 默认空选 → 截图不同步**：
+
+```
+PC 文件数 before = 80
+触发截图 → 等待 12 秒
+PC 文件数 after  = 80   delta = 0        ← 一张都没同步
+手机端日志：对账跳过：未选择任何同步目录
+```
+
+**C. 选中 `DCIM/Screenshots` → 恢复同步**：
+
+```
+同步目录已保存：1 个（[DCIM/Screenshots]）
+触发截图 → PC 文件数 delta = 1
+落盘位置：Received\Screenshots\1793905720170_Screenshot_2026-11-06-03-08-39-657_....jpg
+```
+
+**D. 未选中的目录不会被「顺带」同步**（关键验证 —— 过滤必须生效）：
+
+```
+手机端（各目录图片数）        PC 端（对应目录文件数）
+DCIM/Screenshots/      : 225   →  Screenshots      : 13   ✓（选中的）
+DCIM/Camera/SubDir/   :   3   →  （PC 端无此目录）    ✓ 未选，不同步
+Pictures/<USER-DIR>/     :   3   →  （PC 端无此目录）    ✓ 未选，不同步
+Pictures/<USER-DIR>A/      :   3   →  （PC 端无此目录）    ✓ 未选，不同步
+Pictures/<USER-DIR>B/      :   3   →  （PC 端无此目录）    ✓ 未选，不同步
+Download/             :   1   →  （PC 端无此目录）    ✓ 未选，不同步
+```
+
+**E. 水位不推进的设计得到验证**：空选期间（03:04:37）截的那张图，
+在 03:07:55 选中目录**之后**才被同步（落盘名时间戳 1793905675976）——
+说明「空选期间水位不推进 → 选完从原水位继续」按设计工作。
+
+#### 5.15.4 时延无退化
+
+`tools/assert-latency.ps1`（6 轮，CI 产物）：
+
+```
+第 1 轮: 落盘→可粘贴 =  82ms  OK   系统段(截图→可粘贴)= 522ms
+第 2 轮: 落盘→可粘贴 = 294ms  OK   系统段(截图→可粘贴)= 832ms
+第 5 轮: 落盘→可粘贴 = 501ms  OK   系统段(截图→可粘贴)=1009ms
+第 6 轮: 落盘→可粘贴 =1170ms  OK   系统段(截图→可粘贴)=1666ms
+→ 达标 6/6，平均 512ms，最大 1170ms（阈值 2000ms）
+```
+
+#### 5.15.5 公开前的脱敏与历史重写
+
+公开前做了两件事（本轮一并完成）：
+
+1. **工作区脱敏**：把 Stage 6/7 新增内容里的本机标识换成仓库既有的占位符约定
+   （`<user>` / `<PC-IP>` / `<PHONE-MODEL>` / `<ICS-IP>`），
+   `tools/assert-latency.ps1` 的接收目录改为从 `$env:LOCALAPPDATA` 推导（不再硬编码用户名）。
+2. **历史重写**：`git filter-repo --replace-text` 替换掉历史提交里的
+   用户名 / 机型 / 本机 IP / ICS 网段，随后清掉 remote-tracking ref、reflog、
+   unreachable 对象并 `gc --prune=now`。强推（`--force-with-lease`）后远端历史
+   已无任何本机标识（逐 commit 的 blob 级扫描确认）。
+
+**踩到的坑**：脱敏用的 PowerShell 脚本里，替换串含反斜杠与 `$`，
+`.Replace()` 把它们当转义处理，一度把 `C:\Users\<user>` 写成 `::\Users\IKUN`、
+把 `$ReceivedDir` 写成 `RReceivedDir`。**字符串替换脚本改代码是不可靠的**——
+后来改用逐处精确替换 + 编译/测试兜底，并 `git checkout` 恢复了受损文件。
 ## 6. 遗留
 
 1. ~~**计划任务看门狗**未实现~~ → **第五轮已用「隐藏监护进程」实现**（不需要注册系统计划任务、不需要提权）。
