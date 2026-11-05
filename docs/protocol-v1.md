@@ -1,4 +1,4 @@
-# PhotoBeam 协议规范 v1.6（Stage 6 修订版 · 端到端时延收紧）
+# PhotoBeam 协议规范 v1.7（Stage 7 修订版 · 手机端目录结构保留）
 
 > 状态：v1.5（Stage 5 修订版）。Stage 0 已四轮签字，Stage 1~4 实现已按规范交付；
 > **v1.4 的修订原则：以实机验证结果为准**——凡 v1.3 的条文与真机行为冲突，
@@ -24,6 +24,11 @@
 > 4. **§7.6 开机流程按实测改写**：广播内**直接起服务** + 精确闹钟兜底（v1.3 写的是「只起闹钟」）。
 > 5. **§8 计划任务看门狗移出本版范围**（Stage 5 决策：不在系统注册计划任务），登记为后续项。
 > 6. §7.7 Android 14 部分媒体授权三态、§7.5 FGS `onTimeout` 降级链路：条款保留，实现状态标注。
+>
+> **v1.7 变更要点**：`file_meta` 新增 `rel_path` 字段 —— 手机端目录结构保留到 PC
+> （手机 `Pictures/Screenshots/` → PC `Received/Screenshots/`），顶层媒体桶被剥离；
+> `rel_path` 按不可信输入处理（完整路径消毒 + 二次逃逸检查）；字段缺失时向后兼容
+> （落平到接收目录根）。原 §10 延后项 A 转为已实施，延后项 B（任意文件类型）维持不实施。
 >
 > **v1.6 变更要点**：§9 第 2 条端到端时延判据由「截图 ≤3 秒落盘」收紧为
 > **「截图 ≤2 秒可粘贴」**，并给出两级守门人（CI 可跑的关键路径预算 + 真机端到端脚本）；
@@ -276,7 +281,7 @@ key = session（32B），每帧独立 12B 随机 nonce；重连换新 session �
 
 | 消息 | 字段（CTRL_JSON payload） |
 |---|---|
-| `file_meta` | `file_id`(SHA-256 hex 小写)、`name`、`size`、`mtime`、`mime`、`captured_at`、`batch_id`、`is_latest_in_batch`(bool)、`batch_size`(int) |
+| `file_meta` | `file_id`(SHA-256 hex 小写)、`name`、`size`、`mtime`、`mime`、`captured_at`、`batch_id`、`is_latest_in_batch`(bool)、`batch_size`(int)、`rel_path`(string, **v1.7 新增**，见下) |
 | `file_end` | `file_id` |
 | `ack` | `file_id`、`status`("ok"/"error")、`reason`("ok"/"duplicate"/"ext_rejected"/"disk_full"/"invalid_name"/"io_error")、`err_class`("permanent"/"transient") |
 | `error` | `reason`、`ver`、`min_ver`（连接级/协议级错误专用 [R-15]） |
@@ -298,6 +303,22 @@ key = session（32B），每帧独立 12B 随机 nonce；重连换新 session �
   该字符串分支，改名无兼容风险）；
 - **v1.4 新增**：上述四类接收端错误（`ext_rejected` / `io_error` / `disk_full` / `file_too_large`）
   **必须同时给用户可见反馈**（PC 端日志 + 合并限流的消息提示），不得只回 ACK 静默丢弃；
+- **`rel_path`（v1.7 新增，手机端相对目录）**：Sender 带上图片在 MediaStore 中的
+  `RELATIVE_PATH`（如 `DCIM/Screenshots/`），Receiver 据此在接收目录下建**子目录**落盘，
+  不再把所有图拍平到一个目录。约定：
+  - **顶层媒体桶被剥离**：`DCIM` / `Pictures` / `Download` / `Documents` / `Movies` /
+    `Music` / `Podcasts` 等标准桶去掉第一层——手机的 `Pictures/Screenshots/` 落到
+    PC 的 `Received/Screenshots/`（协议 §10 延后项 A 的目标）；
+  - **单向语义不变**：只保留目录结构，不做反向删除同步（v1 仍是单向投递）；
+  - **向后兼容**：字段缺失（旧版 Sender）→ 落平到接收目录根，行为与 v1.6 一致；
+  - **落盘名规则不变**：仍是 `<unixMs_Receiver>_<消毒文件名>`，冲突加 `-1`/`-2`；
+  - **幂等键不变**：仍按 `file_id`（内容 SHA-256）去重，**与目录无关**——
+    同一张图即使来自不同目录，也只落盘一份。
+- **`rel_path` 必须按不可信输入处理**（对端可控 → 路径穿越风险）：
+  Receiver 落盘前必须做完整消毒 —— 丢弃 `..` 分量、剥离绝对路径前缀与盘符、
+  拒绝 Windows 保留设备名（CON/NUL/COM1…）、去控制字符与非法字符、限制单级长度与
+  总深度；消毒后还要做**二次逃逸检查**（拼出的路径必须在接收目录之下）。
+  清洗规则不改变**目录语义**（只做安全清洗，不丢层级），清洗后为空则落平到根目录。
 - **隔离写入**：先写 `Received\.tmp\<file_id>.part`，FILE_END 后校验整文件 SHA-256 =
   file_id → 通过则**原子 rename** 到 `<unixMs_Receiver时钟>_<消毒名>`（冲突加 -1/-2）；
   校验失败删 .part 回 transient；
@@ -518,20 +539,24 @@ PC 反向拉取（协议字段预留，v1 不实现 [P2-新2]）。
 
 **v1.6 新增延后项（Stage 6 · 范围扩张的代价与约束分析）**：
 
-**延后项 A：保留手机端目录结构（多文件夹 → 多文件夹映射）**
+**延后项 A：保留手机端目录结构（多文件夹 → 多文件夹映射）—— ✅ v1.7 已实施**
 
 - **目标**：手机 `Pictures/Screenshots/` 落到 PC 的 `Screenshots/`，而不是全部拍平到 `Received/`。
 - **协议改动**：`file_meta` 增加 `rel_path` 字段（手机端 `MediaStoreSync` 已在本地读取
-  `RELATIVE_PATH`，只是发送时丢弃了）；PC 端落盘前按 `rel_path` 建子目录。
-- **代价**：
-  1. 协议字段变更 → v1.6 → v1.7，PC 与手机端**必须同版本**，混版会因字段缺失而退化；
-  2. **路径穿越风险**（协议 §5.2 已有 `name` 的消毒逻辑，`rel_path` 需同等处理：
-     剥离 `..`、绝对路径前缀、盘符、保留字设备名）；
-  3. PC 端落盘不再拍平 → 幂等去重键（当前按落盘名）需重新定义，否则同名文件会散落多目录；
-  4. 弹窗「已保存到」路径变长，展示需截断处理。
+  `RELATIVE_PATH`，只是发送时丢弃了）；PC 端落盘前按 `rel_path` 建子目录。**已实施**（v1.7）。
+- **代价与实际处置**：
+  1. ~~协议字段变更 → v1.6 → v1.7，PC 与手机端必须同版本~~ →
+     **实际按「向后兼容」设计**：字段缺失时落平到接收目录根，行为与 v1.6 完全一致，
+     混版不会出错（只是旧手机端拿不到目录结构）；
+  2. ~~路径穿越风险~~ → **已按不可信输入处理**（协议 §5.2 新增条款）：
+     `pc/relpath.go` 做完整消毒（`..`、绝对路径、盘符、保留设备名、控制字符、
+     长度/深度上限）+ 二次逃逸检查；`pc/relpath_test.go` 有 9 组用例覆盖穿越攻击；
+  3. ~~幂等去重键需重新定义~~ → **不需要**：幂等键本就是 `file_id`（内容 SHA-256），
+     与落盘路径无关（原先担心的「同名文件散落多目录」不存在，因为幂等看的是内容不是名字）；
+  4. ~~弹窗「已保存到」路径变长~~ → 已处理：回调传入的是**实际落盘目录**，
+     弹窗用既有的 `ellipsisTail` 截断（超 34 字符保留尾部）。
 - **约束**：v1 明确「单 PC 配对、单向投递」，目录保留仍是**单向**语义（PC 不回传删除）。
-- **建议**：作为 v1.7 的独立小版本实施，不与端到端时延优化混做（避免两个变量同时动，
-  无法归因）。
+- **实测**：见 `docs/stage5-evidence.md` §5.14。
 
 **延后项 B：支持任意文件类型（不止图片）**
 

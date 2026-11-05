@@ -548,7 +548,8 @@ type rxFile struct {
 	part     *os.File
 	hasher   hash.Hash
 	written  int64
-	skip     bool // 幂等命中：吞掉剩余块
+	skip     bool   // 幂等命中：吞掉剩余块
+	relPath  string // [Stage 7] 清洗后的相对目录（落盘子目录），空 = 落在接收目录根
 }
 
 func messageLoop(conn net.Conn, key []byte, senderFP string, onFileReceived func(string, string, string)) {
@@ -597,6 +598,7 @@ func messageLoop(conn net.Conn, key []byte, senderFP string, onFileReceived func
 					BatchID         string `json:"batch_id"`
 					IsLatestInBatch bool   `json:"is_latest_in_batch"`
 					BatchSize       int    `json:"batch_size"`
+					RelPath         string `json:"rel_path"` // [Stage 7] 手机端相对目录
 				}
 				if parseJSONInto(pt, &meta) != nil {
 					return
@@ -630,6 +632,7 @@ func handleFileMeta(conn net.Conn, key []byte, meta *struct {
 	BatchID         string `json:"batch_id"`
 	IsLatestInBatch bool   `json:"is_latest_in_batch"`
 	BatchSize       int    `json:"batch_size"`
+	RelPath         string `json:"rel_path"` // [Stage 7] 手机端相对目录
 }) *rxFile {
 	sendAck := func(status, reason, class string) {
 		sendCtrl(conn, key, map[string]any{
@@ -668,23 +671,43 @@ func handleFileMeta(conn net.Conn, key []byte, meta *struct {
 		return &rxFile{fileID: meta.FileID, skip: true}
 	}
 	// 磁盘配额（第二优先）[R-15]
-	saveDir := getSaveDir()
-	if free, err := diskFreeBytes(saveDir); err == nil && free < 500<<20 {
+	if free, err := diskFreeBytes(getSaveDir()); err == nil && free < 500<<20 {
 		sendAck("error", "disk_full", "permanent")
 		logErr("磁盘空间不足，拒收: %s（剩余 %d MB）", meta.Name, free>>20)
 		notifyRecvFailure("disk_full", fmt.Sprintf("磁盘剩余不足 500 MB（当前 %d MB）", free>>20))
 		return &rxFile{fileID: meta.FileID, skip: true}
 	}
-	part, err := os.Create(filepath.Join(saveDir, ".tmp", meta.FileID+".part"))
+	// 临时文件写在接收目录根的 .tmp 下（不进子目录——子目录还没建好）
+	part, err := os.Create(filepath.Join(getSaveDir(), ".tmp", meta.FileID+".part"))
 	if err != nil {
 		sendAck("error", "io_error", "transient")
 		logErr("创建临时文件失败: %v", err)
 		notifyRecvFailure("io_error", "无法写入接收目录: "+err.Error())
 		return &rxFile{fileID: meta.FileID, skip: true}
 	}
-	logf("接收文件: %s (%d bytes) batch=%s", clean, meta.Size, meta.BatchID)
+	// [Stage 7] 手机端目录结构保留：按 rel_path 建子目录。
+	// rel_path 来自对端（不可信）→ 必须经 sanitizeRelPath 清洗 + resolveSaveSubDir 二次逃逸检查。
+	saveDir := getSaveDir()
+	subDir, relSub := resolveSaveSubDir(saveDir, meta.RelPath)
+	if relSub != "" {
+		if err := os.MkdirAll(subDir, 0o755); err != nil {
+			// 建目录失败 → 落平到接收目录根（不能因此拒收整张图）
+			logErr("创建子目录失败，退回接收目录根: %s（%v）", relSub, err)
+			subDir, relSub = saveDir, ""
+			part.Close()
+			os.Remove(part.Name())
+			sendAck("error", "io_error", "transient")
+			notifyRecvFailure("io_error", "无法创建子目录: "+err.Error())
+			return &rxFile{fileID: meta.FileID, skip: true}
+		}
+	}
+	dirLabel := relSub
+	if dirLabel == "" {
+		dirLabel = "<root>"
+	}
+	logf("接收文件: %s (%d bytes) batch=%s dir=%s", clean, meta.Size, meta.BatchID, dirLabel)
 	return &rxFile{fileID: meta.FileID, name: clean, origName: meta.Name, size: meta.Size, part: part,
-		hasher: sha256.New()}
+		hasher: sha256.New(), relPath: relSub}
 }
 
 // notifyRecvFailure：接收失败的用户提示 —— 合并同类 + 限流 [PC-6]
@@ -753,14 +776,19 @@ func finalizeFile(conn net.Conn, key []byte, rx *rxFile, onFileReceived func(str
 		notifyRecvFailure("hash_mismatch", "文件校验失败（可能传输损坏）: "+rx.name)
 		return
 	}
+	// [Stage 7] 落在手机端对应的子目录（relPath 空 = 接收目录根）
 	saveDir := getSaveDir()
+	destDir := saveDir
+	if rx.relPath != "" {
+		destDir = filepath.Join(saveDir, rx.relPath)
+	}
 	finalName := fmt.Sprintf("%d_%s", timeNow().UnixMilli(), rx.name)
-	dest := filepath.Join(saveDir, finalName)
+	dest := filepath.Join(destDir, finalName)
 	// 落盘名冲突加 -1/-2 后缀（协议 §5.2）[P2-06]
 	for i := 1; fileExists(dest); i++ {
 		ext := filepath.Ext(rx.name)
 		base := strings.TrimSuffix(rx.name, ext)
-		dest = filepath.Join(saveDir, fmt.Sprintf("%d_%s-%d%s", timeNow().UnixMilli(), base, i, ext))
+		dest = filepath.Join(destDir, fmt.Sprintf("%d_%s-%d%s", timeNow().UnixMilli(), base, i, ext))
 	}
 	if err := os.Rename(rx.part.Name(), dest); err != nil {
 		os.Remove(rx.part.Name()) // 残留清理 [P2-07]
@@ -774,7 +802,7 @@ func finalizeFile(conn net.Conn, key []byte, rx *rxFile, onFileReceived func(str
 	logf("落盘完成: %s", dest)
 	resetRecvFailState() // 成功一次 → 清掉限流状态（下次出错重新提示）[PC-6]
 	if onFileReceived != nil {
-		onFileReceived(dest, rx.origName, saveDir)
+		onFileReceived(dest, rx.origName, destDir)
 	}
 }
 

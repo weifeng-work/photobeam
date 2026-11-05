@@ -822,6 +822,8 @@ class SenderService : Service() {
                         .put("batch_id", it.batchId)
                         .put("is_latest_in_batch", it.isLatestInBatch)
                         .put("batch_size", it.batchSize)
+                        // [Stage 7] 手机端相对目录（PC 端做路径消毒后建子目录）
+                        .put("rel_path", it.relPath.trim('/'))
                         .toString().toByteArray())
                     // chunks（256KiB，从内存 data 直发——内容与 file_id 同源 [方案 A]）
                     var off = 0

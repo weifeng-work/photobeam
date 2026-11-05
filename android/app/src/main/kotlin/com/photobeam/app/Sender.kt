@@ -146,6 +146,9 @@ object Sender {
             .put("batch_id", item.batchId)
             .put("is_latest_in_batch", item.isLatestInBatch)
             .put("batch_size", item.batchSize)
+            // [Stage 7] 手机端相对目录（如 "DCIM/Screenshots/"）——PC 端按它建子目录。
+            // PC 端会做完整的路径消毒（穿越/盘符/保留名），这里只做最基本的形式化。
+            .put("rel_path", item.relPath.trim('/'))
             .toString().toByteArray())
 
         // chunks（256KiB，从内存 data 直发——内容与 file_id 同源 [方案 A]）
