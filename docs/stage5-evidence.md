@@ -981,7 +981,7 @@ Download/             :   1   →  （PC 端无此目录）    ✓ 未选，不�
    已无任何本机标识（逐 commit 的 blob 级扫描确认）。
 
 **踩到的坑**：脱敏用的 PowerShell 脚本里，替换串含反斜杠与 `$`，
-`.Replace()` 把它们当转义处理，一度把 `C:\Users\<user>` 写成 `::\Users\IKUN`、
+`.Replace()` 把它们当转义处理，一度把 `C:\Users\<用户名>` 写成 `::\Users\<用户名>`、
 把 `$ReceivedDir` 写成 `RReceivedDir`。**字符串替换脚本改代码是不可靠的**——
 后来改用逐处精确替换 + 编译/测试兜底，并 `git checkout` 恢复了受损文件。
 ## 6. 遗留
