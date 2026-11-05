@@ -235,7 +235,18 @@ class SenderService : Service() {
             // 队列有积压 = 连拍/上一批还没发完 → 去抖合并，避免每张单独建连接
             handler.postDelayed(flushRunnable, 250)
         }
+        // [Stage 6 · 缺陷修复兜底] 本轮若遇到 is_pending=1 的行（文件还没写完），
+        // 那张图这轮入不了队。正常情况 MediaStore 清零 is_pending 时会再次触发
+        // ContentObserver；但部分 ROM 不通知 UPDATE 变更 → 补一次 800ms 后的重扫，
+        // 保证「pending 图永远不会丢」不依赖 ROM 的通知行为。
+        if (sync.sawPendingRow) {
+            handler.removeCallbacks(rescanRunnable)
+            handler.postDelayed(rescanRunnable, 800)
+        }
     }
+
+    /** pending 行重扫兜底（见 scheduleAdaptiveFlush 的说明） */
+    private val rescanRunnable = Runnable { reconcileAndFlush() }
 
     override fun onCreate() {
         super.onCreate()
