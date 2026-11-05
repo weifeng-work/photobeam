@@ -25,6 +25,7 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ListView
+import android.widget.ScrollView
 import android.widget.TextView
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -184,7 +185,19 @@ class MainActivity : Activity() {
         root.addView(bStop)
         root.addView(bDiag)
         root.addView(bDirs)
-        setContentView(root)
+
+        // [Stage 9 · 修复] 内容超出屏幕时无法滚动 —— ⑦「导出诊断信息」被裁到只剩 21px，
+        // ⑧「选择同步文件夹」完全在屏幕外，用户根本点不到。
+        // 根因：root 是裸 LinearLayout，直接 setContentView(root) → 超出部分被裁掉且不可滚。
+        // 修法：把 root 包进 ScrollView（可滚动），并给底部留一段空白，
+        //       让最后一个按钮滚到顶时也能完整显示（不被手势条/导航栏压住）。
+        val scroll = ScrollView(this).apply {
+            isFillViewport = true
+            addView(root, ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        root.setPadding(pad, pad, pad, pad * 2)   // 底部双倍留白：最后一个按钮滚上来也不贴边
+        setContentView(scroll)
 
         bPerm.setOnClickListener {
             requestPermissions(needed.toTypedArray(), 100)
