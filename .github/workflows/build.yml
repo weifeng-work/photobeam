@@ -146,7 +146,7 @@ jobs:
 
   # ---------- 产物清理 ----------
   # 每次推送产生 2 个 artifact，不清理会无限堆积（默认保留 90 天也会占空间）。
-  # 策略：CI 跑完后删掉本仓库所有历史 artifact，只留本次的。
+  # 策略：CI 跑完后删掉**历史** artifact，保留本次的（否则本次产物也一起没了）。
   cleanup-artifacts:
     name: 清理旧产物
     runs-on: ubuntu-latest
@@ -156,17 +156,20 @@ jobs:
       contents: read
     if: always()          # 无论前面成败都清理
     steps:
-      - name: 删除本仓库的全部历史 artifact
+      - name: 删除本次 run 之外的历史 artifact
         uses: actions/github-script@v7
         with:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
+            const currentRun = context.runId;
             const artifacts = await github.paginate(github.rest.actions.listArtifactsForRepo, {
               owner, repo, per_page: 100
             });
-            let n = 0;
+            let n = 0, kept = 0;
             for (const a of artifacts) {
+              // 本次 run 的 artifact 要留着（用户要从 Actions 页面下载本次产物）
+              if (a.workflow_run && a.workflow_run.id === currentRun) { kept++; continue; }
               try {
                 await github.rest.actions.deleteArtifact({ owner, repo, artifact_id: a.id });
                 n++;
@@ -174,7 +177,7 @@ jobs:
                 core.warning(`delete artifact ${a.id} failed: ${e.message}`);
               }
             }
-            core.info(`deleted ${n} old artifacts`);
+            core.info(`deleted ${n} old artifacts, kept ${kept} from current run`);
 
   # ---------- 自动 Release ----------
   # 打 v* tag 触发：重新构建两个产物 → 汇总成 Release（附 apk/exe 下载链接）。
