@@ -24,18 +24,29 @@ object SyncDirs {
     private const val PREFS = "photobeam"
     private const val KEY_DIRS = "sync_dirs"
     private const val KEY_PICKED = "sync_dirs_picked"
+    // [Stage 12] 首次引导是否已被用户明确关闭过（"暂不选择"）。
+    // 与 KEY_PICKED 分开：KEY_PICKED = 用户主动保存过一次选择（哪怕是空集）；
+    // KEY_GUIDE_DISMISSED = 用户明确说"暂不选择"、不想再被弹窗打扰。
+    private const val KEY_GUIDE_DISMISSED = "sync_guide_dismissed"
 
-    /** 用户已勾选的目录（RELATIVE_PATH 去掉尾斜杠的形式，如 "DCIM/Screenshots"） */
+    /** 用户已勾选的目录（RELATIVE_PATH 去掉尾斜杠的形式，如 "DCIM/Screenshots"）
+     *
+     *  [Stage 12 · 缺陷修复] **必须返回副本**：SharedPreferences.getStringSet 返回的是
+     *  prefs 内部持有的那个 Set 实例，直接修改它会抛 ConcurrentModificationException，
+     *  而且在某些 ROM 上会静默写坏存储。这里返回 HashSet 副本，调用方随便改都安全。 */
     fun selected(ctx: Context): Set<String> {
         val sp = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        return sp.getStringSet(KEY_DIRS, emptySet()) ?: emptySet()
+        val raw = sp.getStringSet(KEY_DIRS, null) ?: return emptySet()
+        return HashSet(raw)
     }
 
-    /** 保存勾选结果 */
+    /** 保存勾选结果
+     *  [Stage 12 · 缺陷修复] 同样存**副本**：putStringSet 会持有传入集合的引用，
+     *  调用方之后改它就等于改了 prefs 内部状态（Android 官方文档明确要求传副本）。 */
     fun save(ctx: Context, dirs: Set<String>) {
         val sp = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         sp.edit()
-            .putStringSet(KEY_DIRS, dirs)
+            .putStringSet(KEY_DIRS, HashSet(dirs))
             .putBoolean(KEY_PICKED, true)
             .apply()
     }
@@ -43,6 +54,19 @@ object SyncDirs {
     /** 用户是否已经做过选择（用于首次启动引导：没选过才弹） */
     fun hasPicked(ctx: Context): Boolean =
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_PICKED, false)
+
+    /**
+     * [Stage 12] 用户是否明确关闭过首次引导（点过「暂不选择」）。
+     * 只有明确关闭过才不再自动弹窗；单纯"还没保存过选择"时继续引导。
+     */
+    fun isGuideDismissed(ctx: Context): Boolean =
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_GUIDE_DISMISSED, false)
+
+    /** 标记首次引导已被明确关闭 */
+    fun dismissGuide(ctx: Context) {
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean(KEY_GUIDE_DISMISSED, true).apply()
+    }
 
     /**
      * 列出手机上**有图片的目录**，按图片数降序。

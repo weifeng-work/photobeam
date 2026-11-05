@@ -20,7 +20,12 @@ if [ ! -f rsrc_windows_amd64.syso ] || [ icon.ico -nt rsrc_windows_amd64.syso ] 
 fi
 
 echo "[2/3] go build（GUI 子系统）"
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w -H=windowsgui" -o ../dist/PhotoBeam.exe .
+# 版本号从仓库根的 VERSION 文件注入（[Stage 11] 检查更新功能要用）。
+# 与 GitHub Release 的 tag（v<VERSION>）保持一致 —— 单一真源。
+VER="$(tr -d ' \r\n' < ../VERSION)"
+if [ -z "$VER" ]; then echo "FAIL: VERSION 文件为空"; exit 1; fi
+echo "构建版本: $VER"
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w -H=windowsgui -X main.appVersion=$VER" -o ../dist/PhotoBeam.exe .
 
 echo "[3/3] 交付校验"
 rm -f ../dist/PhotoBeam.exe~  # Go 在替换运行中的 exe 时会留 ~ 备份 [S3-2]

@@ -182,6 +182,8 @@ class MainActivity : Activity() {
         val bDiag = btn("⑦ 导出诊断信息")
         // [Stage 8] 同步目录筛选：用户选择哪些手机相册目录参与同步
         val bDirs = btn("⑧ 选择同步文件夹（默认不同步任何目录）")
+        // [Stage 11] 检查更新：只查版本、只给下载链接，不自动下载/安装
+        val bUpdate = btn("⑨ 检查更新")
 
         root.addView(title)
         root.addView(statusView)
@@ -195,6 +197,7 @@ class MainActivity : Activity() {
         root.addView(bStop)
         root.addView(bDiag)
         root.addView(bDirs)
+        root.addView(bUpdate)
 
         // [Stage 9 · 修复] 内容超出屏幕时无法滚动 —— ⑦「导出诊断信息」被裁到只剩 21px，
         // ⑧「选择同步文件夹」完全在屏幕外，用户根本点不到。
@@ -225,6 +228,20 @@ class MainActivity : Activity() {
         // [Stage 5] 填了 IP 就优先用它（直连通道①），没填就走完整三通道发现
         bPair.setOnClickListener { pairFlow(ipInput.text.toString().trim()) }
         bSync.setOnClickListener {
+            // [Stage 12 · 缺陷修复 · 兜底] 未选任何目录时，同步不会有任何结果。
+            // 用户（尤其新装用户）点「立即同步」看到「无可发送图片」会一头雾水 →
+            // 直接弹窗引导去选目录，别让用户猜。
+            if (SyncDirs.selected(this).isEmpty()) {
+                AlertDialog.Builder(this)
+                    .setTitle("还没有选择要同步的文件夹")
+                    .setMessage("PhotoBeam 默认**不同步任何图片**（隐私保护）。\n\n" +
+                        "请先选择要同步到电脑的相册文件夹，例如 DCIM/Screenshots。\n\n" +
+                        "（不选 = 一张图都不会离开手机）")
+                    .setPositiveButton("去选择") { _, _ -> showDirPicker(firstRun = false) }
+                    .setNegativeButton("取消", null)
+                    .show()
+                return@setOnClickListener
+            }
             // [A3] 立即同步：服务跑完一轮会把结果写进 prefs，这里启动轮询等回执
             SenderService.start(this, SenderService.ACTION_SYNC_NOW)
             statusView.text = "已触发同步，请稍候…"
@@ -269,6 +286,7 @@ class MainActivity : Activity() {
         }
         bDiag.setOnClickListener { exportDiagnostics() }
         bDirs.setOnClickListener { showDirPicker(firstRun = false) }
+        bUpdate.setOnClickListener { checkUpdateAsync() }
 
         requestPermissions(needed.toTypedArray(), 100)
         refreshStatus()
@@ -288,8 +306,62 @@ class MainActivity : Activity() {
 
         // [Stage 8] 首次启动引导：必须先选同步目录，否则**一张图都不会同步**
         //（隐私默认拒绝）。已选过就不再弹（用户随时可用 ⑧ 改）。
-        if (!SyncDirs.hasPicked(this)) {
+        // [Stage 12] 条件更精确：只有「从没保存过选择」且「用户没明确关闭过引导」才弹。
+        if (!SyncDirs.hasPicked(this) && !SyncDirs.isGuideDismissed(this)) {
             root.post { showDirPicker(firstRun = true) }
+        }
+    }
+
+    // ---------- 检查更新 [Stage 11] ----------
+
+    /**
+     * 检查更新：查 GitHub 最新 Release，比对版本号，**只给下载链接**。
+     *
+     * 不自动下载、不自动安装 —— 装 APK 需要 REQUEST_INSTALL_PACKAGES 权限
+     * （系统会显示「允许此应用安装其他应用」的 scary 说明），国产 ROM 审核更严，
+     * 收益不抵摩擦。所以本版只做到「知道有新版 + 一点就跳下载页」。
+     */
+    private fun checkUpdateAsync() {
+        statusView.text = "正在检查更新…"
+        Thread {
+            val cur = UpdateChecker.currentVersion(this)
+            val r = UpdateChecker.check(this, cur)
+            runOnUiThread {
+                when {
+                    r.error.isNotEmpty() ->
+                        AlertDialog.Builder(this)
+                            .setTitle("检查更新失败")
+                            .setMessage("${r.error}\n\n" +
+                                "（可能当前网络访问不了 GitHub。PhotoBeam 本身不需要联网——" +
+                                "数据只在本机与手机之间走局域网。）")
+                            .setPositiveButton("好", null).show()
+                    r.hasNew ->
+                        AlertDialog.Builder(this)
+                            .setTitle("有新版本：v${r.latest}")
+                            .setMessage("当前版本：v${r.current}\n\n" +
+                                (if (r.notes.isNotEmpty()) "${r.notes}\n\n" else "") +
+                                "下载地址：\n${r.pageUrl}\n\n" +
+                                "（PhotoBeam 不会自动下载或安装，请自行下载后安装。）")
+                            .setPositiveButton("打开下载页") { _, _ -> openUrl(r.pageUrl) }
+                            .setNegativeButton("取消", null).show()
+                    else ->
+                        AlertDialog.Builder(this)
+                            .setTitle("已是最新版本")
+                            .setMessage("当前版本 v${r.current}，没有新版本。")
+                            .setPositiveButton("好", null).show()
+                }
+                refreshStatus()
+            }
+        }.start()
+    }
+
+    /** 用系统浏览器打开下载页 */
+    private fun openUrl(url: String) {
+        try {
+            startActivity(Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url))
+                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (e: Exception) {
+            statusView.text = "无法打开浏览器：${e.message}"
         }
     }
 
@@ -343,15 +415,42 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
             if (height > maxListH) height = maxListH
         }
-        lv.adapter = ArrayAdapter(this, android.R.layout.simple_list_item_multiple_choice, labels)
+        // [Stage 12 · 缺陷修复] 不能用 ArrayAdapter + ListView.setItemChecked：
+        //   setItemChecked 设的是「ListView 选中项」（单选高亮），**不是** CheckedTextView 的
+        //   勾选状态；ArrayAdapter.getView() 也不知道 checked[] 数组 →
+        //   ① 初始勾选状态显示不出来；② 点击后勾选框纹丝不动（用户看到「点了没反应」）。
+        //   官方多选对话框内部用 MultiChoiceViewHandler 管这个映射，绕过它就 broken。
+        //   → 自写 adapter，在 getView() 里把 checked[] 同步给 CheckedTextView。
+        val dirAdapter = object : android.widget.BaseAdapter() {
+            override fun getCount(): Int = labels.size
+            override fun getItem(position: Int): Any = labels[position]
+            override fun getItemId(position: Int): Long = position.toLong()
+            override fun getView(position: Int, convertView: android.view.View?, parent: android.view.ViewGroup?): android.view.View {
+                val v = convertView ?: android.view.LayoutInflater.from(this@MainActivity).inflate(
+                    android.R.layout.simple_list_item_multiple_choice, parent, false)
+                val tv = v as? android.widget.CheckedTextView
+                    ?: (v.findViewById(android.R.id.checkbox) as? android.widget.CheckedTextView)
+                // ★ 关键：把当前勾选状态写进视图 —— 这才是 setItemChecked 做不到的事
+                tv?.isChecked = checked[position]
+                tv?.text = labels[position]
+                // [Stage 12 · 缺陷修复 · 补强] simple_list_item_multiple_choice 的根节点
+                // 是 CheckedTextView，它在 ListView 里默认可获焦 → 抢走点击事件 →
+                // ListView 的 onItemClick 不触发 → 用户「点了没反应」。
+                // 设成不可获焦/不可点击，点击统一交给 ListView 处理。
+                tv?.isFocusable = false
+                tv?.isClickable = false
+                tv?.isFocusableInTouchMode = false
+                return v
+            }
+        }
+        lv.adapter = dirAdapter
         lv.setOnItemClickListener(object : AdapterView.OnItemClickListener {
-            override fun onItemClick(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                val which = position
-                checked[which] = !checked[which]
-                for (i in labels.indices) lv.setItemChecked(i, checked[i])
+            override fun onItemClick(parent: AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
+                checked[position] = !checked[position]
+                // 通知 adapter 刷新 → getView() 会用新的 checked[] 重绘勾选状态
+                dirAdapter.notifyDataSetChanged()
             }
         })
-        for (i in labels.indices) lv.setItemChecked(i, checked[i])
         container.addView(lv)
 
         val dlg = AlertDialog.Builder(this)
@@ -373,9 +472,11 @@ class MainActivity : Activity() {
             }
             .setNegativeButton(if (firstRun) "暂不选择（不同步任何图片）" else "取消") { _, _ ->
                 if (firstRun) {
-                    // 首次引导取消 = 明确保持"不同步任何东西"，并标记已做过选择
-                    // （避免每次启动都弹窗骚扰；用户随时可从 ⑧ 改）。
-                    SyncDirs.save(this, emptySet())
+                    // [Stage 12 · 缺陷修复] 首次引导取消 = 明确"我不想被打扰" →
+                    //   标记引导已关闭，不再每次启动都弹。
+                    //   但**不**标记 hasPicked（= 用户主动保存过选择），
+                    //   这样状态区仍能如实显示"未选择任何文件夹"。
+                    SyncDirs.dismissGuide(this)
                     statusView.text = "当前不会同步任何图片。可点「⑧ 选择同步文件夹」随时开启。"
                 }
             }
@@ -434,6 +535,9 @@ class MainActivity : Activity() {
         // [Stage 8] 同步目录状态：让用户一眼看出"现在到底在同步什么"
         // 注意：必须在 buildString 之外取 —— buildString 里 this 是 StringBuilder，不是 Context
         val selDirs = SyncDirs.selected(this)
+        // [Stage 11] 当前版本号（读 manifest 的 versionName，构建脚本注入）
+        // 注意：必须在 buildString 之外取 —— 里面 this 是 StringBuilder，不是 Context
+        val appVersion = UpdateChecker.currentVersion(this)
         // [Stage 10] PC 端分配给本机的落盘目录名（多机同步时用户据此找自己的图）
         val devDir = prefs.getString("pc_dev_dir", "") ?: ""
         statusView.text = buildString {
@@ -443,7 +547,7 @@ class MainActivity : Activity() {
             if (devDir.isNotEmpty()) {
                 appendLine("我的照片在电脑：$devDir\\")
             }
-            append("电脑：${paired ?: "未配对"}\n")
+            append("电脑：${paired ?: "未配对"}（本机 v${appVersion}）\n")
             append("待发送：$pending 张\n")
             append("服务：${serviceStateText(alarmOnly)}\n")
             // 状态栏图标状态如实显示：图标亮 = 已连接，所以图标本身必须一直在

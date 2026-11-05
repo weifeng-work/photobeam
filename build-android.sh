@@ -19,6 +19,38 @@ OUT="android/build"
 
 mkdir -p "$OUT/dex" "$OUT/gen"
 
+# 版本号从仓库根的 VERSION 文件注入 AndroidManifest 的 versionName [Stage 11]
+# （检查更新功能要比对版本号；与 GitHub Release 的 tag（v<VERSION>）保持一致 —— 单一真源）
+VER="$(tr -d ' \r\n' < VERSION)"
+if [ -z "$VER" ]; then echo "FAIL: VERSION 文件为空"; exit 1; fi
+echo "构建版本: $VER"
+# 用 python 改写 manifest 的 <manifest ...> 标签，插入/更新 versionName 与 versionCode
+python - "$MANIFEST" "$VER" << 'PYVER'
+import re, sys
+path, ver = sys.argv[1], sys.argv[2]
+src = open(path, encoding="utf-8").read()
+# versionCode：把 1.2.3 → 10203
+parts = ver.split(".")
+code = 0
+for p in parts[:3]:
+    try:
+        code = code * 100 + int(p)
+    except ValueError:
+        code = code * 100
+attrs = f'android:versionName="{ver}" android:versionCode="{code}"'
+m = re.search(r"<manifest\b[^>]*>", src)
+if not m:
+    print("FATAL: manifest 标签未找到"); sys.exit(1)
+tag = m.group(0)
+# 先去掉已有的 versionName/versionCode，再加新的
+new_tag = re.sub(r'\s+android:versionName="[^"]*"', "", tag)
+new_tag = re.sub(r'\s+android:versionCode="[^"]*"', "", new_tag)
+new_tag = new_tag.replace("<manifest", "<manifest " + attrs, 1)
+src = src.replace(tag, new_tag, 1)
+open(path, "w", encoding="utf-8").write(src)
+print(f"manifest versionName={ver} versionCode={code}")
+PYVER
+
 rm -f PhotoBeam.apk "$OUT/base.apk" "$OUT/unsigned.apk" "$OUT/aligned.apk"
 echo "[1/5] aapt2 compile res + link"
 RESZIP="$OUT/res.zip"

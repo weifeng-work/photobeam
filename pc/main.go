@@ -137,6 +137,7 @@ func onReady() {
 	mPairNew := systray.AddMenuItem("配对新设备", "允许一台新手机接入（2 分钟内有效；配成即失效）")
 	mRePair := systray.AddMenuItem("重新配对", "清除已配对设备，下次连接重新走配对流程")
 	mDiag := systray.AddMenuItem("导出诊断信息", "生成诊断文本并写入日志目录（不写入剪贴板）")
+	mUpdate := systray.AddMenuItem("检查更新", "查询 GitHub 上是否有新版本（只提示，不自动下载/安装）")
 	mFW := systray.AddMenuItem("修复防火墙规则", "以管理员权限重建防火墙入站规则")
 	mAuto := systray.AddMenuItemCheckbox("开机自启（登录时启动）", "写入当前用户的启动项", cfg.Autostart)
 	mSuper := systray.AddMenuItemCheckbox("崩溃后自动重启", "主进程异常退出时由隐藏监护进程拉起（不需要管理员权限）", supervisorEnabled())
@@ -197,6 +198,28 @@ func onReady() {
 				}
 				// 路径可能很长 → 用会自动换行的消息框（弹窗宽度固定，容易被截断）
 				messageBox("诊断信息已写入：\n"+path+"\n\n（未写入剪贴板）", "PhotoBeam 诊断信息")
+			})
+		case <-mUpdate.ClickedCh:
+			// [Stage 11] 检查更新：只查版本、只给下载链接，**不自动下载/安装**。
+			// 网络失败不是错误（可能在纯局域网环境）→ 如实提示「查不到」，不打扰。
+			go goroutineSafe("check-update", func() {
+				info := checkForUpdate(appVersion)
+				switch {
+				case info.Err != nil:
+					messageBox("检查更新失败：\n"+info.Err.Error()+
+						"\n\n（可能当前网络访问不了 GitHub。PhotoBeam 本身不需要联网——" +
+						"数据只在本机与手机之间走局域网。）", "检查更新")
+				case info.HasNew:
+					msg := "有新版本：v" + info.Latest + "（当前 v" + info.Current + "）"
+					if info.Notes != "" {
+						msg += "\n\n" + info.Notes
+					}
+					msg += "\n\n下载地址：\n" + info.PageURL +
+						"\n\n（PhotoBeam 不会自动下载或安装，请自行下载后替换 exe 即可。）"
+					messageBox(msg, "检查更新")
+				default:
+					messageBox("当前已是最新版本（v"+info.Current+"）。", "检查更新")
+				}
 			})
 		case <-mFW.ClickedCh:
 			ok := addFirewallRulesElevated()
