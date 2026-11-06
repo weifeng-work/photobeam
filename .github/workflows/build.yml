@@ -303,8 +303,23 @@ jobs:
           TAG: ${{ github.ref_name }}
           REPO: ${{ github.repository }}
         run: |
-          # 本版改了什么 → 直接取 tag message（发布时用 git tag -a vX.Y.Z -m "..." 写）
-          $tagNotes = (git tag -l --format='%(contents)' $env:TAG) -join "`n"
+          # 本版改了什么 → 取 tag message（发布时用 git tag -a vX.Y.Z -m "..." 写）
+          #
+          # 走 **GitHub API** 而不是本地 `git tag -l --format='%(contents)'`：
+          # actions/checkout 默认 fetch-depth=1，浅克隆下本地 tag 对象并不可靠
+          # （实测 v1.2.1 那次就取到了 commit 的 message 而不是 tag 的）。
+          # API 读的是远端的 tag 对象，与克隆深度无关。
+          $tagNotes = ""
+          try {
+            $ref = gh api "repos/$env:REPO/git/ref/tags/$env:TAG" | ConvertFrom-Json
+            if ($ref.object.type -eq 'tag') {
+              $obj = gh api "repos/$env:REPO/git/tags/$($ref.object.sha)" | ConvertFrom-Json
+              $tagNotes = [string]$obj.message
+            }
+          } catch {
+            Write-Output "取 tag message 失败（不影响发布）: $($_.Exception.Message)"
+          }
+          Write-Output ("tagNotes length = " + $tagNotes.Length)
           $notes = @"
           ## PhotoBeam $env:TAG
 
