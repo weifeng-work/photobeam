@@ -229,6 +229,12 @@ func bufPtrAt(buf []byte, off uintptr) uintptr {
 	return *(*uintptr)(unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + off))
 }
 
+// bufU32At：取缓冲区内的 uint32 字段（按偏移）—— 用于按**真实结构偏移**读字段，
+// 不必在 Go 结构体里逐字段复刻（漏一个字段后面全体错位）。
+func bufU32At(buf []byte, off uintptr) uint32 {
+	return *(*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + off))
+}
+
 // queryNetIfaces：枚举网卡（GetAdaptersAddresses + ConvertInterfaceIndexToLuid）
 // GAA_FLAG_INCLUDE_GATEWAYS(0x80) 必须显式带上，否则网关列表恒为空
 func queryNetIfaces() []netIface {
@@ -273,8 +279,18 @@ func queryNetIfaces() []netIface {
 			IfIndex: a.IfIndex,
 		}
 		ni.IfType = ifTypeOf(a.IfIndex)
-		if ni.IfType == 0 && a.Ipv6IfIndex != 0 {
-			ni.IfType = ifTypeOf(a.Ipv6IfIndex)
+		if ni.IfType == 0 {
+			// [修复] 按**真实偏移**读字段：IP_ADAPTER_ADDRESSES（x64）里
+			//   +96=Mtu, +100=IfType, +104=OperStatus, +108=Ipv6IfIndex。
+			// 旧 Go 结构体漏了 IfType/OperStatus 两个字段，把 Ipv6IfIndex 放在 +100 →
+			// fallback 读到的是 IfType（6/71），再把它当接口索引去换算必然失败，
+			// 网卡类型被错误分类/过滤（热点的网卡可能被误判成虚拟网卡）。
+			// 这里直接读 +100 的 IfType（它就是权威值），仅当其为 0 才用 +108 的 Ipv6IfIndex 兜底。
+			if t := bufU32At(buf, off+100); t > 0 && t <= ifTypeMaxTrusted {
+				ni.IfType = t
+			} else if v6 := bufU32At(buf, off+108); v6 != 0 {
+				ni.IfType = ifTypeOf(v6)
+			}
 		}
 		// 单播地址
 		if uoff, ok := offOf(a.FirstUnicastAddress); ok {

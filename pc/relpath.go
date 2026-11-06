@@ -144,10 +144,12 @@ func cleanPathSegment(seg string) string {
 		// 加前缀规避（CON → _CON）
 		seg = "_" + seg
 	}
-	// 长度上限
-	if len(seg) > maxPathSegment {
-		seg = seg[:maxPathSegment]
-		seg = strings.TrimSpace(seg)
+	// 长度上限（[修复] 按 **rune** 截断：旧实现按字节截，中文/emoji 目录名被切在
+	// 多字节字符中间 → 落盘目录名出现 U+FFFD 乱码；100 字符而不是 100 字节也更符合
+	// 「单级目录名上限」的语义——UTF-8 下 100 字符最多 400 字节，仍在 Windows 255
+	// 字节限制之外，但 Windows 实际按字符算，这里保守取 100 字符且总路径有上限保护）
+	if r := []rune(seg); len(r) > maxPathSegment {
+		seg = strings.TrimSpace(string(r[:maxPathSegment]))
 	}
 	return seg
 }

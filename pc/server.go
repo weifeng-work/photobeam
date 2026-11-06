@@ -30,6 +30,102 @@ const (
 	maxFileSize      = 200 << 20 // 单文件上限 200MB（超出即断）
 )
 
+// ---------- 配对速率限制（协议 §3.4） ----------
+//
+// 规则（协议原文）：每个 IP 每分钟配对失败 ≤5 次；连续失败 5 次 → 冷却 60 秒；
+// 冷却期内该 IP 的配对请求一律以 MODE err{reason:"pairing_cooldown"} 明确拒绝
+// （不静默断链，让手机知道要等）。
+//
+// 计数口径（实现约定）：
+//   · 只统计 pairing 分支的**异常失败**——未展示向导窗却收到 pair_confirm、
+//     PC 用户未确认（点不一致/超时/被新会话取代）、SAS 或签名校验失败。
+//   · 手机端主动发 pair_reject（人眼核对后决定拒绝）**不计失败**——那是协议
+//     设计的正常工作路径，用户核对数字不一致不该被惩罚成「攻击」。
+//   · 已配对设备的重连失败不进这里（诊断计数 authStats 与之分离）。
+//   · 配对成功 → 清空该 IP 的全部失败记录。
+// 内存安全：按需回收 24 小时无活动的条目，防恶意刷 IP 撑爆 map。
+
+const (
+	pairFailWindow     = 60 * time.Second  // 失败计数窗口
+	pairFailMax        = 5                 // 窗口内允许的失败次数上限
+	pairCooldown       = 60 * time.Second  // 触发后的冷却时长
+	pairStatRetention  = 24 * time.Hour    // 条目保留时长
+	pairStatGCInterval = 5 * time.Minute   // 回收检查间隔
+)
+
+type pairFailStat struct {
+	times         []time.Time // 窗口内的失败时刻
+	cooldownUntil time.Time   // 冷却截止时刻（零值 = 不在冷却期）
+	lastSeen      time.Time   // 最近一次活动（GC 用）
+}
+
+var (
+	pairStatMu    sync.Mutex
+	pairStatByIP  = map[string]*pairFailStat{}
+	pairStatGCLas = time.Time{}
+)
+
+// pairingCooldownRemaining：该 IP 剩余冷却时长（0 = 不在冷却期）。
+func pairingCooldownRemaining(ip string) time.Duration {
+	pairStatMu.Lock()
+	defer pairStatMu.Unlock()
+	s := pairStatByIP[ip]
+	if s == nil {
+		return 0
+	}
+	if d := time.Until(s.cooldownUntil); d > 0 {
+		return d
+	}
+	return 0
+}
+
+// pairingCooldownFail：记录一次配对失败；窗口内达到上限 → 进入冷却。
+func pairingCooldownFail(ip string) {
+	now := time.Now()
+	pairStatMu.Lock()
+	defer pairStatMu.Unlock()
+	pairStatGC(now)
+	s := pairStatByIP[ip]
+	if s == nil {
+		s = &pairFailStat{}
+		pairStatByIP[ip] = s
+	}
+	s.lastSeen = now
+	// 只保留窗口内的失败时刻（过期的不再计入）
+	keep := s.times[:0]
+	for _, t := range s.times {
+		if now.Sub(t) < pairFailWindow {
+			keep = append(keep, t)
+		}
+	}
+	s.times = append(keep, now)
+	if s.cooldownUntil.Before(now) && len(s.times) >= pairFailMax {
+		s.cooldownUntil = now.Add(pairCooldown)
+		s.times = nil // 冷却期内不再累计，等冷却自然过期
+		logWarn("IP %s 在 %v 内配对失败达 %d 次 → 冷却 %v", ip, pairFailWindow, pairFailMax, pairCooldown)
+	}
+}
+
+// pairingCooldownReset：配对成功 → 清空该 IP 的失败记录与冷却。
+func pairingCooldownReset(ip string) {
+	pairStatMu.Lock()
+	delete(pairStatByIP, ip)
+	pairStatMu.Unlock()
+}
+
+// pairStatGC：回收长期不活跃的条目。调用方必须已持有 pairStatMu。
+func pairStatGC(now time.Time) {
+	if now.Sub(pairStatGCLas) < pairStatGCInterval {
+		return
+	}
+	pairStatGCLas = now
+	for ip, s := range pairStatByIP {
+		if now.Sub(s.lastSeen) > pairStatRetention {
+			delete(pairStatByIP, ip)
+		}
+	}
+}
+
 // ---------- 明文帧（HELLO/MODE，[u32 BE len][body]） ----------
 
 func readPlainFrame(conn net.Conn) ([]byte, error) {
@@ -104,7 +200,9 @@ func startTCPServer() error {
 	for port := TCPPortBase; port <= TCPPortMax; port++ {
 		ln, err = net.Listen("tcp4", fmt.Sprintf(":%d", port))
 		if err == nil {
+			cfgMu.Lock()
 			cfg.TCPPort = port
+			cfgMu.Unlock()
 			saveConfig(cfg)
 			logf("TCP 监听 :%d", port)
 			break
@@ -120,8 +218,16 @@ func startTCPServer() error {
 		for {
 			conn, e := ln.Accept()
 			if e != nil {
-				logf("accept 失败: %v", e)
-				return
+				// [修复] 一次瞬时 accept 错误不能结束监听循环——否则托盘看似正常，
+				// PC 却永久不再接受新连接。只有监听器确实被关闭（stopTCPServer /
+				// 进程退出）才退出；其余错误短暂退避后继续。
+				if errors.Is(e, net.ErrClosed) {
+					logf("accept 停止: %v", e)
+					return
+				}
+				logWarn("accept 失败: %v（100ms 后继续监听）", e)
+				time.Sleep(100 * time.Millisecond)
+				continue
 			}
 			go goroutineSafe("handleConn", func() { handleConn(conn) })
 		}
@@ -144,8 +250,11 @@ func stopTCPServer() {
 func handleConn(conn net.Conn) {
 	defer conn.Close()
 	// [Stage 5 第五轮] 记下对端 IP —— 托盘 tooltip 用它挑「手机所在网段」的本地地址
-	notePeerIP(conn.RemoteAddr().String())
-	logf("连接进入: %s", conn.RemoteAddr().String())
+	remote := conn.RemoteAddr().String()
+	notePeerIP(remote)
+	// 配对速率限制（协议 §3.4）按连接源 IP 统计
+	peerIP, _, _ := net.SplitHostPort(remote)
+	logf("连接进入: %s", remote)
 
 	conn.SetDeadline(timeNow().Add(handshakeTimeout))
 
@@ -203,8 +312,22 @@ func handleConn(conn net.Conn) {
 	xidRaw, _ := b64decode(senderHello.X25519IDPub)
 	senderFP := fingerprint(ed25519.PublicKey(edRaw), to32(xidRaw))
 	mode := "pairing"
-	if findDevice(senderFP) != nil {
+	if _, known := deviceByFP(senderFP); known {
 		mode = "reconnect"
+	}
+	// [协议 §3.4] 按 IP 的配对失败速率限制：该 IP 在冷却期内 → MODE 帧回
+	// err{reason:"pairing_cooldown"} 并断链（不静默，让手机明确知道要等）。
+	// 只对 pairing 生效——已配对设备的重连失败只进诊断计数，不触发冷却（两类计数分离）。
+	if mode == "pairing" {
+		if left := pairingCooldownRemaining(peerIP); left > 0 {
+			logf("IP %s 处于配对冷却期（剩余 %v），拒绝配对请求", peerIP, left.Round(time.Second))
+			cooldownFrame, _ := jsonMarshalIndent(map[string]any{
+				"pb": 1, "type": "mode", "mode": "pairing", "fp": identity.FP(), "reset": false,
+				"err": map[string]any{"reason": "pairing_cooldown"},
+			})
+			_ = writePlainFrame(conn, cooldownFrame)
+			return
+		}
 	}
 	// [Stage 5 第五轮 · 配对待命闸门]
 	// 新设备（PC 不认识这个指纹）的配对请求，只有在 PC 处于「配对新设备」待命态时才受理。
@@ -252,7 +375,6 @@ func handleConn(conn net.Conn) {
 
 	// 认证（P0-05：reconnect 验签失败 → 降级 pairing（reset:true）→ SAS 重建，只降级一次）
 	conn.SetDeadline(timeNow().Add(frameTimeout))
-	authAttempts := 0
 	for {
 		if mode == "reconnect" {
 			ft, pt, err := readEncFrame(conn, keys.Session)
@@ -270,10 +392,10 @@ func handleConn(conn net.Conn) {
 			if parseJSONInto(pt, &m) != nil || m.Type != "auth" {
 				return
 			}
-			dev := findDevice(senderFP)
-			logf("重连验签: fp=%s dev=%v 结果=%v", senderFP, dev != nil,
-				dev != nil && ed25519.Verify(ed25519.PublicKey(edRaw), th, mustDecode(m.Sig)))
-			if dev != nil && ed25519.Verify(ed25519.PublicKey(edRaw), th, mustDecode(m.Sig)) {
+			dev, known := deviceByFP(senderFP)
+			sigOK := known && ed25519.Verify(ed25519.PublicKey(edRaw), th, mustDecode(m.Sig))
+			logf("重连验签: fp=%s dev=%v 结果=%v", senderFP, known, sigOK)
+			if sigOK {
 				okSig := ed25519.Sign(identity.EdPriv, th)
 				// [Stage 10] 回传 dev_dir：手机端据此显示「我的照片在电脑的 <dev_dir> 目录」。
 				// **不参与 transcript**（与 pair_intent 同理）→ 不影响签名、不影响 SAS、
@@ -286,27 +408,21 @@ func handleConn(conn net.Conn) {
 				ip, portStr, _ := net.SplitHostPort(remoteOf(conn))
 				var pn int
 				fmt.Sscanf(portStr, "%d", &pn)
-				dev.LastIP, dev.LastPort = ip, cfg.TCPPort // last_port = PC 自身监听端口 [P1-01]
-				saveConfig(cfg)
+				// [修复] 设备表的更新走锁内 helper，不能在锁外改切片元素（数据竞争）
+				updateDeviceNet(senderFP, ip, tcpPort()) // last_port = PC 自身监听端口 [P1-01]
 				logf("重连认证通过: %s", dev.DevName)
 				authStats.ok()
 				break
 			}
-			// 验签失败（pin 过期/伪造）→ 降级 pairing，SAS 人眼比对重建
+			// 验签失败（pin 过期/伪造）。
+			// [修复] 不能在这里补发第二条明文 MODE（mode=pairing, reset:true）：
+			// 加密通道已经建立，手机端 handshake() 只在加密前读一次 MODE，
+			// 这条明文帧会被当成加密帧解析 → 手机抛异常断链，
+			// 「配对记录已重置」的提示永远到不了。
+			// 直接关闭本连接，让手机下一轮重连走正常的 HELLO→MODE(pairing) 流程。
 			authStats.fail("重连验签失败（对端身份不匹配）")
-			if authAttempts >= 1 {
-				logf("重连认证失败且已降级过，断开")
-				return
-			}
-			authAttempts++
-			mode = "pairing"
-			modeFrame, _ := jsonMarshalIndent(map[string]any{
-				"pb": 1, "type": "mode", "mode": "pairing", "fp": identity.FP(), "reset": true,
-			})
-			if err := writePlainFrame(conn, modeFrame); err != nil {
-				return
-			}
-			continue
+			logf("重连验签失败（对端身份不匹配 / pin 过期），关闭连接；请让手机重新配对")
+			return
 		}
 		// pairing 分支
 		logf("配对模式 SAS=%s（等待手机 pair_confirm）", keys.SAS)
@@ -443,6 +559,7 @@ func handleConn(conn net.Conn) {
 		if pw == nil {
 			logf("收到 pair_confirm 但本端未展示 SAS 向导窗（pair_intent=false），拒绝配对")
 			authStats.fail("未展示 SAS 向导窗却收到 pair_confirm")
+			pairingCooldownFail(peerIP) // 协议 §3.4：异常失败计入速率限制
 			finish()
 			return
 		}
@@ -455,12 +572,14 @@ func handleConn(conn net.Conn) {
 			if !agreed {
 				logf("PC 用户未确认（点不一致 / 超时 / 被取代）→ 不接受配对")
 				authStats.fail("PC 用户未确认，拒绝配对")
+				pairingCooldownFail(peerIP) // 协议 §3.4：异常失败计入速率限制
 				finish()
 				return
 			}
 		case <-time.After(time.Duration(pairTimeoutMs+5) * time.Millisecond):
 			logf("等待 PC 用户确认超时 → 不接受配对")
 			authStats.fail("等待 PC 用户确认超时")
+			pairingCooldownFail(peerIP) // 协议 §3.4：异常失败计入速率限制
 			finish()
 			return
 		}
@@ -468,9 +587,11 @@ func handleConn(conn net.Conn) {
 		if !ctEqual(m.SAS, keys.SAS) || !ed25519.Verify(ed25519.PublicKey(edRaw), th, mustDecode(m.Sig)) {
 			logf("配对校验失败（SAS 或签名），静默断开")
 			authStats.fail("配对校验失败（SAS 或签名不一致）")
+			pairingCooldownFail(peerIP) // 协议 §3.4：异常失败计入速率限制
 			return
 		}
 		authStats.ok()
+		pairingCooldownReset(peerIP) // 协议 §3.4：配对成功 → 清空该 IP 的失败记录
 		okSig := ed25519.Sign(identity.EdPriv, th)
 		// [Stage 10] 回传 dev_dir（不参与 transcript，密码学中性，向后兼容）
 		pairDevName := firstNonEmpty(m.DevName, senderHello.DevName)
@@ -483,7 +604,7 @@ func handleConn(conn net.Conn) {
 		var pn int
 		fmt.Sscanf(portStr, "%d", &pn)
 		upsertDevice(Device{FP: senderFP, EdPub: senderHello.EdPub, XIDPub: senderHello.X25519IDPub,
-			DevName: pairDevName, LastIP: ip, LastPort: cfg.TCPPort})
+			DevName: pairDevName, LastIP: ip, LastPort: tcpPort()})
 		// [Stage 5 第五轮] 配对待命**一次性消耗**：成功接上一台新设备就退出待命。
 		// 这样「每加一台手机都要显式点一次『配对新设备』」—— 避免陌生人随时蹭配对。
 		disarmPairing()
@@ -498,7 +619,7 @@ func handleConn(conn net.Conn) {
 	// [PC-4] 弹窗显示**手机端原始文件名** + 已保存目录（落盘名带毫秒前缀，用户对不上）
 	onFile := func(destPath, origName, saveDir string) {
 		go goroutineSafe("clipboard+popup", func() {
-			if !cfg.ClipboardEnabled {
+			if !clipboardEnabled() {
 				return
 			}
 			// [Stage 6 · 延迟优化] 只做关键路径：解码 + DIB（约 100ms）。
@@ -516,7 +637,7 @@ func handleConn(conn net.Conn) {
 			// PNG 编码交给后台阶段（代际号校验，避免覆盖更新的图）
 			ok, snapNil := writeClipboardWithRestore(dib, func() []byte {
 				return preparePNGAsync(destPath)
-			}, cfg.ClipboardSeconds, nil)
+			}, clipboardSeconds(), nil)
 			tClip := timeNow()
 			logf("剪贴板关键路径: 解码+DIB=%v 写入=%v（PNG 后台补写）",
 				tDIB.Sub(t0), tClip.Sub(tDIB))
@@ -526,7 +647,7 @@ func handleConn(conn net.Conn) {
 			}
 			saved := "已保存到 " + ellipsisTail(saveDir, 34) // [PC-4] 路径过长时保留尾部
 			if ok {
-				hint := "Ctrl+V 可粘贴 · " + fmt.Sprint(cfg.ClipboardSeconds) + " 秒后还原"
+				hint := "Ctrl+V 可粘贴 · " + fmt.Sprint(clipboardSeconds()) + " 秒后还原"
 				if snapNil {
 					hint = "原内容无可还原，本次不还原" // 中性表述：真因多为上一次同步的图 [S3-13]
 				}
@@ -540,7 +661,7 @@ func handleConn(conn net.Conn) {
 	// 手机端会收到这个值并显示出来，用户据此知道「我这台手机的图在电脑哪个目录」。
 	// 设备名从已配对设备记录取（配对成功后 upsertDevice 已入库；重连时更是现成的）。
 	devName := senderHello.DevName
-	if d := findDevice(senderFP); d != nil && d.DevName != "" {
+	if d, known := deviceByFP(senderFP); known && d.DevName != "" {
 		devName = d.DevName
 	}
 	devDir := deviceDirName(devName, senderFP)
@@ -591,7 +712,21 @@ func messageLoop(conn net.Conn, key []byte, senderFP string, devDir string, onFi
 		switch ft {
 		case FrameFileData:
 			if rx != nil && !rx.skip && rx.part != nil {
-				rx.part.Write(pt)
+				// [修复] 写错误不能吞：磁盘写满/IO 错误此前被静默忽略，直到最后
+				// 哈希不匹配才报 transient（用户的图已经丢了一半才发现）。
+				// 现在写失败即按 transient 报错并断开，让手机端重试。
+				if _, werr := rx.part.Write(pt); werr != nil {
+					logErr("写临时文件失败: %v", werr)
+					sendCtrl(conn, key, map[string]any{
+						"type": "ack", "file_id": rx.fileID,
+						"status": "error", "reason": "io_error", "err_class": "transient",
+					})
+					notifyRecvFailure("io_error", "写入接收目录失败: "+werr.Error())
+					rx.part.Close()
+					os.Remove(rx.part.Name())
+					rx = nil
+					return
+				}
 				rx.written += int64(len(pt))
 				rx.hasher.Write(pt)
 			}
@@ -622,6 +757,16 @@ func messageLoop(conn net.Conn, key []byte, senderFP string, devDir string, onFi
 				}
 				if parseJSONInto(pt, &meta) != nil {
 					return
+				}
+				// [修复] 上一个文件还没 file_end 就又来 file_meta：旧实现直接覆盖 rx，
+				// 旧 part 句柄泄漏（文件一直开到进程结束）、旧 hasher 里的数据丢弃。
+				// 协议 §5.1 要求按状态机处理——这里收掉旧句柄记违规日志后继续，
+				// 不断连接（单帧乱序不值得撕整条连接），但绝不留泄漏。
+				if rx != nil && rx.part != nil {
+					logf("协议违规：上一个文件未 file_end 即收到新 file_meta，收掉旧临时文件")
+					rx.part.Close()
+					os.Remove(rx.part.Name())
+					rx = nil
 				}
 				rx = handleFileMeta(conn, key, senderFP, devDir, &meta)
 			case "file_end":
@@ -663,6 +808,16 @@ func handleFileMeta(conn net.Conn, key []byte, senderFP string, devDir string, m
 	// 幂等检查（第一优先）[R-15]
 	// [Stage 10] 幂等键含设备维度：两台手机传同一张图（内容相同 → file_id 相同）时
 	// 各存一份，互不吞；否则第二台手机的那张图会被静默丢弃（还回「已送达」的成功回执）。
+	// [修复·安全] file_id 必须**先校验**再用：协议声称它是 SHA-256 hex，但此前 PC 端
+	// 从不验证格式，把它直接拼进临时文件路径（os.Create(saveDir/.tmp/<file_id>.part)）。
+	// 恶意对端发 file_id="..\\..\\x" 就能把 .part 写到接收目录之外（filepath.Join 会
+	// 解析 .. 逃逸），失败路径的 os.Remove(rx.part.Name()) 又变成任意 .part 删除。
+	// 协议 §5.2 对 name/rel_path/dev_name 都有消毒要求，唯独 file_id 裸奔——这里补上。
+	if !isValidFileID(meta.FileID) {
+		sendAck("error", "invalid_file_id", "permanent")
+		logErr("file_id 非法（应为 64 位十六进制）: %q", meta.FileID)
+		return &rxFile{fileID: "", skip: true}
+	}
 	seenKey := seenKeyFor(senderFP, meta.FileID)
 	seenMu.Lock()
 	dup := seenIDs[seenKey]
@@ -700,8 +855,13 @@ func handleFileMeta(conn net.Conn, key []byte, senderFP string, devDir string, m
 		notifyRecvFailure("disk_full", fmt.Sprintf("磁盘剩余不足 500 MB（当前 %d MB）", free>>20))
 		return &rxFile{fileID: meta.FileID, skip: true}
 	}
-	// 临时文件写在接收目录根的 .tmp 下（不进子目录——子目录还没建好）
-	part, err := os.Create(filepath.Join(getSaveDir(), ".tmp", meta.FileID+".part"))
+	// 临时文件写在接收目录根的 .tmp 下（不进子目录——子目录还没建好）。
+	// [修复] 文件名加**发送方指纹前 8 位**前缀：v1.9 的幂等键已有设备维度，但 .part
+	// 临时名此前是裸 file_id——两台手机传同一张图（内容相同 → file_id 相同）时，
+	// 第二个 os.Create 会截断第一个连接正在写的同一文件，字节交错 → 双方哈希不匹配、
+	// 传输失败重试（恰是 v1.9 主打的「多机同图」场景）。
+	partName := senderFP[:8] + "-" + meta.FileID + ".part"
+	part, err := os.Create(filepath.Join(getSaveDir(), ".tmp", partName))
 	if err != nil {
 		sendAck("error", "io_error", "transient")
 		logErr("创建临时文件失败: %v", err)
@@ -845,6 +1005,22 @@ func finalizeFile(conn net.Conn, key []byte, rx *rxFile, onFileReceived func(str
 
 // ---------- 工具 ----------
 
+// isValidFileID：协议 §5.1 规定 file_id = SHA-256(content) 的十六进制串（64 字符）。
+// 只允许十六进制字符 → 天然免疫路径分隔符、..、绝对路径等一切穿越把戏
+// （比「黑名单过滤危险字符」更可靠：白名单之外的输入一律拒绝）。
+func isValidFileID(id string) bool {
+	if len(id) != 64 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
 func sendCtrl(conn net.Conn, key []byte, v any) error {
 	b, err := jsonMarshal(v)
 	if err != nil {
@@ -867,6 +1043,20 @@ func sanitizeName(name string) (string, error) {
 	base = strings.TrimSpace(base)
 	if base == "" || base == "." || base == ".." {
 		return "", errors.New("文件名非法")
+	}
+	// [修复] Windows 保留设备名（CON/NUL/COM1…）与超长名：手机发「CON.jpg」或
+	// 300 字符文件名时落盘必然失败，旧实现按 io_error/transient **无限重试**、
+	// 永不 dropped，队列被僵尸项占满。这里直接判 permanent 拒绝。
+	if ext := filepath.Ext(base); ext != "" {
+		if reservedNames[strings.ToUpper(strings.TrimSuffix(base, ext))] {
+			return "", fmt.Errorf("%q 是 Windows 保留设备名", base)
+		}
+	}
+	if reservedNames[strings.ToUpper(base)] {
+		return "", fmt.Errorf("%q 是 Windows 保留设备名", base)
+	}
+	if len(base) > 200 {
+		return "", errors.New("文件名超过 200 字符上限")
 	}
 	ext := strings.ToLower(filepath.Ext(base))
 	wl := map[string]bool{"jpg": true, "jpeg": true, "png": true, "webp": true, "gif": true, "bmp": true, "heic": true}

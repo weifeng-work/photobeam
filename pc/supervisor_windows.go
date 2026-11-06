@@ -162,6 +162,13 @@ func runSupervisor() {
 			clearCleanExit()
 			return
 		}
+		// [修复] 用户取消勾选「崩溃后自动重启」时，**运行中的监护进程**必须停手：
+		// 旧实现只有托盘开关写 supervisor_off 文件，监护循环从不读它 → 关掉后
+		// 主进程被杀仍会被拉起，与 user-journey「不想被拉回来就取消勾选」矛盾。
+		if !supervisorEnabled() {
+			logf("「崩溃后自动重启」已关闭 → 监护进程退出，不再拉起主进程")
+			return
+		}
 		// ③ 异常退出 → 重新拉起主进程
 		cmd := exec.Command(exe)
 		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}

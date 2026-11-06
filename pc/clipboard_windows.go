@@ -152,6 +152,8 @@ func setExclusionMarkers() bool {
 			continue
 		}
 		if r, _, _ := procSetClipboardData.Call(uintptr(f), h); r == 0 {
+			// [修复] 写入失败时句柄仍归我们所有 → 必须 GlobalFree，否则每次失败泄漏一份全局内存
+			procGlobalFree.Call(h)
 			logf("排除标记写入失败 fmt=%d", f) // 降级不致命：用户会进 Win+V 历史但数据正确
 			ok = false
 		}
@@ -169,6 +171,8 @@ func setOwnerMarker(gen uint64) {
 		return
 	}
 	if r, _, _ := procSetClipboardData.Call(uintptr(fmtPhotoBeamMarker), h); r == 0 {
+		// [修复] 归属标记写入失败 → 句柄仍归我们，必须 GlobalFree 防泄漏
+		procGlobalFree.Call(h)
 		logf("归属标记写入失败 fmt=%d", fmtPhotoBeamMarker)
 	}
 }
@@ -497,15 +501,24 @@ func writeClipboardWithRestore(dib []byte, pngProvider func() []byte, seconds in
 	r, _, werr := procSetClipboardData.Call(cfDIB, h)
 	if r == 0 {
 		procCloseClipboard.Call()
+		// [修复] SetClipboardData 失败 → h 仍归我们所有，必须 GlobalFree（否则每次失败泄漏 len(dib) 字节全局内存）
+		procGlobalFree.Call(h)
 		logf("剪贴板写入失败: SetClipboardData(CF_DIB) len=%d winerr=%d", len(dib), werr)
 		return false, true
 	}
 	procCloseClipboard.Call() // 周期 1 结束——**剪贴板即刻让出，用户此时已可 Ctrl+V**
 
+	// [修复·关键时序] 还原的基准序号必须**此刻**取：DIB 已写入、剪贴板刚让出。
+	// 旧实现在后台 goroutine 里 sleep(350ms)+PNG 编码（合计约 1.2s）之后才取 —
+	// 用户在这 ~1.2s 内复制的内容会被算进「序号未变」，还原定时器据此把用户
+	// 刚复制的内容覆盖掉，违反 user-journey「窗口期内用户复制了别的内容则不还原」。
+	r0, _, _ := procGetSeqNumber.Call()
+	seqAtWrite := uint32(r0)
+
 	// ---- 阶段 2（后台）：PNG 补写 + 还原定时器 ----
 	// [Stage 6] 原来这里固定 sleep 350+250=600ms，现在全部搬到后台。
 	// 代际号 myGen 传进去：若期间有更新的图写入，PNG 与还原定时器都要让位。
-	schedulePNGBackfill(pngProvider, myGen, snap, seconds, onRestore, markersOK)
+	schedulePNGBackfill(pngProvider, myGen, snap, seconds, onRestore, markersOK, seqAtWrite)
 
 	return true, snap == nil
 }
@@ -517,14 +530,19 @@ func writeClipboardWithRestore(dib []byte, pngProvider func() []byte, seconds in
 //
 // 保留 [R-5] 的 350ms 空档（让系统剪贴板历史的延迟处理完成，防 win32k AV [C-04]）——
 // 它现在只延后 PNG 的补写，不再延后用户的粘贴时刻。
-func schedulePNGBackfill(pngProvider func() []byte, myGen uint64, snap *clipSnap, seconds int, onRestore func(), markersOK bool) {
+func schedulePNGBackfill(pngProvider func() []byte, myGen uint64, snap *clipSnap, seconds int, onRestore func(), markersOK bool, seqAtWrite uint32) {
 	go func() {
 		// 空档：让系统剪贴板历史的延迟处理完成（防 win32k AV [C-04]）
 		time.Sleep(350 * time.Millisecond)
 
 		// 期间若已有更新的图写入 → 本轮 PNG 作废（否则会覆盖新图的剪贴板内容）
-		if clipGen != myGen {
-			logf("PNG 补写跳过：已被更新的图取代（代际 %d → %d）", myGen, clipGen)
+		// [修复] clipGen 的读必须在 cbMu 内：它是被 :482 持锁写的共享变量，
+		// 之前这里裸读，-race 会报（多张连发时后台 goroutine 与写入路径并发）。
+		cbMu.Lock()
+		genNow := clipGen
+		cbMu.Unlock()
+		if genNow != myGen {
+			logf("PNG 补写跳过：已被更新的图取代（代际 %d → %d）", myGen, genNow)
 			return
 		}
 
@@ -554,9 +572,6 @@ func schedulePNGBackfill(pngProvider func() []byte, myGen uint64, snap *clipSnap
 			runtime.UnlockOSThread()
 		}
 
-		// 写入后的序号（还原的比对基准 [MiniMax 坑 2]）
-		r2, _, _ := procGetSeqNumber.Call()
-		seqAfterWrite := uint32(r2)
 		if markersOK {
 			logf("剪贴板写入完成（不进 Win+V 历史）png=%dB", len(pngData))
 		} else {
@@ -576,11 +591,11 @@ func schedulePNGBackfill(pngProvider func() []byte, myGen uint64, snap *clipSnap
 				return
 			}
 			r2, _, _ := procGetSeqNumber.Call()
-			if uint32(r2) != seqAfterWrite {
+			if uint32(r2) != seqAtWrite {
 				// [B7] 两种「跳过」必须能区分开：
 				//   · 用户自己复制了别的内容 → 尊重用户，不还原
 				//   · （被本程序后续写入取代的情况上面已单独处理）
-				logf("剪贴板还原跳过：剪贴板已被外部更新（用户复制了其他内容，序号 %d → %d），不还原", seqAfterWrite, uint32(r2))
+				logf("剪贴板还原跳过：剪贴板已被外部更新（用户复制了其他内容，序号 %d → %d），不还原", seqAtWrite, uint32(r2))
 				return
 			}
 			if snap == nil {

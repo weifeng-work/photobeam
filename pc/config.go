@@ -8,8 +8,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync"
 	"strings"
+	"sync"
+	"time"
 )
 
 const (
@@ -119,7 +120,10 @@ func saveConfig(c *Config) {
 	os.Rename(tmp, filepath.Join(appDir(), "config.json"))
 }
 
-func findDevice(fp string) *Device {
+// ---------- 设备表读写（cfgMu 保护） ----------
+
+// findDeviceLocked：调用方必须已持有 cfgMu。
+func findDeviceLocked(fp string) *Device {
 	for i := range cfg.Devices {
 		if cfg.Devices[i].FP == fp {
 			return &cfg.Devices[i]
@@ -128,20 +132,122 @@ func findDevice(fp string) *Device {
 	return nil
 }
 
+// deviceByFP：返回设备记录的**副本**（不存在时 ok=false）。
+// 返回副本而不是切片内指针，避免调用方在锁外读写 cfg.Devices 造成数据竞争。
+func deviceByFP(fp string) (Device, bool) {
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+	if e := findDeviceLocked(fp); e != nil {
+		return *e, true
+	}
+	return Device{}, false
+}
+
 func upsertDevice(d Device) {
-	if e := findDevice(d.FP); e != nil {
+	cfgMu.Lock()
+	if e := findDeviceLocked(d.FP); e != nil {
 		d.PairedAt = e.PairedAt
 		*e = d
 	} else {
 		d.PairedAt = nowUnix()
 		cfg.Devices = append(cfg.Devices, d)
 	}
-	saveConfig(cfg)
+	cfgMu.Unlock()
+	saveConfig(cfg) // saveConfig 自己会再锁 cfgMu（不能持锁调用，否则自锁）
 }
 
 func clearDevices() {
+	cfgMu.Lock()
 	cfg.Devices = nil
+	cfgMu.Unlock()
 	saveConfig(cfg)
+}
+
+// updateDeviceNet：更新已配对设备的最近地址（锁内改字段，锁外落盘）。
+func updateDeviceNet(fp, ip string, port int) {
+	cfgMu.Lock()
+	if e := findDeviceLocked(fp); e != nil {
+		e.LastIP, e.LastPort = ip, port
+	}
+	cfgMu.Unlock()
+	saveConfig(cfg)
+}
+
+// hasDevices：是否已配对过设备（discovery 应答的 paired 提示用）。
+func hasDevices() bool {
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+	return len(cfg.Devices) > 0
+}
+
+// devicesSnapshot：诊断文本用的设备列表副本（持锁读，锁外遍历）。
+func devicesSnapshot() []Device {
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+	out := make([]Device, len(cfg.Devices))
+	copy(out, cfg.Devices)
+	return out
+}
+
+// ---------- 配置项并发访问 ----------
+//
+// saveConfig 在 cfgMu 内序列化**整个** Config，因此任何 cfg 字段的读写
+// （尤其托盘 goroutine 与连接 goroutine 共享的开关）都必须走同一把锁，
+// 否则会与 saveConfig 的 marshal 形成数据竞争。
+
+func clipboardEnabled() bool {
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+	return cfg.ClipboardEnabled
+}
+
+// tcpPort：当前生效的 TCP 监听端口（startTCPServer 探测落定后写入）。
+func tcpPort() int {
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+	return cfg.TCPPort
+}
+
+func setClipboardEnabled(on bool) {
+	cfgMu.Lock()
+	cfg.ClipboardEnabled = on
+	cfgMu.Unlock()
+}
+
+func clipboardSeconds() int {
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+	return cfg.ClipboardSeconds
+}
+
+func setClipboardSeconds(sec int) {
+	cfgMu.Lock()
+	cfg.ClipboardSeconds = sec
+	cfgMu.Unlock()
+}
+
+func autostartFlag() bool {
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+	return cfg.Autostart
+}
+
+func setAutostartFlag(on bool) {
+	cfgMu.Lock()
+	cfg.Autostart = on
+	cfgMu.Unlock()
+}
+
+func firewallAttempted() bool {
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+	return cfg.FWDone
+}
+
+func setFirewallAttempted(v bool) {
+	cfgMu.Lock()
+	cfg.FWDone = v
+	cfgMu.Unlock()
 }
 
 // seenIDsMax [R-6]：幂等集合上限（FIFO 近似裁剪）——防 received_ids.json 无限增长
@@ -181,8 +287,8 @@ func seenKeyFor(fp, fileID string) string {
 
 func addSeenID(id string) {
 	seenMu.Lock()
+	defer seenMu.Unlock()
 	if seenIDs[id] {
-		seenMu.Unlock()
 		return
 	}
 	seenIDs[id] = true
@@ -193,11 +299,13 @@ func addSeenID(id string) {
 		delete(seenIDs, oldest)
 	}
 	arr := append([]string(nil), seenOrder...)
-	seenMu.Unlock()
+	// [修复] marshal + 写 tmp + rename 必须都在 seenMu 内：
+	// 多连接并发收图时，两个 goroutine 同时写 received_ids.json.tmp 会互相截断，
+	// 写出损坏的 JSON → 下次启动 loadSeenIDs 解析失败 → 幂等历史全部丢失。
 	b, _ := jsonMarshalIndent(arr)
 	tmp := filepath.Join(appDir(), "received_ids.json.tmp")
-	os.WriteFile(tmp, b, 0o644)
-	os.Rename(tmp, filepath.Join(appDir(), "received_ids.json"))
+	_ = os.WriteFile(tmp, b, 0o644)
+	_ = os.Rename(tmp, filepath.Join(appDir(), "received_ids.json"))
 }
 
 func isUnderOneDrive(dir string) bool {
@@ -218,19 +326,19 @@ func nowUnix() int64 { return timeNow().Unix() }
 
 // ---------- 保存目录读写（PC-2：向导窗/托盘可在运行时改目录） ----------
 
-// saveDirMu 保护 cfg.SaveDir —— 向导窗线程改目录与接收线程读目录并发
-var saveDirMu sync.RWMutex
+// cfg.SaveDir 与 Config 的其他字段一样由 cfgMu 保护——
+// saveConfig 在 cfgMu 内序列化整个 Config，另用一把锁写同一字段会形成数据竞争。
 
 func getSaveDir() string {
-	saveDirMu.RLock()
-	defer saveDirMu.RUnlock()
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
 	return cfg.SaveDir
 }
 
 func setSaveDir(d string) {
-	saveDirMu.Lock()
-	defer saveDirMu.Unlock()
+	cfgMu.Lock()
 	cfg.SaveDir = d
+	cfgMu.Unlock()
 }
 
 // applySaveDir：校验 → 建目录（含 .tmp）→ 写回配置并落盘
@@ -254,4 +362,37 @@ func applySaveDir(dir string) error {
 	saveConfig(cfg)
 	logf("接收目录已改为: %s", abs)
 	return nil
+}
+
+// cleanupStaleParts：启动时清理接收目录 .tmp 下超过 24 小时的 .part 残留
+// （协议 §9 第 11 条：崩溃后 .tmp 可清理；v1 不做断点续写）。
+// 幂等：目录不存在 / 读取失败 / 删除失败都只记日志，不影响启动。
+func cleanupStaleParts() {
+	dir := filepath.Join(getSaveDir(), ".tmp")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return // 目录还不存在（首次运行）或不可读 → 无需清理
+	}
+	cutoff := timeNow().Add(-24 * time.Hour)
+	removed := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".part") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if !info.ModTime().Before(cutoff) {
+			continue // 24 小时内 → 可能是正在进行的传输，保留
+		}
+		if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
+			logWarn("清理过期临时文件失败: %s（%v）", e.Name(), err)
+			continue
+		}
+		removed++
+	}
+	if removed > 0 {
+		logf("已清理过期临时文件 %d 个（.tmp 下超过 24 小时的 .part）", removed)
+	}
 }

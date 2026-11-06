@@ -49,6 +49,9 @@ func main() {
 	cfg = loadConfig()
 	identity = loadOrCreateIdentity()
 	loadSeenIDs()
+	// [修复] 协议 §9.11 要求「.tmp 崩溃后可清理」：启动时清掉接收目录下超过
+	// 24 小时的 .part 残留（崩溃/断电留下的半截临时文件）。幂等，失败只记日志。
+	cleanupStaleParts()
 	logf("PhotoBeam 启动 · 指纹 %s · 保存目录 %s · 本机 IP %s",
 		identity.FP(), getSaveDir(), tooltipIP())
 	// [Stage 5 第五轮 · L] 把自己的 PID 写进交接文件，并拉起隐藏的监护进程
@@ -97,7 +100,7 @@ func main() {
 	// [Stage 5 第五轮 · A1′] 首次启动且**尚未配对过任何设备** → 自动进入待命态，
 	// 让第一次配对零学习成本（不用先知道「配对新设备」这个入口）。
 	// 有设备之后就不再自动待命 —— 新增设备必须由用户在托盘里显式点「配对新设备」。
-	if len(cfg.Devices) == 0 {
+	if !hasDevices() {
 		armPairing(pairArmFirstRun)
 		go func() {
 			time.Sleep(1500 * time.Millisecond)
@@ -139,13 +142,13 @@ func onReady() {
 	mDiag := systray.AddMenuItem("导出诊断信息", "生成诊断文本并写入日志目录（不写入剪贴板）")
 	mUpdate := systray.AddMenuItem("检查更新", "查询 GitHub 上是否有新版本（只提示，不自动下载/安装）")
 	mFW := systray.AddMenuItem("修复防火墙规则", "以管理员权限重建防火墙入站规则")
-	mAuto := systray.AddMenuItemCheckbox("开机自启（登录时启动）", "写入当前用户的启动项", cfg.Autostart)
+	mAuto := systray.AddMenuItemCheckbox("开机自启（登录时启动）", "写入当前用户的启动项", autostartFlag())
 	mSuper := systray.AddMenuItemCheckbox("崩溃后自动重启", "主进程异常退出时由隐藏监护进程拉起（不需要管理员权限）", supervisorEnabled())
 	systray.AddSeparator()
 	// [Stage 5 收尾 · 场景D] 剪贴板相关的两项配置原本只能手改 config.json，
 	// 改完还得重启进程才生效 → 现在托盘里直接改，**立即生效**。
-	mClip := systray.AddMenuItemCheckbox("剪贴板同步：开", "把收到的图片同时写入系统剪贴板（可随时关掉）", cfg.ClipboardEnabled)
-	mClipSec := systray.AddMenuItem(clipSecondsLabel(cfg.ClipboardSeconds), "点击切换自动还原时长：30 / 60 / 120 / 300 秒")
+	mClip := systray.AddMenuItemCheckbox("剪贴板同步：开", "把收到的图片同时写入系统剪贴板（可随时关掉）", clipboardEnabled())
+	mClipSec := systray.AddMenuItem(clipSecondsLabel(clipboardSeconds()), "点击切换自动还原时长：30 / 60 / 120 / 300 秒")
 	systray.AddSeparator()
 	mRestart := systray.AddMenuItem("重启 PhotoBeam", "重新启动接收端（改了 config.json 后用；端口会自动释放）")
 	systray.AddSeparator()
@@ -180,7 +183,7 @@ func onReady() {
 			armPairing(pairArmFirstRun)
 			messageBox("已清除全部配对记录。\n"+
 				"手机下次连接时将重新进入配对流程。\n\n"+
-				"（本机已进入「等待新设备」状态，2 分钟内有效）", "重新配对")
+				"（本机已进入「等待新设备」状态，10 分钟内有效）", "重新配对")
 		case <-mPairNew.ClickedCh:
 			// [Stage 5 第五轮] 显式进入待命态：只有在这个窗口里才接受新设备的配对请求
 			armPairing(pairArmWindow)
@@ -232,9 +235,10 @@ func onReady() {
 					"netsh advfirewall firewall add rule name=\"PhotoBeam-UDP\" dir=in action=allow protocol=UDP localport=5416 profile=any program=\""+exe+"\"", "修复防火墙")
 			}
 		case <-mAuto.ClickedCh:
-			cfg.Autostart = !cfg.Autostart
+			on := !autostartFlag()
+			setAutostartFlag(on)
 			saveConfig(cfg)
-			setAutostart(cfg.Autostart)
+			setAutostart(on)
 			syncAutostartCheck(mAuto)
 		case <-mSuper.ClickedCh:
 			// [Stage 5 第五轮 · L] 崩溃自动重启开关
@@ -251,22 +255,24 @@ func onReady() {
 				"（用托盘「退出」正常关闭始终不会被拉起）", "PhotoBeam")
 		case <-mClip.ClickedCh:
 			// [场景D] 剪贴板开关：立即生效（写入路径每次都读 cfg）
-			cfg.ClipboardEnabled = !cfg.ClipboardEnabled
+			on := !clipboardEnabled()
+			setClipboardEnabled(on)
 			saveConfig(cfg)
-			setMenuChecked(mClip, cfg.ClipboardEnabled)
-			mClip.SetTitle("剪贴板同步：" + onOffText(cfg.ClipboardEnabled))
-			logf("剪贴板同步已%s", onOffText(cfg.ClipboardEnabled))
-			messageBox("剪贴板同步已"+onOffText(cfg.ClipboardEnabled)+"。\n"+
+			setMenuChecked(mClip, on)
+			mClip.SetTitle("剪贴板同步：" + onOffText(on))
+			logf("剪贴板同步已%s", onOffText(on))
+			messageBox("剪贴板同步已"+onOffText(on)+"。\n"+
 				"（关闭后图片仍然会保存到接收文件夹，只是不再写入剪贴板）", "PhotoBeam")
 		case <-mClipSec.ClickedCh:
 			// [场景D] 还原秒数：点击循环切换，立即生效
-			cfg.ClipboardSeconds = nextClipSeconds(cfg.ClipboardSeconds)
+			sec := nextClipSeconds(clipboardSeconds())
+			setClipboardSeconds(sec)
 			saveConfig(cfg)
-			mClipSec.SetTitle(clipSecondsLabel(cfg.ClipboardSeconds))
-			logf("剪贴板自动还原时长改为 %d 秒", cfg.ClipboardSeconds)
+			mClipSec.SetTitle(clipSecondsLabel(sec))
+			logf("剪贴板自动还原时长改为 %d 秒", sec)
 			messageBox(fmt.Sprintf("剪贴板自动还原时长已改为 %d 秒。\n"+
 				"（超过这个时间没人复制别的东西，就把剪贴板还回你原来的内容）",
-				cfg.ClipboardSeconds), "PhotoBeam")
+				sec), "PhotoBeam")
 		case <-mRestart.ClickedCh:
 			restartSelf()
 		case <-mQuit.ClickedCh:
@@ -355,7 +361,7 @@ func updateTrayTooltip() {
 	if ip := tooltipIP(); ip != "" {
 		tip += " · " + ip
 	}
-	tip += " · TCP " + fmt.Sprint(cfg.TCPPort) + " · 指纹 " + identity.FP()
+	tip += " · TCP " + fmt.Sprint(tcpPort()) + " · 指纹 " + identity.FP()
 	if rem := pairingArmRemaining(); rem > 0 {
 		tip += fmt.Sprintf(" · 等待新设备（%d 秒）", rem)
 	}
@@ -418,11 +424,12 @@ func buildDiagnostics() string {
 	fmt.Fprintf(&b, "生成时间: %s\r\n", timeNow().Format("2006-01-02 15:04:05"))
 	fmt.Fprintf(&b, "协议版本: %d\r\n", ProtoVer)
 	fmt.Fprintf(&b, "指纹: %s\r\n", identity.FP())
-	fmt.Fprintf(&b, "TCP 监听: %d\r\nUDP 发现: %d\r\n", cfg.TCPPort, cfg.UDPPort)
+	fmt.Fprintf(&b, "TCP 监听: %d\r\nUDP 发现: %d\r\n", tcpPort(), cfg.UDPPort)
 	fmt.Fprintf(&b, "保存目录: %s\r\n", getSaveDir())
 	fmt.Fprintf(&b, "防火墙规则: %s\r\n", firewallRuleState())
-	fmt.Fprintf(&b, "已配对设备: %d\r\n", len(cfg.Devices))
-	for _, d := range cfg.Devices {
+	devs := devicesSnapshot()
+	fmt.Fprintf(&b, "已配对设备: %d\r\n", len(devs))
+	for _, d := range devs {
 		fmt.Fprintf(&b, "  - %s (%s) 最近 %s:%d\r\n", d.DevName, d.FP, d.LastIP, d.LastPort)
 	}
 
@@ -521,20 +528,26 @@ func firewallRuleState() string {
 }
 
 func ensureFirewall() {
-	if cfg.FWDone {
+	if firewallAttempted() {
 		return
 	}
-	if strings.Contains(firewallRuleState(), "未找到") {
+	// [修复] 协议 §8 要求「启动自检规则存在 + 路径一致，失效自动重建」。
+	// 旧实现只检查「未找到」：升级/移动 exe 后规则仍绑着旧路径 → 手机连不上，
+	// 但自愈逻辑永远不触发（路径比对只在诊断文本里展示给人看）。
+	// 现在把「路径不一致」也纳入自动重建条件（verdict 由 firewallPathVerdict 给出，
+	// 它对两条规则分别判「未找到 / 不一致（未按程序绑定）/ 不一致（绑的是别的路径）/ 一致」）。
+	verdict := firewallPathVerdict()
+	if strings.Contains(verdict, "未找到") || strings.Contains(verdict, "不一致") {
 		if r := addFirewallRulesElevated(); r > 32 {
-			cfg.FWDone = true
+			setFirewallAttempted(true)
 			saveConfig(cfg)
-			logf("防火墙规则已预置")
+			logf("防火墙规则已预置/重建（自检：%s）", verdict)
 		} else {
 			logf("防火墙规则预置被取消（UAC 拒绝），可稍后从托盘修复")
 			trayWarn("防火墙规则未创建（UAC 被取消）。\n手机可能连不上本机。\n可稍后从托盘菜单『修复防火墙规则』重试。")
 		}
 	} else {
-		cfg.FWDone = true
+		setFirewallAttempted(true)
 		saveConfig(cfg)
 	}
 }
