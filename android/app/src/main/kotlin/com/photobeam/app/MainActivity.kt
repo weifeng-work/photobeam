@@ -130,12 +130,49 @@ class MainActivity : Activity() {
      * Android 14+ 是**三态**授权（全量 / 部分 / 无）。
      * 申请时必须同时带上 READ_MEDIA_VISUAL_USER_SELECTED：
      * 否则用户选「部分照片」时应用拿不到部分授权，只会被系统判成"未授予"。
+     *
+     * [Stage 16] 这份固定列表**只给 ① 按钮用**（用户主动点「重新申请权限」，
+     * 弹系统对话框是期望行为）。**onCreate 不能直接用它** —— 见 [pendingPermissions]。
      */
     private val needed: MutableList<String> = mutableListOf(
         Manifest.permission.READ_MEDIA_IMAGES,
         Manifest.permission.POST_NOTIFICATIONS
     ).also {
         if (Build.VERSION.SDK_INT >= 34) it.add(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED)
+    }
+
+    /**
+     * [Stage 16] 按**当前实际状态**算出「还需要申请哪些权限」。
+     *
+     * 旧实现的问题：onCreate 里**无条件** `requestPermissions(needed)`，
+     * 而 needed 在 SDK 34+ 恒含 READ_MEDIA_VISUAL_USER_SELECTED ——
+     * **请求这个权限会走系统的 photo picker 流程**（就是「选择允许此应用访问的
+     * 照片和视频」那个系统页面）。于是已经拿到**全量**授权的用户，
+     * 每次冷启动都会被弹一次，用户连自己的界面都看不到。
+     * 实测（vivo <PHONE-MODEL> / <PHONE-MODEL>，2026-11-06）：
+     * force-stop 后重进 → topResumedActivity = PhotoPickerUserSelectActivity。
+     *
+     * 现在：
+     *   · READ_MEDIA_IMAGES 已授予（全量）→ 不再请求它，
+     *     也**不请求 VISUAL_USER_SELECTED**（那个只在要走「部分照片」路径时才要带上）
+     *   · 未授予 → 请求 READ_MEDIA_IMAGES；SDK 34+ 时带上 VISUAL_USER_SELECTED
+     *   · 通知权限没授予 → 才申请
+     * 全部都已授予 → 一个都不申请 → **系统不会弹任何东西**。
+     */
+    private fun pendingPermissions(): Array<String> {
+        val out = mutableListOf<String>()
+        if (checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES)
+            != PackageManager.PERMISSION_GRANTED) {
+            out.add(Manifest.permission.READ_MEDIA_IMAGES)
+            if (Build.VERSION.SDK_INT >= 34) {
+                out.add(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED)
+            }
+        }
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED) {
+            out.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        return out.toTypedArray()
     }
 
     /** 照片授权三态 [协议 §7.7] */
@@ -301,7 +338,14 @@ class MainActivity : Activity() {
         bDirs.setOnClickListener { showDirPicker(firstRun = false) }
         bUpdate.setOnClickListener { checkUpdateAsync() }
 
-        requestPermissions(needed.toTypedArray(), 100)
+        // [Stage 16] 只申请「真的还缺」的权限。
+        // 已经是全量授权时**一个都不申请** —— 否则请求 READ_MEDIA_VISUAL_USER_SELECTED
+        // 会走系统 photo picker 流程，用户每次冷启动都被弹一次「选择允许此应用访问的
+        // 照片和视频」（实测 vivo <PHONE-MODEL>）。详见 pendingPermissions。
+        val pending = pendingPermissions()
+        if (pending.isNotEmpty()) {
+            requestPermissions(pending, 100)
+        }
         refreshStatus()
 
         // [Stage 10] 注册 dev_dir 广播（PC 端分配目录名后刷新状态区）
