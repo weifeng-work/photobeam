@@ -75,6 +75,10 @@ class MediaStoreSync(
         // 也可能越过已选目录里的 pending 行。
         val sel: String
         val args: Array<String>
+        // [Stage 14] 老用户升级兼容：**必须在生成目录过滤条件之前**补齐每目录的同步起点。
+        // 否则 v1.2.1 的老用户升级后起点表为空 → 起点默认 0 → 历史图被再补传一次。
+        // 幂等：补齐后不再查 MediaStore（几乎零开销）；未选目录时直接返回。
+        SyncDirs.ensureStartIds(ctx)
         val dirFilter = SyncDirs.buildSelectionSql(ctx)
         if (dirFilter == null) {
             // [Stage 8] 未选任何目录 → **不同步任何东西**（隐私默认拒绝）。

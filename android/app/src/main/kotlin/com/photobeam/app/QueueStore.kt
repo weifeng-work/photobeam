@@ -30,6 +30,16 @@ class QueueItem(
 )
 
 class QueueStore(private val ctx: Context) {
+    companion object {
+        /** [Stage 14] 队列变化广播的节流窗口（毫秒） */
+        private const val NOTIFY_DELAY_MS = 400L
+
+        // 静态节流状态：QueueStore 会被多处 new（Activity / Service 各一份），
+        // 节流标志必须跨实例共享，否则每个实例各自节流 = 不节流。
+        private val notifyHandler = android.os.Handler(android.os.Looper.getMainLooper())
+        @Volatile private var notifyScheduled = false
+    }
+
     val items = ArrayList<QueueItem>()
     val discoveryLedger = HashMap<Long, Long>() // MediaStore _ID → DATE_ADDED [P0-08]
     var lastMaxId: Long = 0                      // 全局 _id 水位（files 表主键，全局唯一；失败项走待重试路径，水位照常推进 [B-11 §7.2]）
@@ -94,6 +104,32 @@ class QueueStore(private val ctx: Context) {
         // 保留上一版快照 [P0-10]
         if (file.exists()) file.copyTo(File(file.parentFile, "queue.json.bak"), overwrite = true)
         tmp.renameTo(file) // Android File.rename = rename(2) 同目录原子
+        notifyQueueChanged()
+    }
+
+    /**
+     * [Stage 14] 队列已落盘 → 通知 UI 实时刷新「待发送 N 张」。
+     *
+     * 放在 save() 里而不是各个调用点，是因为**队列状态变化的点太多**
+     * （入队 / sending / sent / dropped / 溢出丢弃），漏一个就有一处数字不更新。
+     * save() 是这些路径的**唯一汇合点** —— 落盘了就等于状态变了。
+     *
+     * 节流 400ms：连拍/批量补传时 save() 每张都调一次，不节流会疯狂刷 UI。
+     */
+    private fun notifyQueueChanged() {
+        if (notifyScheduled) return
+        notifyScheduled = true
+        notifyHandler.postDelayed({
+            notifyScheduled = false
+            try {
+                val app = ctx.applicationContext
+                app.sendBroadcast(
+                    android.content.Intent(SenderService.ACTION_QUEUE_CHANGED)
+                        .setPackage(app.packageName))
+            } catch (e: Exception) {
+                android.util.Log.w("PhotoBeam", "发队列变化广播失败: ${e.message}")
+            }
+        }, NOTIFY_DELAY_MS)
     }
 
     /**

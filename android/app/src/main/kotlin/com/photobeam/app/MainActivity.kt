@@ -111,6 +111,19 @@ class MainActivity : Activity() {
         }
     }
 
+    // [Stage 14] 队列变化广播接收器：后台入队/发送/出队后刷新状态区。
+    //
+    // 此前状态区的「待发送 N 张」只在 onCreate / onResume / ③立即同步的轮询里刷新，
+    // **没有任何「队列变化 → 通知界面」的链路** —— App 开着时后台同步一百张，
+    // 数字会一直停在 0，用户必须切走再切回才看得到。
+    private val queueReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == SenderService.ACTION_QUEUE_CHANGED) {
+                runOnUiThread { refreshStatus() }
+            }
+        }
+    }
+
     /**
      * 需要申请的运行时权限 [协议 §7.7]
      *
@@ -304,6 +317,19 @@ class MainActivity : Activity() {
             android.util.Log.w("PhotoBeam", "注册 dev_dir 广播失败: ${e.message}")
         }
 
+        // [Stage 14] 注册队列变化广播（状态区「待发送 N 张」实时刷新）
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(queueReceiver, IntentFilter(SenderService.ACTION_QUEUE_CHANGED),
+                    Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("UnspecifiedRegisterReceiverFlag")
+                registerReceiver(queueReceiver, IntentFilter(SenderService.ACTION_QUEUE_CHANGED))
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("PhotoBeam", "注册队列变化广播失败: ${e.message}")
+        }
+
         // [Stage 8] 首次启动引导：必须先选同步目录，否则**一张图都不会同步**
         //（隐私默认拒绝）。已选过就不再弹（用户随时可用 ⑧ 改）。
         // [Stage 12] 条件更精确：只有「从没保存过选择」且「用户没明确关闭过引导」才弹。
@@ -402,7 +428,21 @@ class MainActivity : Activity() {
             text = "勾选需要同步到电脑的相册文件夹（可多选）。\n" +
                 "· 勾选某个文件夹会连同它的子文件夹一起同步。\n" +
                 "· 未勾选任何文件夹 = 不同步任何图片。\n" +
-                "· 只有之后新增的图片会被同步，历史图片不会补传。"
+                "· 默认只有之后新增的图片会被同步，历史图片不会补传。"
+            setPadding(0, 0, 0, pad)
+        })
+        // [Stage 14] 补传开关：默认**不勾**（= 历史图不补传，与上面的说明一致）。
+        // 用户明确勾上 → 该目录里已存在的照片也一起同步（一次性动作）。
+        val backfillBox = android.widget.CheckBox(this).apply {
+            text = "同时补传这些文件夹里已有的照片"
+            isChecked = SyncDirs.backfillEnabled(this@MainActivity)
+            setPadding(0, 0, 0, (6 * resources.displayMetrics.density).toInt())
+        }
+        container.addView(backfillBox)
+        container.addView(TextView(this).apply {
+            text = "勾上会把这些文件夹里**已有的**照片也传一遍（可能很多、占流量）；" +
+                "不勾则只传从现在起新增的照片。"
+            textSize = 12f
             setPadding(0, 0, 0, pad)
         })
         // 显式起一个 ListView 变量：apply 块内的 this 与 lambda 内的 this 不是同一个，
@@ -459,16 +499,29 @@ class MainActivity : Activity() {
             .setPositiveButton("保存") { _, _ ->
                 val chosen = HashSet<String>()
                 for (i in dirs.indices) if (checked[i]) chosen.add(dirs[i].first)
-                SyncDirs.save(this, chosen)
-                android.util.Log.d("PhotoBeam", "同步目录已保存：${chosen.size} 个（$chosen）")
-                if (chosen.isEmpty()) {
-                    statusView.text = "已保存：未选择任何文件夹 → 当前不会同步任何图片"
-                } else {
-                    statusView.text = "已保存：${chosen.size} 个文件夹参与同步 → ${chosen.joinToString(", ")}"
-                }
-                // 立刻触发一次对账（让新选的目录里的新图马上能发出去）
-                SenderService.start(this, SenderService.ACTION_SYNC_NOW)
-                startSyncPolling()
+                val backfill = backfillBox.isChecked
+                // [Stage 14] 算每目录的同步起点要遍历 MediaStore（几千行，几十毫秒）
+                // → 放后台线程，别卡 UI。算完再写 prefs，再触发对账。
+                statusView.text = "正在保存…"
+                Thread {
+                    val starts = SyncDirs.computeStartIds(this, chosen, backfill)
+                    SyncDirs.save(this, chosen, starts, backfill)
+                    android.util.Log.d("PhotoBeam", "同步目录已保存：${chosen.size} 个（$chosen）补传=$backfill")
+                    runOnUiThread {
+                        if (chosen.isEmpty()) {
+                            statusView.text = "已保存：未选择任何文件夹 → 当前不会同步任何图片"
+                        } else if (backfill) {
+                            statusView.text = "已保存：${chosen.size} 个文件夹参与同步" +
+                                "（含已有照片，正在补传）→ ${chosen.joinToString(", ")}"
+                        } else {
+                            statusView.text = "已保存：${chosen.size} 个文件夹参与同步（只传之后新增的）" +
+                                " → ${chosen.joinToString(", ")}"
+                        }
+                        // 立刻触发一次对账（让新选的目录里的新图马上能发出去）
+                        SenderService.start(this, SenderService.ACTION_SYNC_NOW)
+                        startSyncPolling()
+                    }
+                }.start()
             }
             .setNegativeButton(if (firstRun) "暂不选择（不同步任何图片）" else "取消") { _, _ ->
                 if (firstRun) {
@@ -516,12 +569,25 @@ class MainActivity : Activity() {
         stopSyncPolling()
         // [Stage 10] 注销 dev_dir 广播
         try { unregisterReceiver(devDirReceiver) } catch (e: Exception) { }
+        // [Stage 14] 注销队列变化广播
+        try { unregisterReceiver(queueReceiver) } catch (e: Exception) { }
     }
 
     // ---------- 状态区 ----------
 
     private fun refreshStatus() {
         val paired = prefs.getString("pc_name", null)
+        // [Stage 14 · 缺陷修复] **必须重新读盘**再算待发送数。
+        //
+        // MainActivity 持有的 queue 与 SenderService 里的 queue 是**两个独立实例**
+        // （各自 new QueueStore(ctx)），只有 queue.json 是共享的。
+        // 本类**从不写盘**（不 save/enqueue），所以 onCreate 时 load() 出来的
+        // 是一份**永久冻结的快照** —— 服务端同步一百张，这个实例里的
+        // pendingCount() 仍然是 onCreate 那一刻的数字（实测一直显示 0）。
+        //
+        // load() 读的是原子 rename 过的完整文件，不会读到半截；
+        // 它把 "sending" 复位成 "pending" 只作用于本副本（本类不写盘），无副作用。
+        queue.load()
         val pending = queue.pendingCount()
         val mode = prefs.getString("icon_mode", null) ?: SenderService.iconMode
         // [修复 2026-11-02 v2] 电池优化白名单状态：

@@ -42,6 +42,10 @@ class SenderService : Service() {
         /** 正规前台服务通知 id */
     /** [Stage 10] 内部广播：dev_dir 已更新（UI 据此刷新状态区） */
     const val ACTION_DEVDIR_UPDATED = "photobeam.devdir.updated"
+        /** [Stage 14] 内部广播：队列已变化（UI 据此**实时**刷新「待发送 N 张」）。
+         *  此前状态区只在 onCreate/onResume/③立即同步的轮询里刷新 → App 开着时
+         *  后台同步一百张，数字一直停在 0，必须切走再切回才看得到。 */
+        const val ACTION_QUEUE_CHANGED = "photobeam.queue.changed"
         const val NOTI_ID = 1
         /** 降级（普通通知）id：必须与 NOTI_ID 分离。
          *  [修复 2026-11-02 v2] 被系统"静默拒绝"的 startForeground 会**异步 cancel 掉同 id 的通知**，
