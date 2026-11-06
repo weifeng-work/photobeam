@@ -1,5 +1,17 @@
 // dibtest3：干净的 StretchDIBits 行为测定（目标 DIB 段足够大，绝不越界写）
 // 目标：搞清 StretchDIBits 对「32bpp bottom-up 源 DIB」在什么条件下返回 0。
+//
+// [Stage 13] 这是 Stage 5 的一次性**调试残留**，不是产品代码 ——
+// 当初为定位 StretchDIBits 返回 0 的条件而写的探针，结论已记进
+// docs/stage5-evidence.md。放在仓库里只为留档（Initial commit 就在）。
+//
+// 但它是一个独立 main package：CI 里 `go test ./...` 会把它当第二个包编译
+// （无害，但输出里多一行 "? photobeam/pc/dibtest3 [no test files]"）。
+// 加 //go:build ignore → Go 工具链完全忽略它，不再参与任何 build/vet/test，
+// 同时不必为「删掉它」去重写公开仓库的历史。
+//
+//go:build ignore
+
 package main
 
 import (

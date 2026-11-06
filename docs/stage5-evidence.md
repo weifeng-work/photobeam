@@ -1381,9 +1381,73 @@ redirects=1
 
 #### 5.20.4 实测
 
-构建 v1.2.1 后，手机端点「⑨ 检查更新」——**此时 GitHub 匿名 API 恰好仍处于限流状态**
-（`core.remaining = 0`，`releases/latest` 返回 403），
-正好覆盖降级路径：应显示「已是最新版本」而不是「检查更新失败」。
+**PC 端（真实 GitHub，非 mock）** —— 新增 `TestLiveUpdateCheckAgainstRealGitHub`
+用**生产常量**（不覆盖 `updateAPI`/`releaseURL`）直接打真实 GitHub，
+此刻匿名 API 恰好处于限流状态：
+
+```
+$ cd pc && PB_LIVE_NET=1 go test -run TestLiveUpdate -v
+Err=<nil> Latest="1.2.0" HasNew=false PageURL=https://github.com/weifeng-work/photobeam/releases/latest
+--- PASS: TestLiveUpdateCheckAgainstRealGitHub (2.21s)
+```
+
+`Err=<nil>` = API 403 之后**自动降级成功**，且正确取到线上版本 1.2.0。
+
+**手机端（CI 产物 v1.2.1 实机）** —— 覆盖安装后点「⑨ 检查更新」：
+
+```
+已是最新版本
+当前版本 v1.2.1，没有新版本。
+```
+
+同一时刻的 GitHub 状态（证明走的正是降级路径，而不是 API 恰好成功）：
+
+```
+releases/latest API -> http_code=403                                  ← 匿名 API 限流中（core.remaining=0）
+page -> http_code=200 final=.../releases/tag/v1.2.0                   ← 降级走这条，正常
+```
+
+顺带回归 Stage 12 的勾选修复（v1.2.1 上仍正常）：
+
+```
+点击前：      DCIM/Screenshots checked=true    Pictures/<USER-DIR> checked=false
+点一次：      DCIM/Screenshots checked=true    Pictures/<USER-DIR> checked=true    ← 生效
+再点一次：    DCIM/Screenshots checked=true    Pictures/<USER-DIR> checked=false   ← 可取消
+```
+
+### 5.21 第十四轮：单测此前从未在 CI 里跑过（守门人是假的）
+
+**起因**：本轮给降级路径加了 6 组单测，提交后顺手去看 CI 日志，
+发现 pc job **只做构建 + 产物校验，从来没执行过 `go test`**：
+
+```
+jobs:
+  pc:        构建 → 校验产物 → upload-artifact
+  android:   构建 → upload-artifact
+```
+
+也就是说 §5.12 写下的「`pc/clipboard_perf_test.go`（**CI 可跑**）」、
+§5.13/§5.15/§5.17 的各组单测，**一次都没有在 CI 上执行过**——
+它们只是躺在仓库里、靠人工记得去跑。守门人不转起来，等于没有守门人。
+
+**改法**：pc job 在构建**之前**加一步单测：
+
+```yaml
+- name: 单元测试
+  shell: pwsh
+  run: |
+    # 注意：Go module 在 pc/ 子目录（仓库根没有 go.mod）→ 必须用 -C pc
+    go test -C pc -count=1 -timeout 10m ./...
+```
+
+> 第一次提交这步时 CI 直接红了：
+> `pattern ./...: directory prefix . does not contain main module or its selected dependencies`
+> —— 仓库根根本没有 `go.mod`（module 在 `pc/`）。本地一直用 `go test -C <root>\pc` 所以没暴露。
+> 这正是「只有 CI 才跑得出来」的那类问题。
+
+顺带清掉一个**同类问题的另一面**：`pc/dibtest3/` 是 Stage 5 的一次性 GDI 调试探针
+（Initial commit 就在仓库里），它是一个独立 `main` package → `go test ./...` 会把它当第二个包编译。
+加 `//go:build ignore` 让 Go 工具链忽略它（文件留档，不必为删它去重写公开仓库的历史）。
 
 ## 6. 遗留
 

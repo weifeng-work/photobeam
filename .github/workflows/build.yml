@@ -46,7 +46,8 @@ jobs:
       - name: 单元测试
         shell: pwsh
         run: |
-          go test -count=1 -timeout 10m ./...
+          # 注意：Go module 在 pc/ 子目录（仓库根没有 go.mod）→ 必须用 -C pc
+          go test -C pc -count=1 -timeout 10m ./...
 
       - name: 构建 PhotoBeam.exe
         shell: pwsh
