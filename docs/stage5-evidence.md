@@ -1307,6 +1307,84 @@ Received\
 
 > **现状**：新同步的照片**全部**落在 `Received\<设备名>-<fp8>\<相册目录>\` 里，
 > 不会散落在外层（`resolveDeviceDir` 有二次逃逸检查兜底）。
+### 5.20 第十三轮：「检查更新」撞上 GitHub 匿名 API 限流（降级路径，Stage 11 补强）
+
+**起因**：排查发布流程时实测发现，GitHub **匿名 API 只有 60 次/小时/IP**：
+
+```
+curl https://api.github.com/rate_limit
+→ "core":{"limit":60,"remaining":0,"used":60}
+→ curl .../releases/latest  →  HTTP 403
+```
+
+这直接击穿了 §5.18 的实现：**同一 WiFi 下的用户共享同一个公网 IP**，
+一小时内谁的额度被用光（CI、其他工具、乃至别的项目），
+所有人的「检查更新」就一起报「检查更新失败」——
+而 PhotoBeam 的主功能压根不需要联网，为一个附加功能报网络错误是纯粹的坏体验。
+
+#### 5.20.1 降级方案：走网页通道，不走 API
+
+GitHub 的 `/releases/latest` **页面**会 302 跳到具体版本页，
+**页面通道不受 API 限额约束**。从**最终 URL** 里就能抠出版本号：
+
+```
+GET https://github.com/weifeng-work/photobeam/releases/latest
+→ 302 → https://github.com/weifeng-work/photobeam/releases/tag/v1.2.0
+→ 200
+```
+
+实测（2026-11-06）：
+
+```
+http_code=200
+final_url=https://github.com/weifeng-work/photobeam/releases/tag/v1.2.0
+redirects=1
+```
+
+于是定为：**API 优先**（快、能顺带拿到发布说明首行），
+**失败则自动降级到重定向通道**，用户看到的仍是
+「已是最新版本」或「有新版本 vX.Y.Z」，而不是「查询失败」。
+
+| 场景 | 行为 |
+|---|---|
+| API 200 | 正常比对（带发布说明首行） |
+| API 403/429（限流） | **自动降级** → 重定向通道取 tag → 正常比对 |
+| API 连不上（离线/断网） | **自动降级** → 重定向通道也失败 → 才报「检查更新失败」 |
+
+#### 5.20.2 两端实现
+
+- **PC 端**（`pc/update.go`）：`checkViaRedirect(client, current)` —— 标准库
+  `http.Client` 默认跟随重定向，读 `resp.Request.URL.String()` 拿最终 URL，
+  截 `/releases/tag/` 之后的片段。
+  `updateAPI` / `releaseURL` 由 `const` 改为 `var`，这样测试能指向 `httptest` 服务器。
+- **Android 端**（`android/.../Update.kt`）：`checkViaRedirect(current)` ——
+  `HttpURLConnection` **手动**跟随重定向（它默认不跟跨协议跳转，
+  且我们必须拿到最终 URL），相对 `Location` 用 `URL(URL(target), loc)` 解析，最多 6 跳。
+  降级通道超时单独设 5 秒（比 API 的 8 秒短 —— 它只在 API 已经失败后才走，
+  不该再让用户多等）。
+
+#### 5.20.3 守门人：降级路径的单元测试
+
+新增 `pc/update_fallback_test.go`（6 组）：
+
+| 用例 | 断言 |
+|---|---|
+| API 返回 403 | 降级成功，`Err == nil`，取到 `1.3.0` |
+| API 连不上（端口已关） | 降级成功，`Err == nil` |
+| API 返回 429 + 页面 tag 与当前一致 | 降级成功，`HasNew == false` |
+| 两条路都失败 | **保留原始错误**，不静默吞掉 |
+| `checkViaRedirect` 直接测 | `v1.3.0`→`1.3.0`、`v10.0.0`→`10.0.0`、无 `v` 前缀也认 |
+| 版本号为空 | **不发网络请求** |
+
+> 写测试时踩到两个坑：mock 若对**所有**路径都重定向会无限跳转（`stopped after 10 redirects`）；
+> `releaseURL` 必须带上 `/releases/latest` 路径，否则 mock 不会触发跳转、最终 URL 里抠不到 tag。
+
+#### 5.20.4 实测
+
+构建 v1.2.1 后，手机端点「⑨ 检查更新」——**此时 GitHub 匿名 API 恰好仍处于限流状态**
+（`core.remaining = 0`，`releases/latest` 返回 403），
+正好覆盖降级路径：应显示「已是最新版本」而不是「检查更新失败」。
+
 ## 6. 遗留
 
 1. ~~**计划任务看门狗**未实现~~ → **第五轮已用「隐藏监护进程」实现**（不需要注册系统计划任务、不需要提权）。

@@ -30,10 +30,12 @@ const updateRepo = "weifeng-work/photobeam"
 
 // updateAPI：GitHub 最新 Release 的 API。匿名访问有速率限制（60 次/小时/IP），
 // 但这里是**用户手动点击**才触发，速率完全够用。
-const updateAPI = "https://api.github.com/repos/" + updateRepo + "/releases/latest"
+//
+// 用 var 而非 const：测试里要指向 httptest 服务器（见 update_test.go）。
+var updateAPI = "https://api.github.com/repos/" + updateRepo + "/releases/latest"
 
 // releaseURL：人看的 Release 页面（比 API 更适合给用户点开）
-const releaseURL = "https://github.com/" + updateRepo + "/releases/latest"
+var releaseURL = "https://github.com/" + updateRepo + "/releases/latest"
 
 // updateCheckTimeout：整体超时。查更新是**附加功能**，绝不能拖住 UI 或托盘线程。
 const updateCheckTimeout = 8 * time.Second
@@ -72,11 +74,24 @@ func checkForUpdate(current string) updateInfo {
 
 	resp, err := client.Do(req)
 	if err != nil {
+		// [Stage 12] API 不可用（离线 / 触发 GitHub 匿名 API 速率限制 60 次/小时/IP）
+		// → 降级到「跟随重定向取最终 URL 的 tag」：不走 API，**无限流**。
+		if alt, altErr := checkViaRedirect(client, current); altErr == nil {
+			info.Latest = alt
+			info.HasNew = compareVersions(alt, current) > 0
+			return info
+		}
 		info.Err = err
 		return info
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		// 速率限制（403/429）最常见 → 同样降级
+		if alt, altErr := checkViaRedirect(client, current); altErr == nil {
+			info.Latest = alt
+			info.HasNew = compareVersions(alt, current) > 0
+			return info
+		}
 		info.Err = fmt.Errorf("GitHub API 返回 %d", resp.StatusCode)
 		return info
 	}
@@ -101,6 +116,36 @@ func checkForUpdate(current string) updateInfo {
 	info.Notes = firstLine(rel.Body)
 	info.HasNew = compareVersions(info.Latest, current) > 0
 	return info
+}
+
+// checkViaRedirect：降级方案 —— 访问 /releases/latest 并跟随重定向，
+// 从**最终 URL** 里取 tag（形如 .../releases/tag/v1.2.0）。
+//
+// 为什么需要它：GitHub 匿名 API 限额只有 60 次/小时/IP（同一 WiFi 下的用户共享），
+// 很容易被用光 → 检查更新直接失败。这个方案**不走 API**，页面不限流。
+// 实测（2026-11-06）：跟随重定向后最终 URL = https://github.com/<repo>/releases/tag/v1.2.0
+func checkViaRedirect(client *http.Client, current string) (string, error) {
+	req, err := http.NewRequest("GET", releaseURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "PhotoBeam/"+current+" (update-check)")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	final := resp.Request.URL.String()
+	i := strings.LastIndex(final, "/releases/tag/")
+	if i < 0 {
+		return "", fmt.Errorf("无法从 %s 解析版本号", final)
+	}
+	tag := strings.Trim(strings.TrimSpace(final[i+len("/releases/tag/"):]), "/")
+	tag = strings.TrimPrefix(tag, "v")
+	if tag == "" {
+		return "", fmt.Errorf("版本号为空")
+	}
+	return tag, nil
 }
 
 // firstLine：取发布说明首行（去掉 markdown 标题符号），够用即可。

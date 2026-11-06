@@ -33,6 +33,12 @@ object UpdateChecker {
     private const val PAGE = "https://github.com/$REPO/releases/latest"
     private const val TIMEOUT_MS = 8000
 
+    /** 降级通道的超时：比 API 通道短——它只在 API 已经失败后才走，不该再让用户多等 */
+    private const val TIMEOUT_REDIRECT_MS = 5000
+
+    /** 降级通道最多跳几跳（真实 GitHub 只跳 1 跳：/releases/latest → /releases/tag/vX.Y.Z） */
+    private const val MAX_REDIRECT_HOPS = 6
+
     /** 当前 App 版本号（读 manifest 里的 versionName，由构建脚本注入） */
     fun currentVersion(ctx: Context): String {
         return try {
@@ -63,7 +69,9 @@ object UpdateChecker {
             conn.setRequestProperty("Accept", "application/vnd.github+json")
             try {
                 if (conn.responseCode != 200) {
-                    return res.copy(error = "GitHub API 返回 ${conn.responseCode}")
+                    // GitHub 匿名 API 限流（403/429）最常见 → 降级到网页通道
+                    return checkViaRedirect(current)
+                        ?: res.copy(error = "GitHub API 返回 ${conn.responseCode}")
                 }
                 val text = conn.inputStream.bufferedReader().use { it.readText() }
                 val o = JSONObject(text)
@@ -80,8 +88,64 @@ object UpdateChecker {
                 conn.disconnect()
             }
         } catch (e: Exception) {
-            res.copy(error = e.message ?: e.javaClass.simpleName)
+            // 网络异常（含 API 不可达）→ 同样降级一次；降级也失败才报错
+            checkViaRedirect(current)
+                ?: res.copy(error = e.message ?: e.javaClass.simpleName)
         }
+    }
+
+    /**
+     * 降级方案：访问 /releases/latest 页面并跟随重定向，从**最终 URL** 里取 tag。
+     *
+     * 为什么需要它：GitHub 匿名 API 只有 60 次/小时/IP（同一 WiFi 下的用户共享），
+     * 很容易被用光 → API 返回 403/429，检查更新直接对用户报失败。
+     * 这个方案走**网页通道**，不走 API，不受该限额影响。
+     *
+     * 实测（2026-11-06）：跟随重定向后最终 URL = https://github.com/<repo>/releases/tag/v1.2.0
+     *
+     * 失败返回 null —— 由调用方保留原始错误，不静默吞掉。
+     */
+    private fun checkViaRedirect(current: String): UpdateResult? {
+        var target = PAGE
+        var hops = 0
+        while (hops < MAX_REDIRECT_HOPS) {
+            val conn = URL(target).openConnection() as HttpURLConnection
+            try {
+                conn.connectTimeout = TIMEOUT_REDIRECT_MS
+                conn.readTimeout = TIMEOUT_REDIRECT_MS
+                conn.requestMethod = "GET"
+                // 自己跟随重定向：HttpURLConnection 默认不跟跨协议跳转，且我们必须拿到**最终 URL**
+                conn.instanceFollowRedirects = false
+                conn.setRequestProperty("User-Agent", "PhotoBeam/$current (update-check)")
+                val code = conn.responseCode
+                if (code in 300..399) {
+                    val loc = conn.getHeaderField("Location")
+                    if (loc.isNullOrBlank()) return null
+                    // Location 可能是相对路径（GitHub 就是），用当前 URL 解析
+                    target = URL(URL(target), loc).toString()
+                    hops++
+                } else {
+                    if (code != 200) return null
+                    val finalUrl = target
+                    val marker = "/releases/tag/"
+                    val i = finalUrl.lastIndexOf(marker)
+                    if (i < 0) return null
+                    val tag = finalUrl.substring(i + marker.length).trim('/').removePrefix("v")
+                    if (tag.isBlank()) return null
+                    return UpdateResult(
+                        latest = tag,
+                        current = current,
+                        hasNew = compareVersions(tag, current) > 0,
+                        pageUrl = finalUrl
+                    )
+                }
+            } catch (e: Exception) {
+                return null
+            } finally {
+                conn.disconnect()
+            }
+        }
+        return null
     }
 
     /** 取发布说明首行（去掉 markdown 标题符号） */
