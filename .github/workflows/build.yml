@@ -303,6 +303,8 @@ jobs:
           TAG: ${{ github.ref_name }}
           REPO: ${{ github.repository }}
         run: |
+          # 本版改了什么 → 直接取 tag message（发布时用 git tag -a vX.Y.Z -m "..." 写）
+          $tagNotes = (git tag -l --format='%(contents)' $env:TAG) -join "`n"
           $notes = @"
           ## PhotoBeam $env:TAG
 
@@ -317,6 +319,9 @@ jobs:
 
           使用手册：https://github.com/$env:REPO/blob/$env:TAG/docs/user-journey.md
           "@
+          if ($tagNotes.Trim()) {
+            $notes = $notes + "`n`n## 本版改动`n`n" + $tagNotes.Trim() + "`n"
+          }
           # 已有同名 Release（同 tag 重跑）→ 先删再建
           gh release delete $env:TAG --yes --cleanup-tag 2>&1 | Out-Null
           gh release create $env:TAG --title "PhotoBeam $env:TAG" --notes $notes PhotoBeam.apk "dist\PhotoBeam.exe#PhotoBeam.exe"
