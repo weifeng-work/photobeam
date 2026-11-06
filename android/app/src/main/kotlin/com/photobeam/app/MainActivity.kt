@@ -163,12 +163,12 @@ class MainActivity : Activity() {
      */
     private fun pendingPermissions(): Array<String> {
         val out = mutableListOf<String>()
-        val imagesGranted = checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES)
-            == PackageManager.PERMISSION_GRANTED
+        val imagesGranted = (checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES)
+            == PackageManager.PERMISSION_GRANTED)
         // 部分授权（Android 14+ 三态里的中间态）：用户只放行了部分照片
         val selectedGranted = Build.VERSION.SDK_INT >= 34 &&
-            checkSelfPermission(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED)
-            == PackageManager.PERMISSION_GRANTED
+            (checkSelfPermission(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED)
+                == PackageManager.PERMISSION_GRANTED)
         if (!imagesGranted && !selectedGranted) {
             // **完全没授权** → 必须申请（否则 App 一张图都拿不到）
             out.add(Manifest.permission.READ_MEDIA_IMAGES)
