@@ -507,6 +507,8 @@ class MainActivity : Activity() {
                     val starts = SyncDirs.computeStartIds(this, chosen, backfill)
                     SyncDirs.save(this, chosen, starts)
                     android.util.Log.d("PhotoBeam", "同步目录已保存：${chosen.size} 个（$chosen）补传=$backfill")
+                    // [Stage 14] 打印每目录起点：验证「起点 = 保存时刻的全局 max」这一关键事实
+                    android.util.Log.d("PhotoBeam", "目录同步起点：$starts")
                     runOnUiThread {
                         if (chosen.isEmpty()) {
                             statusView.text = "已保存：未选择任何文件夹 → 当前不会同步任何图片"
