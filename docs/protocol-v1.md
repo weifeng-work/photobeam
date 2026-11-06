@@ -1,6 +1,6 @@
 # PhotoBeam 协议规范 v1.9（Stage 10 修订版 · 多机设备目录隔离）
 
-> 状态：v1.5（Stage 5 修订版）。Stage 0 已四轮签字，Stage 1~4 实现已按规范交付；
+> 状态：v1.9（Stage 10 修订版·多机设备目录隔离）。Stage 0 已四轮签字，Stage 1~4 实现已按规范交付；
 > **v1.4 的修订原则：以实机验证结果为准**——凡 v1.3 的条文与真机行为冲突，
 > 一律**改协议而不是回退已验证有效的实现**，每处偏离在 §11 登记（条款 / 实测 / 理由 / 证据）。
 >
@@ -278,9 +278,11 @@ MAX_FRAME_LEN = 1 MiB（明文），超限立即断链并计入错误计数
 key = session（32B），每帧独立 12B 随机 nonce；重连换新 session → 旧帧重放自动失效
 ```
 
-- **CTRL_JSON 消息清单**（`mode` 不在此列，属明文阶段 [N-08]）：`ping`/`pong`（15s 间隔，
-  45s 无入站帧判死；心跳只维持连接，不是传输前提）、`bye`、`ack`、`pair_confirm`、`pair_ok`、
+- **CTRL_JSON 消息清单**（`mode` 不在此列，属明文阶段 [N-08]）：`ping`/`pong`（**v1.9 实现口径：
+  存活判定由 45s 无入站帧超时兜底，两端均未实现 15s 主动心跳；ping/pong 保留为调试帧**）、
+  `bye`、`ack`、`pair_confirm`、`pair_ok`、
   `pair_reject`（**双向可发** [R-22]）、`auth`、`auth_ok`、`file_meta`、`file_end`、`error`。
+  （v1.9 起 Android 端在长传输的逐张发送循环中会按需补发 ping，用于更早发现半开连接。）
 - **`error` 与 `ACK{status:"error"}` 分工**：`error` 用于**加密阶段的连接级/协议级错误**
   （帧解析失败等；**版本不匹配在明文阶段经 MODE 帧的 `err` 字段报告** [S-02]）；
   **文件级错误一律用 `ACK{status:"error"}`** [R-15]。
@@ -292,19 +294,25 @@ key = session（32B），每帧独立 12B 随机 nonce；重连换新 session �
 
 | 消息 | 字段（CTRL_JSON payload） |
 |---|---|
-| `file_meta` | `file_id`(SHA-256 hex 小写)、`name`、`size`、`mtime`、`mime`、`captured_at`、`batch_id`、`is_latest_in_batch`(bool)、`batch_size`(int)、`rel_path`(string, **v1.7 新增**，见下) |
+| `file_meta` | `file_id`(SHA-256 hex 小写)、`name`、`size`、`mtime`(**保留字段，v1.9 起 PC 端忽略**)、`mime`、`captured_at`、`batch_id`、`is_latest_in_batch`(bool)、`batch_size`(int)、`rel_path`(string, **v1.7 新增**，见下) |
 | `pair_ok` / `auth_ok` | `sig`；**v1.9 新增** `dev_dir`(string)：Receiver 分配给该 Sender 的落盘目录名（见 §5.3） |
 | `file_end` | `file_id` |
-| `ack` | `file_id`、`status`("ok"/"error")、`reason`("ok"/"duplicate"/"ext_rejected"/"disk_full"/"invalid_name"/"io_error")、`err_class`("permanent"/"transient") |
+| `ack` | `file_id`、`status`("ok"/"error")、`reason`("ok"/"duplicate"/"ext_rejected"/`invalid_file_id`/`empty_file`/`file_too_large`/`hash_mismatch`/"disk_full"/"invalid_name"/"io_error")、`err_class`("permanent"/"transient") |
 | `error` | `reason`、`ver`、`min_ver`（连接级/协议级错误专用 [R-15]） |
 | `file_chunk` | 二进制帧（frame_type=0x02），payload = `raw file bytes`；**所属文件与序号由状态机隐含**（M1 单文件顺序传输，见下） |
 
 - **file_id**[P0-07]：Sender 在**入队时**完整读一遍文件计算 SHA-256 并固化到队列项（二遍读
   成本几十到几百毫秒，已计入 §9 第 2 条时延预算）；传输时第二遍读文件流式发送。
   Receiver 幂等集合存 file_id。**ACK 处理顺序 = 幂等集合 → 磁盘配额 → 落盘** [R-15]。
+  **v1.9 安全条款**：Receiver 必须校验 `file_id` 形如 64 位十六进制（SHA-256 hex），
+  非法 → `ACK{error, permanent, reason:"invalid_file_id"}`。理由：file_id 此前被直接拼进
+  临时文件路径（`.tmp\<file_id>.part`），不校验时含 `..\` 的值可写出接收目录之外——
+  **路径穿越的最后一个缺口在 file_id 上，必须白名单校验**。
 - 状态机（M1 **禁止多文件交错**）[P1-02]：
   `IDLE → file_meta → RECV(expect_seq=0,1,2…) → file_end → ack`。
-  chunk 顺序由状态机保证；FILE_END 后同文件 chunk = 协议违规断链。
+  chunk 顺序由状态机保证；**v1.9 实现口径**：FILE_END 后同文件 chunk 静默丢弃并记日志；
+  上一个文件未 file_end 又收到新 `file_meta` 时，Receiver 收掉旧临时文件（删除）后继续
+  处理新文件（记协议违规日志，**不断链**——单帧乱序不值得撕整条连接，但不能留句柄泄漏）。
 
 ### 5.2 接收端落盘规则（M1 必须完整实现）[N-05]
 
@@ -383,9 +391,11 @@ v1.7 引入 `rel_path` 后目录结构只来自手机端相册目录，**不含�
 
 因此本版只做「显示目录位置」，**不做重命名**。
 
-- **隔离写入**：先写 `Received\.tmp\<file_id>.part`，FILE_END 后校验整文件 SHA-256 =
-  file_id → 通过则**原子 rename** 到 `<unixMs_Receiver时钟>_<消毒名>`（冲突加 -1/-2）；
-  校验失败删 .part 回 transient；
+- **隔离写入**：先写 `Received\.tmp\<fp前8>-<file_id>.part`（v1.9：临时名带发送方指纹前 8 位，
+  防两台手机传同一张图时 .part 撞名互相截断），FILE_END 后校验整文件 SHA-256 = file_id →
+  通过则**原子 rename** 到 `<unixMs_Receiver时钟>_<消毒名>`（冲突加 -1/-2）；
+  校验失败删 .part 回 transient。**v1.9 新增**：启动时清理 .tmp 下超过 24 小时的 .part 残留
+  （崩溃/断电留下的半截临时文件，§9 第 11 条）。
 - 落盘名时间戳用 **Receiver 时钟**；跨设备时间比较禁令 [P2-01]。
 - heic 在资源管理器无缩略图 → README/托盘提示说明 [P2-02]。
 - **v1.5 新增（Stage 5 第三轮实测）· 逐张回执**：Sender 收到 `ACK{status:"ok"}` 后必须把该文件
@@ -400,7 +410,8 @@ v1.7 引入 `rel_path` 后目录结构只来自手机端相册目录，**不含�
   同批）[R-18]。"捕获间隔"统一指 `DATE_ADDED`。
 - **批内排序与 is_latest**：排序键 = `(DATE_ADDED, MediaStore _ID)`（_ID 单调递增解决同秒
   并列），最后一张 `is_latest_in_batch=true`。
-- **batch_id**：`"<fp前8>-<seq>"`，seq 持久化单调计数（重启继续递增）。
+- **batch_id**：`"b<seq>"`（**v1.9 实现口径**：入队时分配 `b1/b2/…` 单调计数；原草案的
+  `<fp前8>-<seq>` 格式未落地，PC 端不解析 batch_id 内部结构、两端均不依赖它做业务逻辑）。
 - 三层：① 同批仅 is_latest 触发剪贴板动作（M2）；② Receiver 全局最新指针跨批更新；
   ③ Receiver 800ms–1.5s debounce 合并突发，窗口内剪贴板序号变化 → 立即结算。
 - **落盘永远全做，剪贴板只有一个槽位。** 所有时间比较仅在 Sender 侧。
@@ -436,11 +447,13 @@ Sender 只同步**用户显式选中**的相册目录。这是**采集范围**�
 - 目录选择是**手机端本地行为**，Receiver 无需感知 → **不涉及协议字段变更**。
 
 ### 7.2 对账 checkpoint [P0-09][R-09][P2-b]
-**主水位 = `_ID`**（不受时钟影响），**按 `VOLUME_NAME` 分组维护各自的 `last_max_id`**
-（Android 10+ 的 `VOLUME_EXTERNAL` 聚合多卷，各卷 `_ID` 空间独立，单一水位会漏卷）；
+**主水位 = `_ID`**（不受时钟影响）。**v1.9 实现口径：单一全局水位**（`queue.lastMaxId`）。
+理由（Android 实现注释已论证）：MediaStore `files` 表的 `_id` 在 `VOLUME_EXTERNAL` 聚合视图下
+**跨卷全局单调且唯一**，单一水位不会漏卷；原草案「按 `VOLUME_NAME` 分组维护各自的
+`last_max_id`」未落地——后续维护者请勿按旧文改成分组逻辑（会与已验证的水位推进冲突）。
 查询 URI 用 `MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)`（API 29+）。
-流程：`upper_id = 查询时各卷最大 _ID` → 查 `_id > last_max_id[卷]` 的行 → 逐行比发现账本 →
-入队（读一次文件算 file_id）→ **结束后才推进 `last_max_id[卷] = upper_id[卷]`**（处理失败
+流程：`upper_id = 查询时最大 _ID` → 查 `_id > last_max_id` 的行 → 逐行比发现账本 →
+入队（读一次文件算 file_id）→ **结束后才推进 `last_max_id = upper_id`**（处理失败
 不推进，下轮重查）。`DATE_ADDED` 仅作展示与批次聚类，不参与水位判定 → **时钟调快/调慢都
 不漏图**。前台活跃期对账周期默认 60s（进程存活且非受限时）。
 
@@ -591,8 +604,8 @@ is_latest_in_batch, state: pending|sending|sent|dropped, tries, drop_reason}`：
 8. 预占 TCP 5416 → PC 漂移 54xx 且 found 携带新端口，配对成功；
 9. 预占 UDP 5416 → PC 明确告警拒绝启动（不静默漂移）；
 10. 断网导入 250 张 → 队列超限丢最旧 pending，通知栏告知丢弃数量；
-11. 同一图重复入队 3 次 → PC 只落盘 1 份；传输中断 → 重传后无半截文件、无重复文件（.tmp
-    目录崩溃后可清理/续写）；
+11. 同一图重复入队 3 次 → PC 只落盘 1 份；传输中断 → 重传后无半截文件、无重复文件
+    （v1.9：.tmp 下超过 24 小时的 .part 由启动清理删除；v1 不做断点续写）；
 12. `.txt`/`.exe` 伪装图片 → `permanent` 拒绝，手机不重试、通知说明原因；
 13. **拒绝 UAC** → 托盘"修复防火墙规则"入口 + 诊断置顶；profile 切公用 → 全 profile 绑定
     规则仍可入站；
