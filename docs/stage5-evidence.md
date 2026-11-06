@@ -1164,6 +1164,149 @@ deviceDirName("../../etc") 拼出的路径 "...\\PhotoBeam\\etc-<fp8>" 逃出了
 - `TestDualPhoneDirsSeparate`：两台手机 → 不同设备目录，都在接收目录之下；
 - `TestDualPhoneSameImageBothStored`：两台手机传**同一张图** → 新幂等键不同 →
   第二台不命中 → **两台各存一份**；同设备重传 → 仍然幂等跳过。
+### 5.18 第十一轮：两端「检查更新」（Stage 11）
+
+**起因**：用户问「应用内部本身有更新渠道吗？」——实测答案是**完全没有**：
+两端连 HTTP 客户端都没有（`HttpURLConnection` / `OkHttp` / `net/http` 全部搜不到），
+协议 §10 也白纸黑字写着「M1 不做：……静默自更新（M3）」。
+
+项目已公开、已有 4 个 Release，但用户装完 v1.1.1 后**没有任何途径知道 v1.2 出了**。
+
+#### 5.18.1 版本号：VERSION 文件作为单一真源
+
+此前**两端都没有版本号机制**（AndroidManifest 没有 versionName，PC 端没有版本常量）。
+新增仓库根的 `VERSION` 文件，构建时注入两端：
+
+| 目标 | 注入方式 | 验证 |
+|---|---|---|
+| PC 端 exe | `go build -ldflags "-X main.appVersion=$VER"` | exe 二进制含 `1.2.0` ✓ |
+| Android 端 APK | `build-android.sh` 用 python 改写 manifest 的 `versionName`/`versionCode` | `aapt2 dump badging` → `versionName='1.2.0' versionCode='10200'` ✓ |
+| GitHub Release | tag `v<VERSION>` | v1.2.0 ✓ |
+
+三者由同一份 VERSION 派生 → 永远一致。
+
+#### 5.18.2 实现
+
+- **PC 端**（`pc/update.go`）：托盘「检查更新」→ 查 `api.github.com/repos/<repo>/releases/latest`
+  → 比对版本号 → 有新版给下载链接。**不自动下载/安装**（运行中 exe 被占用，且静默替换是安全反模式）。
+- **Android 端**（`android/.../Update.kt`）：⑨ 检查更新 → `HttpURLConnection`（**零新依赖**）
+  → 有新版给下载页（点开浏览器）。
+- **不做自动安装**：装 APK 需要 `REQUEST_INSTALL_PACKAGES` 权限（系统会显示
+  「允许此应用安装其他应用」的 scary 说明），国产 ROM 审核更严 → 收益不抵摩擦。
+- **离线可用**：查不到更新**不是错误** → 提示「可能访问不了 GitHub，PhotoBeam 本身不需要联网」。
+- **版本比对按数字段比较**：`1.10.0 > 1.9.0`（字符串比会判反）；段数不同缺失段按 0
+  （`1.2 == 1.2.0`）；预发布后缀比正式版旧（`1.2.0-beta < 1.2.0`）。
+  `pc/update_test.go` 覆盖这些用例。
+
+#### 5.18.3 实测（CI 产物）
+
+手机端点「⑨ 检查更新」：
+
+```
+已是最新版本
+当前版本 v1.2.0，没有新版本。
+```
+
+（本地是 v1.2.0、GitHub 最新是 v1.1.1 → 正确判定"无新版"。
+发布 v1.2.0 后，v1.1.1 的用户就会看到「有新版本：v1.2.0」。）
+
+GitHub API 实测：
+
+```
+最新 tag = v1.1.1
+assets  = PhotoBeam.apk, PhotoBeam.exe
+```
+
+#### 5.18.4 副作用
+
+- exe 体积 5.05MB → **7.62MB**（`net/http` + `crypto/tls` 带入）。可接受。
+- APK 体积基本不变（6.55MB → 6.56MB，`HttpURLConnection` 是系统自带）。
+
+### 5.19 第十二轮：目录选择复选框**点不动**（严重缺陷，已修）
+
+**用户实机反馈**：在新手机上装 APK 后，目录选择弹窗里**所有选项都无法勾选**
+——点文字、点方框都没反应。而红米上能正常同步。
+因为「默认空选 = 不同步任何图片」，这意味着**新用户装了根本没法用**。
+
+#### 5.19.1 根因（不是 ROM 差异，是实现缺陷）
+
+Stage 8 实现时用了 `setMessage` + `setMultiChoiceItems`，但实测 `setMessage` 会
+**覆盖掉**多选列表（Android AlertDialog 的既有行为），于是改成 `setView` + `ListView` +
+`ArrayAdapter` + `setOnItemClickListener`。**这个改法本身是坏的**：
+
+- `ListView.setItemChecked()` 设置的是「**ListView 选中项**」状态（单选高亮用），
+  **不是** `CheckedTextView` 的 checkmark；
+- `ArrayAdapter.getView()` **不知道** `checked[]` 数组 → 初始勾选状态画不出来；
+- 点击后只改了 ListView 选中态 → 勾选框纹丝不动。
+
+官方多选对话框内部用 `MultiChoiceViewHandler` 管这个映射，绕过它就 broken。
+（红米上能同步，是因为它装的是 Stage 8 之前的版本，用的是 `setMultiChoiceItems`。）
+
+#### 5.19.2 修法（4 处）
+
+1. **自写 `BaseAdapter`**：在 `getView()` 里把 `checked[]` 同步给 `CheckedTextView`
+   —— 这才是 `setItemChecked` 做不到的事；
+2. **补强焦点**：`simple_list_item_multiple_choice` 的根节点是 `CheckedTextView`，
+   它在 ListView 里默认可获焦 → **抢走点击事件** → `onItemClick` 不触发。
+   设 `isFocusable/isClickable = false`，点击统一交给 ListView；
+3. **`SharedPreferences` 集合副本**：`getStringSet` 返回 prefs **内部持有的** Set 引用，
+   `putStringSet` 同样持有传入集合的引用 → 直接改会抛 `ConcurrentModificationException`，
+   某些 ROM 上还会静默写坏存储。`selected()` / `save()` 都改存副本。
+4. **首次引导标记分离**：原逻辑里点「暂不选择」会标记 `sync_dirs_picked=true`
+   → 之后**永远不再弹引导** → 因为点不动而放弃的用户就再也进不来了。
+   改用独立的 `sync_guide_dismissed` 标记（用户明确关闭引导）与
+   `sync_dirs_picked`（用户主动保存过选择）解耦。
+
+另外补了个兜底：未选目录时点「③ 立即同步」→ 弹窗引导去选目录
+（原来只会默默显示「无可发送图片」，用户一头雾水）。
+
+#### 5.19.3 实测（CI 产物 APK，uiautomator 读 CheckedTextView 的 checked 属性）
+
+```
+点击前：
+  checked=true   DCIM/Screenshots（9 张）      ← 初始勾选状态正确渲染（修复前永远显示不出来）
+  checked=false  Pictures/<USER-DIR>（3 张）
+  ... 共 9 个
+
+点第一个之后：
+  checked=false  DCIM/Screenshots（9 张）      ← 点击真的取消了勾选（修复前"点了没反应"）
+  ...
+
+再点一次之后：
+  checked=true   DCIM/Screenshots（9 张）      ← 双向切换正常
+  ...
+```
+
+#### 5.19.4 附带清理：Received 目录里的旧结构照片
+
+v1.7 之前所有照片**完全拍平**在 `Received\` 根目录；v1.7 引入 `rel_path` 后按相册目录
+建子目录；v1.9 引入设备目录后再加一层。实测清点：
+
+```
+清理前：Received\ 下 97 个文件 / 39.6 MB
+  .tmp\                        0   （临时目录，保留）
+  <PHONE-MODEL>-<fp8>\         6   （v1.9 设备目录，保留）
+  Screenshots\                22   （v1.7 旧结构，删）
+  Camera\ / PBTest\ / PhotoBeamTest\  各 1（v1.7 旧结构，删）
+  根目录散落文件              66   （v1.7 之前拍平，删）
+```
+
+**删前逐张核对过**：把电脑端每个旧文件的原名与手机端 MediaStore 比对
+（91 个文件**手机端均无对应副本** → 确认是可删的测试遗留，手机端剩下的 26 张
+全是我测试时造的 `PhotoBeam_s*` / `u1` / `pb_probe.png`）。
+
+清理后：
+
+```
+Received\
+  .tmp\                        0
+  <PHONE-MODEL>-<fp8>\         6   （2.43 MB）
+```
+
+删除走 `mavis-trash`（回收站可恢复）。
+
+> **现状**：新同步的照片**全部**落在 `Received\<设备名>-<fp8>\<相册目录>\` 里，
+> 不会散落在外层（`resolveDeviceDir` 有二次逃逸检查兜底）。
 ## 6. 遗留
 
 1. ~~**计划任务看门狗**未实现~~ → **第五轮已用「隐藏监护进程」实现**（不需要注册系统计划任务、不需要提权）。
