@@ -124,7 +124,19 @@ class MediaStoreSync(
                         sawPendingRow = true
                         continue
                     }
-                    if (queue.discoveryLedger.containsKey(id)) { // 发现账本去重 [P0-08]
+                    // [Stage 14] 补传时**不能**用发现账本去重。
+                    //
+                    // 账本记的是「**发现过**」（Stage 8 之前的版本是全量扫描，
+                    // 手机上所有图都被记进去了），而不是「已成功发送」。
+                    // 实测（红米，2026-11-06）：Pictures/<USER-DIR> 的 3 张图
+                    // 早就在账本里（11-02 时代全量扫描时发现的），
+                    // 但它们**从未被发到电脑**（PC 端 Received 里根本没有该目录）
+                    // → 补传时被账本挡住，「新增 0」，补传开关形同虚设。
+                    //
+                    // 补传的语义是「把这些目录里已有的照片再传一遍」，
+                    // 已经传过的由 **PC 端的幂等键**（<设备指纹>:<内容 SHA-256>）
+                    // 去重，不会重复落盘 —— 多发的那点流量是可接受的代价。
+                    if (!backfill && queue.discoveryLedger.containsKey(id)) { // 发现账本去重 [P0-08]
                         if (id > upper && (pendingBarrier < 0 || id < pendingBarrier)) upper = id
                         continue
                     }

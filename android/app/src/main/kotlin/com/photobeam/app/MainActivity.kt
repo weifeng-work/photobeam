@@ -440,7 +440,8 @@ class MainActivity : Activity() {
         }
         container.addView(backfillBox)
         container.addView(TextView(this).apply {
-            text = "勾上会把这些文件夹里**已有的**照片也传一遍（可能很多、占流量）；" +
+            text = "勾上会把这些文件夹里已有的照片也传一遍（可能很多、占流量；" +
+                "手机上的待发队列满了会按先进先出丢掉一部分）；" +
                 "不勾则只传从现在起新增的照片。"
             textSize = 12f
             setPadding(0, 0, 0, pad)
