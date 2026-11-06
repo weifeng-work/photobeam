@@ -172,6 +172,35 @@ class QueueStore(private val ctx: Context) {
     @Synchronized
     fun unreadyCount(): Int = items.count { it.state == "pending" && it.fileId.isEmpty() }
 
+    /**
+     * [Stage 15] 清理「反复尝试仍读不出来」的僵尸项。
+     *
+     * 为什么要单独做一次（而不是等 flushQueue 的重试上限）：
+     * v1.2.2 及更早版本里，vivo 等 ROM 追加尾部元数据的截图**永远读不出来**，
+     * 于是几百个历史截图长期卡在队列里。本版修好读取判据后，它们会**立刻变成可读**
+     * → 如果不清掉，一次 flush 就会把它们**一次性全推给电脑** ——
+     * 正是用户在 v1.2.0 时代抱怨过的「意外全量」。
+     *
+     * 判据用 unreadyTries：这批僵尸项在旧版本下已经被反复尝试过很多轮
+     * （unreadyTries 很大），而正常的新项恒为 0 → 不会误伤。
+     *
+     * 一次性：靠 prefs 标记（PREFS_QUEUE_PURGED），只在升级后首次运行执行。
+     * 被清掉的图用户仍可随时用「同时补传已有照片」主动传。
+     */
+    @Synchronized
+    fun purgeStuckUnreadable(threshold: Int): Int {
+        var n = 0
+        for (it in items) {
+            if (it.state == "pending" && it.unreadyTries >= threshold) {
+                it.state = "dropped"
+                it.dropReason = "stuck_unreadable"
+                n++
+            }
+        }
+        if (n > 0) save()
+        return n
+    }
+
     @Synchronized
     fun prune() {
         // 账本清理 [R-08]：仅保留最近 30 天

@@ -102,26 +102,70 @@ object Sender {
         }
     }
 
-    /** 图片内容完整性：JPEG SOI…EOI / PNG 头…IEND；两者都不是 → 未完成 */
+    /**
+     * 图片内容完整性：JPEG SOI…EOI / PNG 头…IEND；两者都不是 → 未完成
+     *
+     * [Stage 15 · vivo 兼容] 判据从「末尾 8 字节内必须紧邻 EOI」改成
+     * 「**文件里存在 EOI/IEND，且其后附加数据不超过限额**」。
+     *
+     * 为什么原来那样写：MIUI 会在截图**还没写完**时就插入 MediaStore 行，
+     * 而 MediaStore 记录的 size 就是当时写到的长度 → **纯长度比对拦不住**
+     * （实测截断到 130126/160387 的文件长度完全一致），只有内容判据能拦，
+     * 否则用户会在电脑上粘贴出半截图。所以「内容完整」这一条必须保留。
+     *
+     * 为什么原来那样写会误杀：原实现假设「文件尾部就是图片结束」，
+     * 只在**末尾 8 字节内**找 EOI。而部分 ROM 会在图片后面**追加私有数据**：
+     *   vivo 智慧截图实测在 JPEG 的 EOI 之后追加 265 字节
+     *   （b'vivo{"com.vivo.smartshot.screenshot.scen...cameraAlbum!'）
+     *   → 末尾 8 字节是 "eralbum!"，没有 EOI → **每一张 vivo 截图都被判为
+     *   「内容不完整」→ 永远读不出来 → 僵尸项占满队列 → 新截图发不出去**。
+     *
+     * 新判据同时满足两边：
+     *   · 截断文件（写到一半）→ **根本没有 EOI** → 仍然被拦住 ✓
+     *   · vivo 追加元数据 → EOI 存在 + 尾部附加 265B ≤ 限额 → 放行 ✓
+     * 尾部附加数据上限取 1MB：正常 JPEG 的 EOI 就是最后一个标记，
+     * 后面顶多跟一点元数据；超过 1MB 仍判为异常。
+     */
     private fun completeImage(data: ByteArray): Boolean {
         if (data.size < 8) return false
         val jpegMagic = (data[0].toInt() and 0xFF) == 0xFF && (data[1].toInt() and 0xFF) == 0xD8
         val pngMagic = (data[0].toInt() and 0xFF) == 0x89 && data[1] == 'P'.code.toByte()
         if (pngMagic) {
-            val n = data.size
-            return n >= 8 && data[n - 8] == 'I'.code.toByte() && data[n - 7] == 'E'.code.toByte() &&
-                data[n - 6] == 'N'.code.toByte() && data[n - 5] == 'D'.code.toByte()
+            // IEND(4 字节) + CRC(4 字节) = 8 字节；找**最后一个** IEND
+            val idx = lastIndexOf(data, PNG_IEND)
+            if (idx < 0) return false
+            return data.size - (idx + 8) <= MAX_TRAILER
         }
         if (jpegMagic) {
-            // EOI(FF D9)，容忍末尾少量 padding（实测 MIUI 无，但扫描 8 字节更稳）
-            var i = data.size - 2
-            while (i >= data.size - 8 && i >= 0) {
-                if ((data[i].toInt() and 0xFF) == 0xFF && (data[i + 1].toInt() and 0xFF) == 0xD9) return true
-                i--
-            }
-            return false
+            // EOI = FFD9；找**最后一个**
+            val idx = lastIndexOf(data, JPEG_EOI)
+            if (idx < 0) return false
+            return data.size - (idx + 2) <= MAX_TRAILER
         }
         return false
+    }
+
+    /** 尾部附加数据上限（字节）—— 见 completeImage 的说明 */
+    private const val MAX_TRAILER = 1024 * 1024
+
+    private val JPEG_EOI = byteArrayOf(0xFF.toByte(), 0xD9.toByte())
+    private val PNG_IEND = byteArrayOf('I'.code.toByte(), 'E'.code.toByte(),
+        'N'.code.toByte(), 'D'.code.toByte())
+
+    /** 找标记的**最后一次**出现位置（-1 = 没有） */
+    private fun lastIndexOf(data: ByteArray, needle: ByteArray): Int {
+        val n = needle.size
+        if (data.size < n) return -1
+        var i = data.size - n
+        while (i >= 0) {
+            var hit = true
+            for (j in 0 until n) {
+                if (data[i + j] != needle[j]) { hit = false; break }
+            }
+            if (hit) return i
+            i--
+        }
+        return -1
     }
 
     /** 传输单张图（连接与握手已由 flushQueue 建立独立链路）[协议 §5] */

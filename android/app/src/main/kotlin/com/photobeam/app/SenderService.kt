@@ -39,6 +39,17 @@ class SenderService : Service() {
          *  与 ACTION_SYNC_NOW 的区别：这次对账**忽略全局 _id 水位**
          *  （历史图的 _id ≤ 水位，正常增量路径扫不到它们）。 */
         const val ACTION_BACKFILL = "photobeam.backfill"
+
+        /** [Stage 15] 未就绪项的最大重试轮数（30 秒一轮 → 20 轮 ≈ 10 分钟）。
+         *  超过就跳过，不再永久占住队列位置（见 flushQueue 里的说明）。 */
+        const val UNREADY_MAX_TRIES = 20
+
+        /** [Stage 15] 升级后一次性清理「僵尸项」的门槛（unreadyTries ≥ 此值即视为卡死）。
+         *  只在 v1.2.3 升级后的**首次**运行执行（见 queue_purged 标记）。 */
+        const val STUCK_PURGE_THRESHOLD = 10
+
+        /** [Stage 15] 僵尸清理的一次性标记（prefs key） */
+        const val PREFS_QUEUE_PURGED = "queue_purged_v1215"
     /** [Stage 10] 只取回 PC 端分配给本机的落盘目录名（dev_dir）——不触发对账/发送。
      *  用于：PC 端升级后（新增 dev_dir 字段）手机端还没存过 → 主动取一次，
      *  用户就能在界面看到「我的照片在电脑：xxx」。 */
@@ -275,6 +286,23 @@ class SenderService : Service() {
         // 不记住就会每次都去试 → 又触发系统对同 id 通知的异步取消 → 图标闪没。
         fgsDenied = try { prefs.getBoolean("fgs_denied", false) } catch (e: Exception) { false }
         queue = QueueStore(this).also { it.load() }
+        // [Stage 15] 升级后**一次性**清理僵尸项：在修好读取判据之前卡在队列里、
+        // 反复尝试仍读不出来的历史项（unreadyTries 很大）。
+        // 不清的话，本次升级后它们会立刻变成可读 → 一次性全推给电脑
+        // （= 用户在 v1.2.0 时代抱怨过的「意外全量」）。
+        // 判据 unreadyTries ≥ 10：正常项恒为 0，不会误伤；被清掉的图
+        // 用户随时可用「同时补传已有照片」主动传。
+        try {
+            if (!prefs.getBoolean(PREFS_QUEUE_PURGED, false)) {
+                val purged = queue.purgeStuckUnreadable(STUCK_PURGE_THRESHOLD)
+                prefs.edit().putBoolean(PREFS_QUEUE_PURGED, true).apply()
+                if (purged > 0) {
+                    android.util.Log.w("PhotoBeam", "升级清理僵尸项：$purged 个（曾反复读取失败）")
+                }
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("PhotoBeam", "僵尸清理失败: ${e.message}")
+        }
         IdentityKeys.loadOrCreate(prefs)
         pairing = PairingEngine(prefs, IdentityKeys.loadOrCreate(prefs), android.os.Build.MODEL)
         sync = MediaStoreSync(this, queue) {
@@ -850,6 +878,26 @@ class SenderService : Service() {
                             it.dropReason = "uri_dead"
                             queue.save()
                             android.util.Log.w("PhotoBeam", "URI 已失效，丢弃: ${it.name} (unready=${it.unreadyTries})")
+                            Notifier.localDropped(applicationContext, it.name)
+                            continue
+                        }
+                        // [Stage 15] 连续多轮都读不出来 → **不再永久占住队列位置**。
+                        //
+                        // 为什么必须加这一条：协议 §7.3「未就绪永不丢弃」是为了防住
+                        // MIUI 截图写入中途的**短暂**不可读；但「永远读不出来」的项
+                        // （文件损坏 / 被加密 / ROM 追加了无法识别的数据）会**无限期**
+                        // 占着队列，而 flush 是按 capturedAt 排序的（老图在前）→
+                        // 几百个僵尸项会把**新截图挤到最后，永远发不出去**。
+                        // 实测（vivo <PHONE-MODEL>）：队列被 355 个读不出来的老截图占满，
+                        // 新截图始终传不出去。
+                        //
+                        // 20 轮 × 30 秒 ≈ 10 分钟，远长于任何正常的写入耗时。
+                        if (it.unreadyTries >= UNREADY_MAX_TRIES) {
+                            it.state = "dropped"
+                            it.dropReason = "unreadable"
+                            queue.save()
+                            android.util.Log.w("PhotoBeam",
+                                "反复读取失败(${it.unreadyTries} 轮)，跳过: ${it.name}")
                             Notifier.localDropped(applicationContext, it.name)
                             continue
                         }
