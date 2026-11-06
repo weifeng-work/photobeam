@@ -153,21 +153,32 @@ class MainActivity : Activity() {
      * force-stop 后重进 → topResumedActivity = PhotoPickerUserSelectActivity。
      *
      * 现在：
-     *   · READ_MEDIA_IMAGES 已授予（全量）→ 不再请求它，
-     *     也**不请求 VISUAL_USER_SELECTED**（那个只在要走「部分照片」路径时才要带上）
-     *   · 未授予 → 请求 READ_MEDIA_IMAGES；SDK 34+ 时带上 VISUAL_USER_SELECTED
+     *   · **全量授权** → 不请求任何照片权限 → **系统不会弹任何东西** ✓
+     *   · **完全没授权**（首次安装）→ 请求 READ_MEDIA_IMAGES（SDK 34+ 带上
+     *     VISUAL_USER_SELECTED）→ 弹系统的三态选择器，这是期望行为 ✓
+     *   · **部分授权**（用户只放行了部分照片）→ **不自动请求**：系统的 photo picker
+     *     在这种状态下每次冷启动都会弹；状态区已有明确提示，想改成全量的用户
+     *     主动点 ① 即可（那处仍用固定列表，弹对话框是期望行为）。
      *   · 通知权限没授予 → 才申请
-     * 全部都已授予 → 一个都不申请 → **系统不会弹任何东西**。
      */
     private fun pendingPermissions(): Array<String> {
         val out = mutableListOf<String>()
-        if (checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES)
-            != PackageManager.PERMISSION_GRANTED) {
+        val imagesGranted = checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES)
+            == PackageManager.PERMISSION_GRANTED
+        // 部分授权（Android 14+ 三态里的中间态）：用户只放行了部分照片
+        val selectedGranted = Build.VERSION.SDK_INT >= 34 &&
+            checkSelfPermission(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED)
+            == PackageManager.PERMISSION_GRANTED
+        if (!imagesGranted && !selectedGranted) {
+            // **完全没授权** → 必须申请（否则 App 一张图都拿不到）
             out.add(Manifest.permission.READ_MEDIA_IMAGES)
             if (Build.VERSION.SDK_INT >= 34) {
                 out.add(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED)
             }
         }
+        // 部分授权（PARTIAL）时**不自动申请** —— 系统 photo picker 会每次冷启动都弹，
+        // 而状态区已有明确提示（「⚠ 仅授权了部分照片 → 点 ① 改为允许访问所有照片」），
+        // 想改成全量的用户主动点 ① 即可（那处仍用固定列表，弹对话框是期望行为）。
         if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
             != PackageManager.PERMISSION_GRANTED) {
             out.add(Manifest.permission.POST_NOTIFICATIONS)
