@@ -17,6 +17,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 )
@@ -174,5 +175,29 @@ func TestCheckForUpdateRequiresVersion(t *testing.T) {
 	}
 	if called {
 		t.Error("版本号为空时不应发起网络请求")
+	}
+}
+
+// TestLiveUpdateCheckAgainstRealGitHub：对**真实** GitHub 的端到端验证（默认跳过）。
+//
+// 为什么要单独一条：上面的用例都跑在 mock 上，能证明「降级逻辑写对了」，
+// 但证明不了「真实 GitHub 当前的响应形态能被降级路径接住」。
+// 2026-11-06 实测 GitHub 匿名 API 处于限流状态（core.remaining=0，
+// releases/latest 返回 403），正是这条路径的真实触发条件。
+//
+// 运行：cd pc && PB_LIVE_NET=1 go test -run TestLiveUpdate -v
+// CI 不跑（网络波动会让 CI 变红），本地手动开。
+func TestLiveUpdateCheckAgainstRealGitHub(t *testing.T) {
+	if os.Getenv("PB_LIVE_NET") != "1" {
+		t.Skip("跳过真实网络测试（设 PB_LIVE_NET=1 开启）")
+	}
+	// 注意：这里**不覆盖** updateAPI / releaseURL —— 用生产常量，才是真验证。
+	info := checkForUpdate("1.2.1")
+	t.Logf("Err=%v Latest=%q HasNew=%v PageURL=%s", info.Err, info.Latest, info.HasNew, info.PageURL)
+	if info.Err != nil {
+		t.Fatalf("真实网络下检查更新失败（降级没兜住）: %v", info.Err)
+	}
+	if info.Latest == "" {
+		t.Fatal("真实网络下没取到版本号")
 	}
 }

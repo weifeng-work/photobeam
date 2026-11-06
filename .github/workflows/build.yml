@@ -40,6 +40,14 @@ jobs:
           if (-not (Test-Path $rsrc)) { throw "rsrc 未就位：$rsrc" }
           Write-Output "rsrc 就位：$rsrc"
 
+      # 单元测试（守门人）——放在构建**之前**：测试红了就别浪费时间构建产物。
+      # 覆盖：目录保留/路径穿越(pc/relpath_test.go)、幂等键与设备目录(pc/devdir_*.go)、
+      # 版本比对与**更新限流降级**(pc/update*_test.go)、剪贴板关键路径性能(pc/clipboard_perf_test.go)。
+      - name: 单元测试
+        shell: pwsh
+        run: |
+          go test -count=1 -timeout 10m ./...
+
       - name: 构建 PhotoBeam.exe
         shell: pwsh
         run: |
