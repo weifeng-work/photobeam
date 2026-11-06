@@ -1726,6 +1726,83 @@ W PhotoBeam: 升级清理僵尸项：143 个（曾反复读取失败）
   其他厂商 ROM 上。判据已改成「找标记」而不是「末尾必须紧邻标记」，对这类行为通用。
 - Android 端仍**没有自动化单测**（项目未引入测试框架）：本轮的判据验证靠
   「真机拉文件 + 离线复算 + 真机端到端」三段式，CI 跑不到。
+### 5.24 第十六轮：全量授权的用户每次冷启动都被弹系统照片选择器（Stage 16）
+
+**起因**：用户 2026-11-06 反馈（vivo <PHONE-MODEL>）：
+
+> 如果我杀掉这个APK的进程，然后我重新进去，它就默认会弹出「选择允许此应用访问的照片和视频」，
+> 这是怎么回事？这个当然只是体验上的问题，但是如果能查清楚改掉它就最好。
+
+#### 5.24.1 复现与定位
+
+```
+force-stop com.photobeam.app → am start MainActivity
+→ topResumedActivity = com.android.providers.media.photopicker.PhotoPickerUserSelectActivity
+```
+
+这台手机 `READ_MEDIA_IMAGES: granted=true`（**全量授权**），所以「系统没给权限」
+不是原因。看代码 → `MainActivity.onCreate` 里：
+
+```kotlin
+private val needed: MutableList<String> = mutableListOf(
+    Manifest.permission.READ_MEDIA_IMAGES,
+    Manifest.permission.POST_NOTIFICATIONS
+).also {
+    if (Build.VERSION.SDK_INT >= 34) it.add(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED)
+}
+...
+requestPermissions(needed.toTypedArray(), 100)   // ← onCreate 里无条件调用
+```
+
+**根因**：Android 14+ 上**请求 `READ_MEDIA_VISUAL_USER_SELECTED` 会走系统的
+photo picker 流程**（就是那个「选择允许此应用访问的照片和视频」的 Activity）。
+而 `needed` 在 SDK 34+ **恒含**这个权限，onCreate 又**无条件**申请
+→ 即使 `READ_MEDIA_IMAGES` 已经是 granted，每次冷启动仍会被弹一次。
+用户连自己的界面都看不到。
+
+（这个 API 的设计意图是：申请它 = 请用户在系统照片选择器里挑一部分授权。
+已经是全量授权时再去申请它，系统仍会走 picker 流程。）
+
+#### 5.24.2 修法：按**当前实际状态**算「还缺哪些权限」
+
+新增 `pendingPermissions()`，onCreate 只申请真的还缺的：
+
+| 授权状态 | 行为 |
+|---|---|
+| **全量**（`READ_MEDIA_IMAGES` granted） | 不请求任何照片权限 → **系统不弹任何东西** ✓ |
+| **完全没授权**（首次安装） | 请求 `READ_MEDIA_IMAGES`（SDK 34+ 带上 `VISUAL_USER_SELECTED`）→ 弹系统三态选择器，**期望行为** ✓ |
+| **部分授权**（只放行了部分照片） | **不自动请求** → 状态区已有提示「⚠ 仅授权了部分照片 → 点 ① 改为允许访问所有照片」，想改的用户主动点 ① ✓ |
+
+① 按钮（用户主动点「重新申请照片与通知权限」）**仍用原来的固定列表** ——
+用户就是想改权限，此时弹系统对话框是期望行为。
+
+#### 5.24.3 实测（v1.2.4，同一台 vivo <PHONE-MODEL>）
+
+```
+force-stop → am start MainActivity
+  topResumedActivity = com.photobeam.app/.MainActivity     ✓ 直接进自己的界面
+再冷启动一次（确认不是偶然）
+  topResumedActivity = com.photobeam.app/.MainActivity     ✓
+```
+
+之前“赖在不退掉”的那个 PhotoPicker task 也一并消失了
+（安装新包会重启任务栈）。
+
+同步功能回归：同一台手机上用 vivo 截屏按键造的 JPEG
+（尾部带 294 字节 vivo 元数据）照常同步到电脑，
+字节数与手机端完全一致 ✓
+
+#### 5.24.4 连带修的一个编译错误
+
+改这一段时踩了 Kotlin 的换行陷阱：`==` **前面**换行会把表达式截断
+（`checkSelfPermission(...)` 换行后接 `== PackageManager.PERMISSION_GRANTED`
+→ Kotlin 认为前者结束 → `Int` vs `Boolean` 类型不匹配）。
+必须加括号把整个比较括起来。
+
+> 教训：这是本项目**第一次**在 Kotlin 侧把编译不过的代码推上远端
+> （提交命令里类型检查失败但 commit 仍继续执行）。后续在提交前加了
+> `if ($LASTEXITCODE -ne 0) { exit 1 }` 守卫 —— 校验不通过就不提交。
+> CI 立刻把这个错误抓了出来（红了一轮），修复后转绿。
 ## 6. 遗留
 
 1. ~~**计划任务看门狗**未实现~~ → **第五轮已用「隐藏监护进程」实现**（不需要注册系统计划任务、不需要提权）。
