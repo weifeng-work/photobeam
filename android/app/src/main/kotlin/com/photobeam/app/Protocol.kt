@@ -1,6 +1,6 @@
 package com.photobeam.app
 
-// PhotoBeam 协议实现（Kotlin 端）— 依据 docs/protocol-v1.md v1.2
+// PhotoBeam 协议实现（Kotlin 端）— 依据 docs/protocol-v1.md v1.9
 // 平台要求：Android 13 (API 33)+。Ed25519/X25519 均为 BouncyCastle rfc8032/rfc7748 裸字节实现（
 // 避免 Conscrypt XDH generateSecret 的端序歧义与 Go 端不对拍的风险）
 
@@ -338,8 +338,12 @@ class PairingEngine(
     }
 
     fun clearPairedPC() {
+        // [修复] 清干净**全部**配对相关键：pc_dev_dir / pc_paired_at / net_fp 一并清，
+        // 否则一旦接线（解绑 / 重新配对）会在 prefs 里留下脏数据（旧落盘目录名、
+        // 旧配对时间、旧网络指纹都会误导 UI 与「换网判定」）。
         prefs.edit().remove("pc_fp").remove("pc_edpub").remove("pc_name")
-            .remove("pc_ip").remove("pc_port").commit()
+            .remove("pc_ip").remove("pc_port").remove("pc_dev_dir")
+            .remove("pc_paired_at").remove("net_fp").commit()
     }
 
     /**
@@ -347,13 +351,19 @@ class PairingEngine(
      * pairing 模式下，本函数发送 pair_confirm 前会回调 [sasConfirm]
      * （返回 SAS_CONFIRM / SAS_REJECT / SAS_TIMEOUT 三态）。
      *
+     * [协议 §3.2 [R-13][R-14]] [sasConfirm] 的第三个参数 `wasPinned`：
+     * true = 本端**已 pin 过这台 PC**（prefs 里有 pc_fp），但 PC 回的 MODE 是
+     * `pairing` —— 即「PC 的配对记录已被重置」（在 PC 上点过「重新配对」/清了
+     * devices.json）。此时对话框必须追加提示，用户确认后才覆盖旧信任密钥。
+     * 首次配对（wasPinned=false）不需要这句。
+     *
      * [Stage 5 第五轮] 回调多带一个 **peerName**（对端电脑名，来自对端 HELLO 的 dev_name）：
      * 用户要能核对「对面那台电脑是不是我的电脑」——这在同一个局域网里跑着多对
      * PhotoBeam 用户时是唯一可靠的锚点（C1）。
      */
     fun handshake(
         sock: Socket,
-        sasConfirm: (sas: String, peerName: String) -> Int,
+        sasConfirm: (sas: String, peerName: String, wasPinned: Boolean) -> Int,
         allowPairing: Boolean = true
     ): HandshakeResult {
         val inp = sock.getInputStream()
@@ -404,8 +414,20 @@ class PairingEngine(
         }
 
         dbg("MODE 已收: mode=$mode err=${modeObj.optJSONObject("err")}")
+        // [协议 §3.2 [R-13]] reset=true = PC 侧曾清除过本机的配对记录（点了「重新配对」/
+        // 清了 devices.json）。协议只要求「记日志 + 触发确认提示」，故这里只打日志；
+        // 触发条件用 known!=null（无论 reset）——见下面 pairing 分支的 wasPinned。
+        if (modeObj.optBoolean("reset", false)) {
+            dbg("PC 报告 reset=true：本机在电脑端的配对记录曾被清除")
+        }
         // 4) 密钥协商 [N-01]：shared = X25519(本端临时私钥, 对端临时公钥)
         val shared = X25519.shared(eph, peerEphRaw)
+        // [协议 §3 低阶点防护] 对端临时公钥若是低阶点（如全零），X25519 会算出**全零**共享密钥。
+        // 正常对端不可能给出这种结果 → 按协议违规处理：断开 + 日志（调用方会 close socket）。
+        if (shared.all { it == 0.toByte() }) {
+            dbg("X25519 shared 全零（对端临时公钥为低阶点）→ 协议违规，断开")
+            throw java.io.IOException("密钥协商失败：对端临时公钥无效（共享密钥全零）")
+        }
         val sessionKey = hkdf(shared, myNonce + peerNonce,
             "photobeam-session-v1".toByteArray(), 32)
         // SAS salt（发送方视角）：sender_eph‖receiver_eph‖sender_nonce‖receiver_nonce
@@ -434,7 +456,12 @@ class PairingEngine(
             // 超时**不发 pair_reject**——pair_reject 的语义是「用户明确拒绝」，
             // 把「用户没来得及看」也当成拒绝，会让 PC 端记成「手机端拒绝配对」并弹错提示。
             // 超时只静默断开，由 PC 自己的 60 秒定时器收尾并提示「配对超时」。
-            when (sasConfirm(sas, peerHello.optString("dev_name", ""))) {
+            //
+            // [协议 §3.2 [R-13][R-14]] 第三个参数 wasPinned = 本端**已 pin 过这台 PC**，
+            // 但 PC 却回 pairing（= 它的配对记录被重置了）→ 对话框要追加确认文案。
+            // 首次配对（known==null）不提示。reset 字段无论真假都以 known 为准（协议原文
+            // 「Sender 已 pin 该 PC 但 mode=pairing（无论 reset）」）。
+            when (sasConfirm(sas, peerHello.optString("dev_name", ""), known != null)) {
                 SAS_CONFIRM -> {
                     ch.writeFrame(out, FRAME_CTRL, org.json.JSONObject()
                         .put("type", "pair_confirm")

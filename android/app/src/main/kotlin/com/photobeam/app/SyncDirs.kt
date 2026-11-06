@@ -225,40 +225,36 @@ object SyncDirs {
     }
 
     /**
-     * 判断某个 relative_path 是否落在已选目录内（前缀匹配）。
-     * 空选 → 一律 false（什么都不同步）。
-     */
-    fun isSelected(ctx: Context, relPath: String): Boolean {
-        val sel = selected(ctx)
-        if (sel.isEmpty()) return false
-        val norm = relPath.trim('/')
-        if (norm.isEmpty()) return false
-        for (s in sel) {
-            if (norm == s) return true
-            // 前缀匹配：选中 DCIM/Camera → DCIM/Camera/Sub 也算
-            if (norm.startsWith("$s/")) return true
-        }
-        return false
-    }
-
-    /**
      * 生成 SQL 的目录过滤条件（用于 MediaStore 查询）。
-     * 返回 null = 无需过滤（未启用筛选时）；返回空集合 = 不允许任何目录。
+     * 返回 null = 无需过滤（未启用筛选时——此时调用方直接返回，不同步任何东西）；
+     * 返回 `Pair(SQL, args)`：首元素是带 `?` 占位符的 SQL，次元素是对应的 selectionArgs。
      *
      * [Stage 14] 每个目录分支各带各的 `_id > 起点`：
      *   起点 = 该目录被选中那一刻的全局最大 _id → 该目录的历史图不补传；
      *   起点 = 0（补传模式）→ 该目录的历史图照传。
+     *
+     * [修复 · SQL 语法错误导致全站停摆] 旧实现字符串拼接
+     * `relative_path LIKE '$esc/%'`，只转义了 LIKE 通配符 `\ % _`，**没转义单引号**：
+     * 目录名带 `'`（如 `Bob's pics`）→ 整条 SQL 语法错误 → reconcile 查询抛异常，
+     * 被 MediaStoreSync 的 catch 吞掉只打 warn → 采集恒 0，用户只看到「待发送 0 张」
+     * 却没有任何线索。改为**参数化**：SQL 里用 `?` 占位符，值经 selectionArgs 传，
+     * 引号不再进 SQL；`$esc/%` / `$esc/` / 起点作为参数传出。
      */
-    fun buildSelectionSql(ctx: Context): String? {
+    fun buildSelectionSql(ctx: Context): Pair<String, List<String>>? {
         val sel = selected(ctx)
-        if (sel.isEmpty()) return null   // 空选 → 查不到任何东西（下面特殊处理）
+        if (sel.isEmpty()) return null   // 空选 → 查不到任何东西（调用方特殊处理）
         val starts = startIds(ctx)
+        val args = ArrayList<String>()
         val ors = sel.joinToString(" OR ") { s ->
-            // 转义 LIKE 的通配符（目录名里可能有 % 或 _）
+            // 只转义 LIKE 通配符（目录名里可能有 % 或 _）；单引号等由 selectionArgs 兜住
             val esc = s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             val start = starts[s] ?: 0L
-            "((relative_path LIKE '$esc/%' ESCAPE '\\' OR relative_path = '$esc/') AND _id > $start)"
+            // 参数顺序必须与 SQL 里占位符顺序一致
+            args.add("$esc/%")
+            args.add("$esc/")
+            args.add(start.toString())
+            "((relative_path LIKE ? ESCAPE '\\' OR relative_path = ?) AND _id > ?)"
         }
-        return ors
+        return Pair(ors, args)
     }
 }

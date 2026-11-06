@@ -73,11 +73,19 @@ object Notifier {
     /**
      * 本端丢弃：MediaStore 行已被删除，该图永远无法再发送 [协议 §7.3]。
      * 与「被电脑拒绝」区分开——这一张不是电脑不要，是它自己已经不存在了。
+     *
+     * [修复] 必须区分丢弃原因：completeImage 现在支持 7 种格式，但文件损坏/被截断/
+     * 被加密等「读不出来」的情况此前统一报「相册里已不存在该图片」——用户看到的
+     * 提示与事实不符（图明明还在）。reason = "unreadable" 时如实说明读不出来。
      */
-    fun localDropped(ctx: Context, name: String) {
+    fun localDropped(ctx: Context, name: String, reason: String = "uri_dead") {
+        val detail = when (reason) {
+            "unreadable" -> "文件反复读取失败（可能已损坏/未写完/被加密），已跳过"
+            else -> "相册里已不存在该图片，已跳过"
+        }
         channel(ctx).notify(103, android.app.Notification.Builder(ctx, CH_EVENTS)
             .setContentTitle("一张图片已失效")
-            .setContentText("$name：相册里已不存在该图片，已跳过（不影响其他图片）")
+            .setContentText("$name：$detail（不影响其他图片）")
             .setSmallIcon(android.R.drawable.stat_notify_error).build())
     }
 
@@ -637,7 +645,6 @@ class MainActivity : Activity() {
     // ---------- 状态区 ----------
 
     private fun refreshStatus() {
-        val paired = prefs.getString("pc_name", null)
         // [Stage 14 · 缺陷修复] **必须重新读盘**再算待发送数。
         //
         // MainActivity 持有的 queue 与 SenderService 里的 queue 是**两个独立实例**
@@ -648,8 +655,20 @@ class MainActivity : Activity() {
         //
         // load() 读的是原子 rename 过的完整文件，不会读到半截；
         // 它把 "sending" 复位成 "pending" 只作用于本副本（本类不写盘），无副作用。
-        queue.load()
-        val pending = queue.pendingCount()
+        //
+        // [修复] 读盘+JSON 解析**不能在 UI 线程**：⑨/队列广播/500ms 轮询都会触发，
+        // 而 SenderService 每发一张 save() 一次（200 张 = 200 次全量序列化 + UI 刷新）
+        // → 补传 200 张时明显掉帧。改为后台线程读、回主线程回填。
+        Thread {
+            try { queue.load() } catch (e: Exception) { }
+            val pending = queue.pendingCount()
+            runOnUiThread { renderStatus(pending) }
+        }.start()
+    }
+
+    /** [修复] refreshStatus 的 UI 部分（必须在主线程执行） */
+    private fun renderStatus(pending: Int) {
+        val paired = prefs.getString("pc_name", null)
         val mode = prefs.getString("icon_mode", null) ?: SenderService.iconMode
         // [修复 2026-11-02 v2] 电池优化白名单状态：
         // 实测（MIUI 13）加入 deviceidle 白名单后，
@@ -871,15 +890,29 @@ class MainActivity : Activity() {
             // [Stage 5 第五轮] PC 明确拒绝（H）/ 对方断开
             var peerRejected = false
             var peerRejectReason: String? = null
+            // [修复] 配对连接必须关闭：旧实现在成功/异常/超时路径都不 close()
+            // → PC 侧要等 45 秒帧超时才清连接（server.go 的 messageLoop 读超时），
+            // 反复配对/重试会累积 PC 端的连接协程与日志噪音。
+            var pairSock: java.net.Socket? = null
             try {
                 // 手工填的 IP 优先；没填就用上次记录里的
                 val lastIP = manualIP?.takeIf { it.isNotBlank() }
                     ?: prefs.getString("pc_ip", null)
                 val lastPort = prefs.getInt("pc_port", 0)
+                // [修复] 手动填 IP 的兜底必须**真直连**：Discovery.resolve 的通道①要求
+                // 历史端口合法（`knownPort in TCP_BASE..TCP_MAX`），首次配对时 pc_port=0
+                // → 通道①被直接跳过，退回被 AP 隔离挡住的广播/单播 → 兜底失败。
+                // 而「公司/学校 AP 隔离、跨 VLAN、首次配对」恰是最需要手动 IP 的场景。
+                // 这里不依赖历史端口：对 5416..5436 顺序 TCP connect，连上即用。
+                var manualSock: java.net.Socket? = null
+                if (!manualIP.isNullOrBlank()) {
+                    manualSock = tryDirectConnect(manualIP)
+                }
                 // [Stage 5 修正] 把已配对 PC 的指纹一并传下去：同一局域网里可能有多台
                 // PhotoBeam PC，靠指纹才能分清「自己那台」和「别人的那台」。
-                val pc = Discovery.resolve(this, lastIP, lastPort, prefs.getString("pc_fp", null))
-                if (pc == null) {
+                val pc = if (manualSock != null) null
+                         else Discovery.resolve(this, lastIP, lastPort, prefs.getString("pc_fp", null))
+                if (manualSock == null && pc == null) {
                     runOnUiThread {
                         statusView.text = "未发现电脑。\n请确认：手机与电脑连同一个 WiFi；" +
                             "电脑端 PhotoBeam 正在运行。\n（也可以在上面直接填电脑的 IP 再点 ②）"
@@ -887,15 +920,19 @@ class MainActivity : Activity() {
                     return@Thread
                 }
 
-
-                runOnUiThread { statusView.text = "已发现 ${pc.name.ifEmpty { pc.ip }}，正在配对…" }
+                runOnUiThread {
+                    statusView.text = if (manualSock != null) "已直连 ${manualIP}，正在配对…"
+                                      else "已发现 ${pc!!.name.ifEmpty { pc.ip }}，正在配对…"
+                }
 
                 val engine = PairingEngine(prefs, IdentityKeys.loadOrCreate(prefs), Build.MODEL)
-                val sock = java.net.Socket()
-                sock.tcpNoDelay = true
-                sock.connect(java.net.InetSocketAddress(pc.ip, pc.port), 3000)
+                val sock: java.net.Socket = manualSock ?: java.net.Socket().also {
+                    it.tcpNoDelay = true
+                    it.connect(java.net.InetSocketAddress(pc!!.ip, pc!!.port), 3000)
+                }
+                pairSock = sock
                 sock.soTimeout = 90_000
-                val res = engine.handshake(sock, sasConfirm = { sas, peerName ->
+                val res = engine.handshake(sock, sasConfirm = { sas, peerName, wasPinned ->
                     // UI 线程弹 SAS 比对对话框，同步等待用户确认
                     // [Stage 5 修订] 等待上限 15s → 60s：人眼核对 6 位数字再点按钮，15s 不够
                     //（实测首轮验收时手机端因等待超时直接发出了 pair_reject）。
@@ -943,6 +980,10 @@ class MainActivity : Activity() {
                             // [C1] 带上**对方电脑名**：同一局域网里可能跑着别人的 PhotoBeam，
                             // 用户要能核对「对面那台是不是我的电脑」。
                             .setMessage("对方电脑：${peerName.ifEmpty { "（名称未知）" }}\n\n" +
+                                // [协议 §3.2 R-13] 本端已 pin 过这台电脑却收到 pairing
+                                // = 电脑端的配对记录被重置（用户点了「重新配对」/清过设备）。
+                                // 必须明确提示：确认后将更新信任密钥。
+                                (if (wasPinned) "注意：该电脑的配对记录已被重置，确认后将更新信任密钥。\n\n" else "") +
                                 "电脑屏幕与手机应显示相同的 6 位数字：\n\n$sas\n\n" +
                                 "两端一致请点『一致』；不一致请点『不一致』。\n" +
                                 "（60 秒内未确认会自动取消）")
@@ -980,6 +1021,14 @@ class MainActivity : Activity() {
                     peerRejectReason = res.versionErr
                 } else {
                 // 设备记录已在 PairingEngine.handshake 内部持久化（协议 §3.3）
+                // [修复] 配对成功后主动发 bye 再关连接：PC 端 messageLoop 收到 bye 会立刻
+                // 结束本轮连接；不发的话 PC 要等 45 秒帧超时才清理（反复配对会累积连接）。
+                try {
+                    res.channel.writeFrame(sock.getOutputStream(), FRAME_CTRL,
+                        "{\"type\":\"bye\"}".toByteArray())
+                } catch (e2: Exception) {
+                    android.util.Log.d("PhotoBeam", "配对后 bye 发送失败（可忽略）: ${e2.message}")
+                }
                 SenderService.start(applicationContext)
                 runOnUiThread {
                     statusView.text = "配对成功！截图/存图会自动同步到电脑。"
@@ -1007,7 +1056,31 @@ class MainActivity : Activity() {
                             friendlyPairError(e)
                     }
                 }
+            } finally {
+                // [修复] 无论成功/失败/超时都关闭配对 socket（见上方 pairSock 注释）。
+                try { pairSock?.close() } catch (e2: Exception) { }
             }
         }.start()
+    }
+
+    /**
+     * [修复] 手动 IP 直连：对 5416..5436 顺序尝试 TCP connect（每个 800ms 超时）。
+     * 不依赖历史端口（首次配对 pc_port=0，Discovery 的通道①会被跳过）。
+     * 返回已连上的 socket；全部失败返回 null（调用方回退到正常发现流程）。
+     */
+    private fun tryDirectConnect(ip: String): java.net.Socket? {
+        for (port in 5416..5436) {
+            val s = java.net.Socket()
+            try {
+                s.tcpNoDelay = true
+                s.connect(java.net.InetSocketAddress(ip, port), 800)
+                android.util.Log.d("PhotoBeam", "手动 IP 直连成功: $ip:$port")
+                return s
+            } catch (e: Exception) {
+                try { s.close() } catch (e2: Exception) { }
+            }
+        }
+        android.util.Log.w("PhotoBeam", "手动 IP 直连失败（5416-5436 均不可达）: $ip")
+        return null
     }
 }

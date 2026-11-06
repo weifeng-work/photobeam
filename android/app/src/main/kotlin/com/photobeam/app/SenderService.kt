@@ -110,6 +110,16 @@ class SenderService : Service() {
          */
         @Volatile var stopRequested = false
 
+        /**
+         * [修复] 本次是否由 **startForegroundService()** 拉起（companion：start() 与服务实例共享）。
+         * 语义：true = 系统手里有我们**未兑现的 FGS 欠条**（5/10 秒内必须调 startForeground()，
+         * 否则 ForegroundServiceDidNotStartInTimeException 杀进程）。
+         * start() 走 startForegroundService 前置 true、被拒退 startService 时清 false；
+         * startForeground() 成功后清 false。postStatus 用它决定 startForeground 失败后
+         * **能否安全降级**（详见 postStatus）。
+         */
+        @Volatile var viaFgs = false
+
         /** 上传动画 4 帧（独立 drawable，逐帧切换以保证状态栏重绘） */
         val UPLOAD_FRAMES = intArrayOf(
             R.drawable.ic_stat_up_0, R.drawable.ic_stat_up_1,
@@ -144,11 +154,16 @@ class SenderService : Service() {
                 return
             }
             try {
+                // [修复] 记录本次由 startForegroundService 拉起：系统因此持有
+                // 「5/10 秒内必须调 startForeground()」的欠条。postStatus 判失败时靠它
+                // 区分「能否安全降级」还是「必须 stopSelf 并重拉」。
+                viaFgs = true
                 ctx.startForegroundService(i)
             } catch (e: Exception) {
                 // [修复 2026-11-02 v2] startForegroundService 被拒（Android 14+ 禁止从
                 // BOOT_COMPLETED 起 FGS；或 MIUI 后台管控）→ 退化成**普通后台服务**：
                 // 服务照样能起来、能发降级通知、能跑同步循环，只是拿不到 FGS 身份。
+                viaFgs = false
                 android.util.Log.w("PhotoBeam", "startForegroundService 被拒: ${e.message} → 退化为后台服务")
                 try {
                     ctx.startService(i)
@@ -192,12 +207,23 @@ class SenderService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private val workExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
     private var linkOk = false // 与电脑的连接状态（通知图标 = 此状态）
-    // [修复 2026-11-02 v2] startForeground 曾经被系统拒绝过 → 仅作**UI 提示**，
-    // **绝不再用于"跳过 startForeground()"**：
-    //   跳过 = 30 秒后 ForegroundServiceDidNotStartInTimeException 杀进程（实测两次），
-    //   而杀进程正是"状态栏图标整体消失"的直接原因。
-    //   现在每次 postStatus 都无条件尝试 startForeground，被拒就降级成普通通知。
-    @Volatile private var fgsDenied = false
+    /**
+     * [修复] 「连续超时」的判定不能是「startForeground 一成功就清零」——onTimeout 会
+     * 立刻重拉服务，新实例的 startForeground 几乎必然成功 → 计数永远在 1 上下振荡、
+     * TIMEOUT_DEGRADE_THRESHOLD 不可达（协议 §7.5 的降级链实际不存在）。
+     * 改为：服务持续存活 2 分钟且期间没有新的超时记录，才视为「连续」已中断、清零。
+     */
+    private val clearStreakRunnable = Runnable {
+        try {
+            val lastTimeout = prefs.getLong("last_timeout_at", 0L)
+            val okAt = prefs.getLong("fgs_ok_at", 0L)
+            val streak = prefs.getInt(PREFS_TIMEOUT_STREAK, 0)
+            if (okAt > 0L && lastTimeout < okAt && streak > 0) {
+                prefs.edit().putInt(PREFS_TIMEOUT_STREAK, 0).apply()
+                android.util.Log.d("PhotoBeam", "前台服务已稳定存活 2 分钟 → 连续超时计数清零（原=$streak）")
+            }
+        } catch (e: Exception) { }
+    }
     private var flushedSomething = false // 本轮冲刷是否真的发出过图（空队列时用轻探测代替 [F-08]）
     // 传输动画 [用户需求]：仅在上传期间播放（4 帧推进），空闲静止
     private var uploading = false
@@ -282,9 +308,6 @@ class SenderService : Service() {
         stopRequested = false
         // [A6] 恢复「仅闹钟模式」标记（降级态跨进程保留）
         alarmOnlyMode = try { prefs.getBoolean(PREFS_ALARM_ONLY, false) } catch (e: Exception) { false }
-        // 记住"后台 startForeground 已被系统拒绝"：闹钟拉起的是新实例，
-        // 不记住就会每次都去试 → 又触发系统对同 id 通知的异步取消 → 图标闪没。
-        fgsDenied = try { prefs.getBoolean("fgs_denied", false) } catch (e: Exception) { false }
         queue = QueueStore(this).also { it.load() }
         // [Stage 15] 升级后**一次性**清理僵尸项：在修好读取判据之前卡在队列里、
         // 反复尝试仍读不出来的历史项（unreadyTries 很大）。
@@ -394,7 +417,13 @@ class SenderService : Service() {
     override fun onTimeout(startId: Int, fgsType: Int) {
         super.onTimeout(startId, fgsType)
         val streak = try { prefs.getInt(PREFS_TIMEOUT_STREAK, 0) + 1 } catch (e: Exception) { 1 }
-        try { prefs.edit().putInt(PREFS_TIMEOUT_STREAK, streak).apply() } catch (e: Exception) { }
+        try {
+            prefs.edit().putInt(PREFS_TIMEOUT_STREAK, streak)
+                // [修复] 记录本次超时时刻：clearStreakRunnable 用 last_timeout_at < fgs_ok_at
+                // 判断「这 2 分钟内没有新超时」，避免一次超时被下一次成功启动白白清零。
+                .putLong("last_timeout_at", System.currentTimeMillis())
+                .apply()
+        } catch (e: Exception) { }
         android.util.Log.w("PhotoBeam",
             "前台服务被系统超时停止: startId=$startId fgsType=$fgsType 连续=$streak")
         try {
@@ -558,18 +587,37 @@ class SenderService : Service() {
             // 正规前台服务通知已建立 → 撤掉可能残留的降级通知（状态栏只留一个图标）
             try { nm.cancel(NOTI_ID_FALLBACK) } catch (e: Exception) { }
             iconMode = "fgs"
-            fgsDenied = false
-            try { prefs.edit().putBoolean("fgs_denied", false).apply() } catch (e: Exception) { }
+            // [修复] startForeground 成功 = 系统那张「5/10 秒内必须前台化」的欠条已兑现
+            // → 清 viaFgs：之后若再失败（如系统限制）走普通降级是安全的，不会再被超时杀。
+            viaFgs = false
             try { prefs.edit().putString("icon_mode", iconMode).apply() } catch (e: Exception) { }
-            // [A6] 前台服务恢复正常 → 连续超时计数清零（"连续"的语义）
+            // [修复] 连续超时计数改为「存活 2 分钟且无新超时」才清零（见 clearStreakRunnable）。
             try {
-                if (prefs.getInt(PREFS_TIMEOUT_STREAK, 0) > 0) {
-                    prefs.edit().putInt(PREFS_TIMEOUT_STREAK, 0).apply()
-                }
+                prefs.edit().putLong("fgs_ok_at", System.currentTimeMillis()).apply()
             } catch (e: Exception) { }
+            handler.removeCallbacks(clearStreakRunnable)
+            handler.postDelayed(clearStreakRunnable, 120_000)
             android.util.Log.d("PhotoBeam", "状态通知已发 mode=$iconMode（正规前台服务）")
         } else {
-            postFallback(nm, fallback)
+            // [修复] 若本次是 startForegroundService() 拉起（viaFgs=true），系统手里
+            // 「5/10 秒内必须前台化」的欠条仍未兑现 —— 只发普通通知降级并不能救命：
+            // 随后系统照样抛 ForegroundServiceDidNotStartInTimeException 杀掉进程
+            // （这正是注释里描述的现象）。此时必须承认失败：立刻 stopSelf，并用
+            // 闹钟 60 秒后重拉（新实例以 startService 走降级路径，不再挂欠条）。
+            if (viaFgs) {
+                viaFgs = false
+                android.util.Log.w("PhotoBeam", "FGS 欠条未兑现（viaFgs）→ 停止自身并由闹钟重拉")
+                postFallback(nm, fallback) // 仍给用户一个可见的「未连接」提示
+                try {
+                    val at = System.currentTimeMillis() + 60_000
+                    scheduleAlarmAt(this, at, exact = true, requestCode = 3)
+                } catch (e2: Exception) {
+                    android.util.Log.w("PhotoBeam", "重拉闹钟安排失败: ${e2.message}")
+                }
+                stopSelf()
+            } else {
+                postFallback(nm, fallback)
+            }
         }
     }
 
@@ -589,9 +637,8 @@ class SenderService : Service() {
         try { nm.notify(NOTI_ID_FALLBACK, fallback) } catch (e: Exception) {
             android.util.Log.w("PhotoBeam", "降级通知发布失败", e)
         }
-        // 记录"被拒"（仅用于 UI 提示；**不再用于跳过 startForeground** —— 见缺陷①）
-        fgsDenied = true
-        try { prefs.edit().putBoolean("fgs_denied", true).apply() } catch (e: Exception) { }
+        // [修复] fgsDenied 只写不读（v2 修复后已成纯装饰）→ 不再维护该标志。
+        // 仅保留 iconMode 供 UI/诊断使用。
         iconMode = "fallback"
         android.util.Log.d("PhotoBeam", "状态通知已发 mode=$iconMode（降级普通通知）")
         try { prefs.edit().putString("icon_mode", iconMode).apply() } catch (e: Exception) { }
@@ -702,7 +749,7 @@ class SenderService : Service() {
                 sock.tcpNoDelay = true
                 sock.connect(java.net.InetSocketAddress(hit.ip, hit.port), 1500)
                 sock.soTimeout = 20_000
-                val hs = pairing.handshake(sock, { _, _ -> SAS_CONFIRM }, allowPairing = false)
+                val hs = pairing.handshake(sock, { _, _, _ -> SAS_CONFIRM }, allowPairing = false)
                 if (hs.mode != "reconnect") return@Thread
                 sock.close()
                 android.util.Log.d("PhotoBeam", "已取回 dev_dir")
@@ -813,13 +860,31 @@ class SenderService : Service() {
         queue.save()
     }
 
+    /**
+     * 退避阶梯（秒）：30 → 60 → 300 → 900（协议 §7.4 的指数退避）。
+     * [修复] 旧实现只有固定 30 秒冲刷周期，tries 只写不读；断网时每 30 秒对同一批图
+     * 完整跑一遍三通道发现（最坏 9s + 254 个 UDP 探测）。
+     */
+    private fun backoffSeconds(tries: Int): Long = when (tries) {
+        0 -> 30L
+        1 -> 60L
+        2 -> 300L
+        else -> 900L
+    }
+
     /** 冲刷队列 [C-10]：一次发现 + 一次连接复用，逐项就绪判定与传输 */
     private fun flushQueue(): Boolean {
         val pc = pairing.loadPairedPC() ?: return true
         var ok = true
         flushedSomething = false
         flushedCount = 0 // [A3] 本轮发送计数（回执用）
-        val pend = queue.pendingItems().sortedBy { it.capturedAt }
+        // [修复·协议 §7.4] 指数退避：transient 失败的项在 nextAttemptAt 到期前不参与冲刷。
+        // 旧实现固定 30 秒对同一批失败图完整跑一遍三通道发现（最坏 9s + 254 个 UDP 探测），
+        // 断网时纯烧电。阶梯 30s/60s/300s/900s（与协议一致）。
+        val nowSec = System.currentTimeMillis() / 1000
+        val pend = queue.pendingItems()
+            .filter { it.nextAttemptAt <= nowSec }
+            .sortedBy { it.capturedAt }
         if (pend.isEmpty()) {
             // 空队列 = 本轮不传输 → 动画必须停。
             // [修复 2026-11-02] 原先这里直接 return，uploading 永远停在 true：
@@ -841,9 +906,13 @@ class SenderService : Service() {
         } catch (e: Exception) {
             linkOk = false
             android.util.Log.w("PhotoBeam", "发现失败: ${e.message}")
+            // [修复] setUploading(true) 在 try 之外调用，而这条最常见的失败路径
+            // （电脑没开 / 不在同一 WiFi）在这里直接 return，会绕过 finally 的
+            // setUploading(false) → uploading 永真 → animTick 每 180ms 重发前台通知，
+            // 状态栏永远播上传动画而实际什么都没传（CPU/电量常驻）。空队列分支修过同坑。
+            setUploading(false)
             return false
         }
-        linkOk = true
         // found 应答携带 PC 实际监听端口 [P1-01/B-10]
         pairing.updateLastConnection(hit.ip, hit.port)
 
@@ -855,16 +924,31 @@ class SenderService : Service() {
             sock.tcpNoDelay = true
             sock.connect(java.net.InetSocketAddress(hit.ip, hit.port), 1500)
             sock.soTimeout = 45_000
-            val hs = pairing.handshake(sock, { _, _ -> SAS_CONFIRM }, allowPairing = false)
+            val hs = pairing.handshake(sock, { _, _, _ -> SAS_CONFIRM }, allowPairing = false)
             if (hs.mode != "reconnect") {
                 throw java.io.IOException("对端要求重新配对（本端在后台发送路径，已断开）")
             }
             ch = hs.channel
+            // [修复] linkOk 必须在**握手成功之后**才置 true：此前 resolve 成功（TCP 能连上）
+            // 就置 true，之后握手失败（如 PC 要求重新配对）不会回滚 → 状态栏亮白「已连接」，
+            // 但图片一张也发不出去。连接级 catch 里会置 false。
+            linkOk = true
             val out = sock.getOutputStream()
             val inp = sock.getInputStream()
+            // [协议 §4] 长传输保活计时起点
+            var lastFrameAt = System.currentTimeMillis()
 
             for (it in pend) {
                 try {
+                    // [修复·协议 §4] 长传输期间按 15 秒间隔补发 ping：空闲期两端不发帧时，
+                    // 半开连接只能靠 PC 的 45s 读超时才发现；批量传输里定期 ping 能更早暴露断链。
+                    if (System.currentTimeMillis() - lastFrameAt > 15_000) {
+                        try {
+                            ch.writeFrame(out, FRAME_CTRL, "{\"type\":\"ping\"}".toByteArray())
+                            android.util.Log.d("PhotoBeam", "已发送 ping（长传输保活）")
+                        } catch (_: Exception) { /* ping 失败由后续发送自然暴露 */ }
+                        lastFrameAt = System.currentTimeMillis()
+                    }
                     it.state = "sending"
                     queue.save()
                     // 发送时就绪判定 + 哈希 [方案 A/C]：读不到 → 分两种情况处理
@@ -878,7 +962,7 @@ class SenderService : Service() {
                             it.dropReason = "uri_dead"
                             queue.save()
                             android.util.Log.w("PhotoBeam", "URI 已失效，丢弃: ${it.name} (unready=${it.unreadyTries})")
-                            Notifier.localDropped(applicationContext, it.name)
+                            Notifier.localDropped(applicationContext, it.name, "uri_dead")
                             continue
                         }
                         // [Stage 15] 连续多轮都读不出来 → **不再永久占住队列位置**。
@@ -898,7 +982,7 @@ class SenderService : Service() {
                             queue.save()
                             android.util.Log.w("PhotoBeam",
                                 "反复读取失败(${it.unreadyTries} 轮)，跳过: ${it.name}")
-                            Notifier.localDropped(applicationContext, it.name)
+                            Notifier.localDropped(applicationContext, it.name, "unreadable")
                             continue
                         }
                         it.state = "pending"
@@ -959,7 +1043,11 @@ class SenderService : Service() {
                     android.util.Log.w("PhotoBeam", "发送失败(${e.errClass}): ${it.name} reason=${e.reason}")
                     it.state = if (e.errClass == "permanent") "dropped" else "pending"
                     it.dropReason = e.reason
-                    if (e.errClass == "transient") it.tries++ // [R-4] transient 也要计数
+                    if (e.errClass == "transient") {
+                        // [修复·协议 §7.4] transient 失败 → 退避阶梯，不要把同一批图每 30 秒重跑一遍发现
+                        it.tries++
+                        it.nextAttemptAt = System.currentTimeMillis() / 1000 + backoffSeconds(it.tries)
+                    }
                     if (e.errClass == "permanent") Notifier.dropped(applicationContext, it.name, e.reason)
                     recordArrivalFailure(it.name, e.reason) // [B3] 失败也要有回执
                     queue.save()
@@ -968,6 +1056,7 @@ class SenderService : Service() {
                     android.util.Log.w("PhotoBeam", "发送异常 ${it.name}: ${e.message}")
                     it.state = "pending"
                     it.tries++
+                    it.nextAttemptAt = System.currentTimeMillis() / 1000 + backoffSeconds(it.tries)
                     queue.save()
                     ok = false
                     break

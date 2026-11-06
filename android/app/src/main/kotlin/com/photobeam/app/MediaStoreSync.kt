@@ -96,12 +96,14 @@ class MediaStoreSync(
             // [Stage 14] 补传：**去掉全局水位**，只留每目录起点。
             // 起点为 0 的目录（= 用户勾了「同时补传已有照片」的目录）→ 全部历史行都入队；
             // 起点非 0 的目录仍只取起点之后的行（不会被补传波及）。
-            sel = "($dirFilter)"
-            args = emptyArray()
+            // [修复] buildSelectionSql 现在返回 (SQL, args)：目录名经 selectionArgs 传，
+            // 目录名带单引号（Bob's pics）不会再撑爆 SQL。
+            sel = "(${dirFilter.first})"
+            args = dirFilter.second.toTypedArray()
             android.util.Log.d("PhotoBeam", "补传对账：忽略全局水位 ${queue.lastMaxId}")
         } else {
-            sel = "_id > ? AND ($dirFilter)"
-            args = arrayOf(queue.lastMaxId.toString())
+            sel = "_id > ? AND (${dirFilter.first})"
+            args = (listOf(queue.lastMaxId.toString()) + dirFilter.second).toTypedArray()
         }
         // 本轮扫描的下界：
         //   常规 = 全局水位（只看增量）

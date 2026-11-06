@@ -26,7 +26,13 @@ class QueueItem(
     var state: String = "pending", // pending | sending | sent | dropped
     var unreadyTries: Int = 0, // 读取未就绪计数（blocked 语义：永不因此丢弃 [§7.3.1]）
     var tries: Int = 0,        // 发送失败计数
-    var dropReason: String = ""
+    var dropReason: String = "",
+    /**
+     * [协议 §7.4] 下次允许发送的时间戳（指数退避 30s→1m→5m→15m）。
+     * 0 = 无退避，随时可发。**放在带默认值的末尾**：旧 queue.json 没有这个字段
+     * → parse 用 optLong 默认 0 → 老数据照常工作。
+     */
+    var nextAttemptAt: Long = 0
 )
 
 class QueueStore(private val ctx: Context) {
@@ -69,7 +75,8 @@ class QueueStore(private val ctx: Context) {
                 e.getLong("media_id"), e.optString("rel_path"),
                 e.optString("batch_id"), e.optBoolean("is_latest"),
                 e.optInt("batch_size", 1), e.optString("state", "pending"),
-                e.optInt("unready_tries"), e.optInt("tries"), e.optString("drop_reason")))
+                e.optInt("unready_tries"), e.optInt("tries"), e.optString("drop_reason"),
+                e.optLong("next_attempt_at", 0L)))
         }
         lastMaxId = o.optLong("last_max_id", 0)
         batchSeq = o.optInt("batch_seq", 0)
@@ -92,7 +99,8 @@ class QueueStore(private val ctx: Context) {
             .put("is_latest", it.isLatestInBatch).put("batch_size", it.batchSize)
             .put("state", it.state)
             .put("unready_tries", it.unreadyTries)
-            .put("tries", it.tries).put("drop_reason", it.dropReason))
+            .put("tries", it.tries).put("drop_reason", it.dropReason)
+            .put("next_attempt_at", it.nextAttemptAt))
         o.put("items", arr)
         o.put("last_max_id", lastMaxId)
         o.put("batch_seq", batchSeq)
@@ -100,10 +108,34 @@ class QueueStore(private val ctx: Context) {
         for ((k, v) in discoveryLedger) led.put(k.toString(), v)
         o.put("ledger", led)
         val tmp = File(file.parentFile, "queue.json.tmp")
-        tmp.writeText(o.toString())
+        // 协议 §7.x：写临时文件 → fsync → 原子 rename。
+        // [修复] 旧实现用 writeText：只有用户态缓冲，掉电/杀进程时可能
+        // 「rename 成功但内容没落盘」→ 得到一个合法的空/半截 queue.json。
+        // 必须先 fd.sync() 再 close。
+        java.io.FileOutputStream(tmp).use { fos ->
+            fos.write(o.toString().toByteArray(Charsets.UTF_8))
+            fos.flush()
+            fos.fd.sync()
+        }
         // 保留上一版快照 [P0-10]
-        if (file.exists()) file.copyTo(File(file.parentFile, "queue.json.bak"), overwrite = true)
-        tmp.renameTo(file) // Android File.rename = rename(2) 同目录原子
+        if (file.exists()) {
+            try {
+                file.copyTo(File(file.parentFile, "queue.json.bak"), overwrite = true)
+            } catch (e: Exception) {
+                android.util.Log.w("PhotoBeam", "写队列 .bak 失败: ${e.message}")
+            }
+        }
+        // Android File.rename = rename(2) 同目录原子。
+        // [修复] 旧实现**丢弃 renameTo 返回值**：失败时队列静默丢失且不回退 .bak。
+        // 失败重试一次；仍失败则记错误日志并保留旧文件（下一轮 save 再试），
+        // .bak 仍是上一份可用快照 —— 启动 parse 失败时 load() 会自动回退它。
+        if (!tmp.renameTo(file)) {
+            android.util.Log.w("PhotoBeam", "队列 rename 失败，重试一次（tmp=${tmp.absolutePath}）")
+            if (!tmp.renameTo(file)) {
+                android.util.Log.e("PhotoBeam",
+                    "队列 rename 连续失败，保留旧队列与 .bak（本轮改动未落盘）")
+            }
+        }
         notifyQueueChanged()
     }
 
@@ -203,10 +235,21 @@ class QueueStore(private val ctx: Context) {
 
     @Synchronized
     fun prune() {
+        var changed = false
         // 账本清理 [R-08]：仅保留最近 30 天
         val cutoff = System.currentTimeMillis() / 1000 - 30L * 24 * 3600
-        discoveryLedger.entries.removeIf { it.value < cutoff && it.key <= lastMaxId }
-        items.removeAll { it.state == "sent" && (it.capturedAt < cutoff) }
+        if (discoveryLedger.entries.removeIf { it.value < cutoff && it.key <= lastMaxId }) changed = true
+        if (items.removeAll { it.state == "sent" && (it.capturedAt < cutoff) }) changed = true
+        // [修复] dropped 项以前**永不出队列**（只有 sent 超 30 天才删）→ queue.json
+        // 长期膨胀、load() 越来越慢。这里补一条清理：保留最近 20 条 + 7 天内，
+        // 与 sent 的 30 天策略同构（dropped 只是诊断信息，不需要长期保留）。
+        val droppedCutoff = System.currentTimeMillis() / 1000 - 7L * 24 * 3600
+        if (items.removeAll { it.state == "dropped" && it.capturedAt < droppedCutoff }) changed = true
+        val droppedItems = items.filter { it.state == "dropped" }.sortedBy { it.capturedAt }
+        if (droppedItems.size > 20) {
+            val remove = droppedItems.take(droppedItems.size - 20).toHashSet()
+            if (items.removeAll(remove)) changed = true
+        }
         // 双上限：200 张 / 500MB，丢最旧 pending [P1-05][P1-08]
         var dropped = 0
         while (items.count { it.state == "pending" } > 200) {
@@ -219,6 +262,12 @@ class QueueStore(private val ctx: Context) {
             bytes -= maxOf(oldest.size, 1L)
             oldest.state = "dropped"; oldest.dropReason = "queue_overflow"; dropped++
         }
-        if (dropped > 0) Notifier.queueOverflow(ctx, dropped)
+        if (dropped > 0) {
+            Notifier.queueOverflow(ctx, dropped)
+            changed = true
+        }
+        // [修复] 超限标 dropped 后**必须落盘**：旧实现不 save()，进程此时被杀就丢；
+        // dropped 清理同样要落盘。只在真的变了时写，避免每 30 秒做一次无谓 IO。
+        if (changed) save()
     }
 }

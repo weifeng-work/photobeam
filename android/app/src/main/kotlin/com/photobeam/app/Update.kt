@@ -178,7 +178,29 @@ object UpdateChecker {
         val bPre = bn.pre.isNotEmpty()
         if (aPre != bPre) return if (aPre) -1 else 1
         if (aPre && bPre && an.pre != bn.pre) {
-            return if (an.pre > bn.pre) 1 else -1
+            // [修复] 预发布后缀不能按字典序比：`beta10 < beta2`（字典序），
+            // 会导致 "1.2.0-beta10" 被判成比 "1.2.0-beta2" 旧 → 误报「已是最新」。
+            // 按 `-`/`.` 拆段：能解析为数字的段做数值比较，其余按字符串（同 parseVersion 风格）。
+            return comparePrerelease(an.pre, bn.pre)
+        }
+        return 0
+    }
+
+    /** [修复] 预发布后缀逐段比较（数字段按数值，其余按字典序） */
+    private fun comparePrerelease(a: String, b: String): Int {
+        val as1 = a.split('-', '.').filter { it.isNotEmpty() }
+        val bs1 = b.split('-', '.').filter { it.isNotEmpty() }
+        val n = maxOf(as1.size, bs1.size)
+        for (i in 0 until n) {
+            val av = as1.getOrNull(i) ?: return -1 // 段数少者更旧（1.2.0-beta < 1.2.0-beta.1）
+            val bv = bs1.getOrNull(i) ?: return 1
+            val an = av.toIntOrNull()
+            val bn = bv.toIntOrNull()
+            if (an != null && bn != null) {
+                if (an != bn) return if (an > bn) 1 else -1
+            } else if (av != bv) {
+                return if (av > bv) 1 else -1
+            }
         }
         return 0
     }
