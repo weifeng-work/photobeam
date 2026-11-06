@@ -35,6 +35,10 @@ class SenderService : Service() {
         const val ACTION_ENSURE_FGS = "photobeam.ensure.fgs"
         /** ③ 立即同步 → 立刻跑一轮对账+冲刷，并把结果写回 prefs 供 UI 回显 [A3] */
         const val ACTION_SYNC_NOW = "photobeam.sync.now"
+        /** [Stage 14] **补传**：把选中目录里已存在的历史照片也扫一遍。
+         *  与 ACTION_SYNC_NOW 的区别：这次对账**忽略全局 _id 水位**
+         *  （历史图的 _id ≤ 水位，正常增量路径扫不到它们）。 */
+        const val ACTION_BACKFILL = "photobeam.backfill"
     /** [Stage 10] 只取回 PC 端分配给本机的落盘目录名（dev_dir）——不触发对账/发送。
      *  用于：PC 端升级后（新增 dev_dir 字段）手机端还没存过 → 主动取一次，
      *  用户就能在界面看到「我的照片在电脑：xxx」。 */
@@ -319,6 +323,11 @@ class SenderService : Service() {
             android.util.Log.d("PhotoBeam", "收到立即同步请求")
             reconcileAndFlush(manual = true)
         }
+        // [Stage 14] 补传：忽略全局水位的全量对账（一次性动作）
+        if (intent?.action == ACTION_BACKFILL) {
+            android.util.Log.d("PhotoBeam", "收到补传请求")
+            reconcileAndFlush(manual = true, backfill = true)
+        }
         // [Stage 10] 取回 PC 端分配的落盘目录名（dev_dir）：只握手，不对账、不发送。
         if (intent?.action == ACTION_FETCH_DEVDIR) {
             android.util.Log.d("PhotoBeam", "收到取 dev_dir 请求")
@@ -583,11 +592,15 @@ class SenderService : Service() {
     /**
      * 对账 + 冲刷一轮。
      * @param manual true = 由「③ 立即同步」触发（结果照样写回 prefs，UI 据此回显）
+     * @param backfill true = **补传**：忽略全局 _id 水位，把选中目录里已存在的
+     *        历史照片也扫一遍（起点为 0 的目录）。全局水位会把这些历史图挡掉
+     *        （它们的 _id ≤ lastMaxId），所以补传必须绕开它 —— 但绕开后
+     *        水位会被这轮扫描推进回最大值，后续常规对账不受影响。
      */
-    fun reconcileAndFlush(manual: Boolean = false) {
+    fun reconcileAndFlush(manual: Boolean = false, backfill: Boolean = false) {
         workExecutor.execute {
             try {
-                doReconcileAndFlush(manual)
+                doReconcileAndFlush(manual, backfill)
             } catch (e: Exception) {
                 android.util.Log.w("PhotoBeam", "reconcileAndFlush 异常", e)
             }
@@ -673,10 +686,10 @@ class SenderService : Service() {
         }.start()
     }
 
-    private fun doReconcileAndFlush(manual: Boolean = false) {
+    private fun doReconcileAndFlush(manual: Boolean = false, backfill: Boolean = false) {
         val pc = pairing.loadPairedPC()
         // 未配对也要对账入队（协议 §7.1：截图先进队列，配对后补发）
-        val n = sync.reconcile()
+        val n = sync.reconcile(backfill)
         if (pc == null) {
             linkOk = false
             android.util.Log.d("PhotoBeam", "未配对：对账新增 $n，队列 ${queue.pendingCount()}")

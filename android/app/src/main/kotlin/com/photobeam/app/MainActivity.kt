@@ -431,11 +431,11 @@ class MainActivity : Activity() {
                 "· 默认只有之后新增的图片会被同步，历史图片不会补传。"
             setPadding(0, 0, 0, pad)
         })
-        // [Stage 14] 补传开关：默认**不勾**（= 历史图不补传，与上面的说明一致）。
-        // 用户明确勾上 → 该目录里已存在的照片也一起同步（一次性动作）。
+        // [Stage 14] 补传开关：**每次打开默认不勾**（补传是一次性动作，
+        // 记住上次的勾选状态会让用户只是改个勾选就莫名其妙触发一次大批量补传）。
         val backfillBox = android.widget.CheckBox(this).apply {
             text = "同时补传这些文件夹里已有的照片"
-            isChecked = SyncDirs.backfillEnabled(this@MainActivity)
+            isChecked = false
             setPadding(0, 0, 0, (6 * resources.displayMetrics.density).toInt())
         }
         container.addView(backfillBox)
@@ -505,7 +505,7 @@ class MainActivity : Activity() {
                 statusView.text = "正在保存…"
                 Thread {
                     val starts = SyncDirs.computeStartIds(this, chosen, backfill)
-                    SyncDirs.save(this, chosen, starts, backfill)
+                    SyncDirs.save(this, chosen, starts)
                     android.util.Log.d("PhotoBeam", "同步目录已保存：${chosen.size} 个（$chosen）补传=$backfill")
                     runOnUiThread {
                         if (chosen.isEmpty()) {
@@ -517,8 +517,11 @@ class MainActivity : Activity() {
                             statusView.text = "已保存：${chosen.size} 个文件夹参与同步（只传之后新增的）" +
                                 " → ${chosen.joinToString(", ")}"
                         }
-                        // 立刻触发一次对账（让新选的目录里的新图马上能发出去）
-                        SenderService.start(this, SenderService.ACTION_SYNC_NOW)
+                        // [Stage 14] 勾了「补传」→ 走补传通道（忽略全局水位的全量对账）。
+                        // 不勾 → 常规增量对账（新选目录的历史图不会补传）。
+                        val act = if (backfill) SenderService.ACTION_BACKFILL
+                                  else SenderService.ACTION_SYNC_NOW
+                        SenderService.start(this, act)
                         startSyncPolling()
                     }
                 }.start()

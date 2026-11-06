@@ -44,8 +44,6 @@ object SyncDirs {
     // [Stage 14] 每目录的同步起点：格式 "目录=起点_id"（MediaStore _id）。
     // 0 = 不限制（补传模式）。
     private const val KEY_DIR_STARTS = "sync_dir_starts"
-    // [Stage 14] 用户是否勾了「同时补传这些文件夹里已有的照片」
-    private const val KEY_BACKFILL = "sync_backfill"
 
     /** 用户已勾选的目录（RELATIVE_PATH 去掉尾斜杠的形式，如 "DCIM/Screenshots"）
      *
@@ -63,14 +61,16 @@ object SyncDirs {
      *  [Stage 12 · 缺陷修复] 同样存**副本**：putStringSet 会持有传入集合的引用，
      *  调用方之后改它就等于改了 prefs 内部状态（Android 官方文档明确要求传副本）。
      *
-     *  [Stage 14] 额外存每目录的同步起点（starts）与补传开关。
-     *  starts 由 [computeStartIds] 预先算好（要查 MediaStore，耗时，必须在后台线程做）。 */
-    fun save(ctx: Context, dirs: Set<String>, starts: Map<String, Long>, backfill: Boolean) {
+     *  [Stage 14] 额外存每目录的同步起点（starts）。
+     *  starts 由 [computeStartIds] 预先算好（要查 MediaStore，耗时，必须在后台线程做）。
+     *
+     *  [Stage 14] 「补传」是**一次性动作**，不持久化 —— 下次打开弹窗默认不勾，
+     *  免得用户只是改个勾选就莫名其妙触发一次大批量补传。 */
+    fun save(ctx: Context, dirs: Set<String>, starts: Map<String, Long>) {
         val sp = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         sp.edit()
             .putStringSet(KEY_DIRS, HashSet(dirs))
             .putBoolean(KEY_PICKED, true)
-            .putBoolean(KEY_BACKFILL, backfill)
             .apply()
         saveStartIds(ctx, starts)
     }
@@ -98,10 +98,6 @@ object SyncDirs {
         for ((k, v) in starts) encoded.add("$k=$v")
         sp.edit().putStringSet(KEY_DIR_STARTS, encoded).apply()
     }
-
-    /** 用户是否勾了「同时补传这些文件夹里已有的照片」（默认否 = 不补传） */
-    fun backfillEnabled(ctx: Context): Boolean =
-        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_BACKFILL, false)
 
     /**
      * 算出保存后的每目录起点表。**耗时**（要查 MediaStore），必须后台线程调用。

@@ -52,8 +52,13 @@ class MediaStoreSync(
      * file_id 留空，由发送时就绪判定补齐（Sender.readReady）。
      * 发现账本在入队时即记 _ID（发现去重）；水位照常推进（失败项走待重试路径，与水位无关 [B-11 §7.2]）。
      * 返回新增数。
+     *
+     * @param backfill true = **补传模式**：忽略全局 _id 水位，只受每目录起点约束。
+     *   为什么必须有这个开关：用户勾了「同时补传已有照片」，要传的是
+     *   **早就存在**的图，它们的 _id ≤ lastMaxId → 被全局水位挡掉 → 补传形同虚设。
+     *   绕开水位后这轮会把水位重新推到最大值，后续常规对账照常走增量（性能不变）。
      */
-    fun reconcile(): Int {
+    fun reconcile(backfill: Boolean = false): Int {
         var added = 0
         sawPendingRow = false
         val uri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
@@ -87,8 +92,22 @@ class MediaStoreSync(
             android.util.Log.d("PhotoBeam", "对账跳过：未选择任何同步目录")
             return 0
         }
-        sel = "_id > ? AND ($dirFilter)"
-        args = arrayOf(queue.lastMaxId.toString())
+        if (backfill) {
+            // [Stage 14] 补传：**去掉全局水位**，只留每目录起点。
+            // 起点为 0 的目录（= 用户勾了「同时补传已有照片」的目录）→ 全部历史行都入队；
+            // 起点非 0 的目录仍只取起点之后的行（不会被补传波及）。
+            sel = "($dirFilter)"
+            args = emptyArray()
+            android.util.Log.d("PhotoBeam", "补传对账：忽略全局水位 ${queue.lastMaxId}")
+        } else {
+            sel = "_id > ? AND ($dirFilter)"
+            args = arrayOf(queue.lastMaxId.toString())
+        }
+        // 本轮扫描的下界：
+        //   常规 = 全局水位（只看增量）
+        //   补传 = 0（历史行也要看）—— SQL 已不带全局水位，这里**必须同步放开**，
+        //   否则下面那句双保险会把历史行全部 continue 掉，补传就形同虚设。
+        val floorId = if (backfill) 0L else queue.lastMaxId
         var upper = queue.lastMaxId
         // pendingBarrier：遇到的第一个 pending 行的 _id。水位不得越过它。
         var pendingBarrier = -1L
@@ -96,7 +115,7 @@ class MediaStoreSync(
             ctx.contentResolver.query(uri, proj, sel, args, "_id ASC")?.use { c ->
                 while (c.moveToNext()) {
                     val id = c.getLong(0)
-                    if (id <= queue.lastMaxId) continue
+                    if (id <= floorId) continue
                     // [Stage 6 · 缺陷修复] is_pending=1 = 文件还没写完。
                     // 这行这轮不入队；且**水位不能越过它**（否则该图永久丢失）。
                     val pending = if (c.isNull(7)) false else c.getInt(7) != 0
