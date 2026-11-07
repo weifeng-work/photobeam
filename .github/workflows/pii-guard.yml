@@ -56,16 +56,31 @@ jobs:
           # （全新 ref）或旧提交已不可达。原实现在这种情况下退回 `head^` ——
           # **只扫最后一个 commit**，前面几个提交夹带的 PII 全被漏掉
           # （另一智能体那次 6 个提交、其中 4 个含机型名，就是这么漏过去的）。
-          # 现在：零 before → 扫**最近 50 个提交**（有界，避免首次推送时扫全史太慢），
+          # 现在：零 before 或 before 不可达 → 扫**最近 50 个提交**（有界），
           # 并把实际扫描范围打印出来，一眼能核对。
+          #
+          # ⚠ 还有一种情况必须处理：**历史重写（filter-repo + force push）之后**
+          # `before` 是个合法的 40 位 sha，但它在重写后的仓库里**已经不存在**
+          # → `git diff <before> <head>` 直接 exit 128 抛 CalledProcessError
+          # （2026-11-07 实测：v1.2.5 那次强推就是这么把 job 弄红的）。
+          # 所以先 `rev-parse --verify` 确认它真的可达，不可达就走同一套降级。
+          def commit_exists(sha):
+              try:
+                  git("rev-parse", "--verify", sha + "^{commit}")
+                  return True
+              except subprocess.CalledProcessError:
+                  return False
+
           zero_before = (not base) or set(base) == {"0"}
-          if zero_before:
+          unreachable_before = (not zero_before) and (not commit_exists(base))
+          if zero_before or unreachable_before:
               try:
                   log50 = git("rev-list", "--max-count=50", head).split()
                   if len(log50) >= 2:
                       # base 取第 50 个提交自身 → diff 覆盖它之后的 49 个提交
                       base = log50[-1]
-                      print(f"push 无可用 before（新分支/强推）→ 扫描最近 {len(log50)} 个提交")
+                      why = "无可用 before（新分支/强推）" if zero_before else "before 在重写后的历史里不可达（历史重写 / 强推）"
+                      print(f"{why} → 扫描最近 {len(log50)} 个提交（base={base[:7]}）")
                   else:
                       print("仓库只有一个提交，没有可扫描的父提交。")
                       sys.exit(0)
