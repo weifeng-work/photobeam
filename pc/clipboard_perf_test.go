@@ -30,12 +30,21 @@ import (
 // 预算给到 300ms 是为了容忍 CI 机器的波动，但足以拦住「退回逐像素」（278ms → 总量 ~350ms+
 // 且在慢机器上更糟）与「PNG 编码回到同步路径」（+846ms，远超）。
 const (
-	dibBudgetMS     = 300
-	decodeBudgetMS  = 200
-	pngEncodeBudget = 2000 // PNG 编码仍在后台跑，但它不该无限慢
+	dibBudgetMS    = 300
+	decodeBudgetMS = 200
+	// [Stage 17 · 修 flaky] PNG 编码预算从 2000ms 放宽到 6000ms。
+	//
+	// 为什么改：这条断言**不是**用来判定「PNG 该不该在后台」的 ——
+	// 那是下面 critical（关键路径）断言的职责（`> dibBudgetMS+decodeBudgetMS` 即失败）。
+	// 它只是「别退化到慢得离谱」的兜底。
+	//
+	// 而 2000ms 这条线正好卡在测试图的实测抖动边缘：
+	// 本机连跑 3 次实测 997ms / 1144ms / 1638ms，负载高时到 2033ms/2103ms
+	// → **偶发红**（2026-11-07 两次撞上，都会让 CI 无谓变红）。
+	// 放宽到 6000ms 仍然能拦住「PNG 编码慢一个数量级」这类真退化。
+	pngEncodeBudget = 6000
 	// 注：真机截图（JPEG 压缩后）PNG 编码实测约 846ms；
-	// 本测试用噪声图（压缩后仍是高熵，PNG 压不动）会到 ~1.3s，
-	// 因此预算按测试图的更差情况取 2000ms。它只用于「别退化到慢得离谱」，不参与 ≤2s 达标判定。
+	// 本测试用噪声图（压缩后仍是高熵，PNG 压不动）实测 1.0~2.1s。
 )
 
 // makeTestJPEG：造一张与真机截图同量级的图片（1080x2400）
@@ -60,23 +69,52 @@ func makeTestJPEG(t *testing.T, w, h int) []byte {
 	return buf.Bytes()
 }
 
+// bestOf：跑 n 次取**最小值**。
+//
+// [Stage 17 · 修 flaky] 性能断言本质上受机器负载影响：本机实测同一段代码
+// 在并行跑其它构建时会慢 3~10 倍（解码 65ms → 1.8s）。固定预算 + 单次采样
+// 必然偶发红（2026-11-07 撞了好几次，会把 CI 无谓染红）。
+// 取 n 次最小值是性能测试的标准做法：负载噪声只会让某次**变慢**，
+// 最小值代表「这段代码在安静环境下的真实成本」，仍能拦住真正的性能退化。
+func bestOf(n int, f func() time.Duration) time.Duration {
+	best := time.Duration(1<<62 - 1)
+	for i := 0; i < n; i++ {
+		if d := f(); d < best {
+			best = d
+		}
+	}
+	return best
+}
+
 // TestDIBGenerationSpeed：守住「解码 + DIB 生成」在预算内
 func TestDIBGenerationSpeed(t *testing.T) {
 	raw := makeTestJPEG(t, 1080, 2400)
 
-	t0 := time.Now()
-	img, _, err := image.Decode(bytes.NewReader(raw))
-	if err != nil {
-		t.Fatalf("解码失败: %v", err)
-	}
-	tDecode := time.Since(t0)
+	var img image.Image
+	var dib []byte
+	var w, h int
 
-	t1 := time.Now()
-	dib, w, h, err := buildDIB(img)
-	if err != nil {
-		t.Fatalf("buildDIB 失败: %v", err)
-	}
-	tDIB := time.Since(t1)
+	// 解码：取 3 次最小值
+	tDecode := bestOf(3, func() time.Duration {
+		t0 := time.Now()
+		var err error
+		img, _, err = image.Decode(bytes.NewReader(raw))
+		if err != nil {
+			t.Fatalf("解码失败: %v", err)
+		}
+		return time.Since(t0)
+	})
+
+	// DIB 生成：取 3 次最小值
+	tDIB := bestOf(3, func() time.Duration {
+		t1 := time.Now()
+		var err error
+		dib, w, h, err = buildDIB(img)
+		if err != nil {
+			t.Fatalf("buildDIB 失败: %v", err)
+		}
+		return time.Since(t1)
+	})
 
 	t.Logf("解码=%v DIB生成=%v 总计=%v (dib=%dB %dx%d)",
 		tDecode.Round(time.Millisecond), tDIB.Round(time.Millisecond),
@@ -167,24 +205,34 @@ func TestDIBContentCorrect(t *testing.T) {
 func TestPNGSeparateFromCriticalPath(t *testing.T) {
 	raw := makeTestJPEG(t, 1080, 2400)
 
-	t0 := time.Now()
+	// 关键路径（解码+DIB）：取 3 次最小值，去负载噪声（见 bestOf 的说明）
+	critical := bestOf(3, func() time.Duration {
+		t0 := time.Now()
+		img, _, err := image.Decode(bytes.NewReader(raw))
+		if err != nil {
+			t.Fatalf("解码失败: %v", err)
+		}
+		_, _, _, err = buildDIB(img)
+		if err != nil {
+			t.Fatalf("buildDIB 失败: %v", err)
+		}
+		return time.Since(t0)
+	})
+
+	// 单独测 PNG 编码耗时，确认它确实是"重活"（所以才值得移出关键路径）
+	var buf bytes.Buffer
 	img, _, err := image.Decode(bytes.NewReader(raw))
 	if err != nil {
 		t.Fatalf("解码失败: %v", err)
 	}
-	_, _, _, err = buildDIB(img)
-	if err != nil {
-		t.Fatalf("buildDIB 失败: %v", err)
-	}
-	critical := time.Since(t0)
-
-	// 单独测 PNG 编码耗时，确认它确实是"重活"（所以才值得移出关键路径）
-	t1 := time.Now()
-	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
-		t.Fatalf("PNG 编码失败: %v", err)
-	}
-	pngCost := time.Since(t1)
+	pngCost := bestOf(2, func() time.Duration {
+		t1 := time.Now()
+		buf.Reset()
+		if err := png.Encode(&buf, img); err != nil {
+			t.Fatalf("PNG 编码失败: %v", err)
+		}
+		return time.Since(t1)
+	})
 
 	t.Logf("关键路径(解码+DIB)=%v  PNG 编码=%v (在后台执行)", critical.Round(time.Millisecond), pngCost.Round(time.Millisecond))
 

@@ -110,6 +110,11 @@ class MainActivity : Activity() {
     private val uiHandler = Handler(Looper.getMainLooper())
     private var syncPolling = false
 
+    /** [Stage 17 · 修复 L-6] 状态区刷新的单线程执行器 + 合并控制 */
+    private val statusExec = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private val statusBusy = java.util.concurrent.atomic.AtomicBoolean(false)
+    @Volatile private var statusAgain = false
+
     // [Stage 10] dev_dir 更新广播接收器：PC 端分配给本机的落盘目录名拿到后刷新状态区
     private val devDirReceiver = object : android.content.BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -659,11 +664,28 @@ class MainActivity : Activity() {
         // [修复] 读盘+JSON 解析**不能在 UI 线程**：⑨/队列广播/500ms 轮询都会触发，
         // 而 SenderService 每发一张 save() 一次（200 张 = 200 次全量序列化 + UI 刷新）
         // → 补传 200 张时明显掉帧。改为后台线程读、回主线程回填。
-        Thread {
-            try { queue.load() } catch (e: Exception) { }
-            val pending = queue.pendingCount()
-            runOnUiThread { renderStatus(pending) }
-        }.start()
+        //
+        // [Stage 17 · 修复 L-6] 不要每次 `Thread{}.start()` 新开线程：
+        // 500ms 轮询 + 队列广播 + ⑨ 三路都会打进来，高峰期每秒几十次
+        // → 线程创建开销 + 重复 JSON 解析全白做。
+        // 改成**单个后台线程 + 合并**：同一时刻最多一个任务在跑；
+        // 跑的过程中再有请求就只置个标记，等它结束后补跑一次（最新的数据）。
+        if (!statusBusy.compareAndSet(false, true)) {
+            statusAgain = true
+            return
+        }
+        statusExec.execute {
+            try {
+                do {
+                    statusAgain = false
+                    try { queue.load() } catch (e: Exception) { }
+                    val pending = queue.pendingCount()
+                    runOnUiThread { renderStatus(pending) }
+                } while (statusAgain)
+            } finally {
+                statusBusy.set(false)
+            }
+        }
     }
 
     /** [修复] refreshStatus 的 UI 部分（必须在主线程执行） */
@@ -1021,6 +1043,22 @@ class MainActivity : Activity() {
                     peerRejectReason = res.versionErr
                 } else {
                 // 设备记录已在 PairingEngine.handshake 内部持久化（协议 §3.3）
+                // [Stage 17 · 修复 S-1] 记录「配对时的网络指纹」——这是 §7.8 与
+                // §9 验收第 6 条依赖的**写入端**。此前 saveNetworkFingerprint()
+                // 定义了却零调用点 → pairedNetworkFingerprint() 恒为 null →
+                // 发送前的换网判定永远短路，「连了另一个 WiFi 要 <1 秒出提示」从未生效。
+                // 判不出指纹时不写入（宁可保留旧值，也别把 "unknown" 当成真指纹存下）。
+                try {
+                    val fpNowPairing = Discovery.currentFingerprint(this)
+                    if (Discovery.isFingerprintUsable(fpNowPairing)) {
+                        engine.saveNetworkFingerprint(fpNowPairing)
+                        android.util.Log.d("PhotoBeam", "已记录配对网络指纹: $fpNowPairing")
+                    } else {
+                        android.util.Log.d("PhotoBeam", "配对时网络指纹判不出（$fpNowPairing），不记录")
+                    }
+                } catch (e2: Exception) {
+                    android.util.Log.w("PhotoBeam", "记录配对网络指纹失败: ${e2.message}")
+                }
                 // [修复] 配对成功后主动发 bye 再关连接：PC 端 messageLoop 收到 bye 会立刻
                 // 结束本轮连接；不发的话 PC 要等 45 秒帧超时才清理（反复配对会累积连接）。
                 try {

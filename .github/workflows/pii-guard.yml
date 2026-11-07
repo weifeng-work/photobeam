@@ -29,8 +29,11 @@ jobs:
 
           raw = os.environ.get("PII_PATTERNS", "").strip()
           if not raw:
-              print("PII_PATTERNS secret not configured; skipping PII guard.")
-              sys.exit(0)
+              # [Stage 17 · 修复] 原实现这里 `sys.exit(0)` —— secret 没配就**静默放行**，
+              # 等于守门人不存在（公开仓库已两次把真实标识推上去过）。
+              # 现在 fail-closed：宁可红一次，也不要在没有规则的情况下冒充"已检查"。
+              print("::error::PII_PATTERNS secret is not configured —— PII guard 无法工作（fail-closed）")
+              sys.exit(1)
 
           patterns = [(p["name"], re.compile(p["regex"], re.I)) for p in json.loads(raw)]
 
@@ -49,11 +52,25 @@ jobs:
 
           base = os.environ.get("PR_BASE_SHA") if os.environ.get("EVENT_NAME") == "pull_request" else os.environ.get("BEFORE_SHA")
           head = os.environ.get("HEAD_SHA") or "HEAD"
-          if not base or set(base) == {"0"}:
+          # [Stage 17 · 修复] 新建分支 / force-push 时 `github.event.before` 是全 0
+          # （全新 ref）或旧提交已不可达。原实现在这种情况下退回 `head^` ——
+          # **只扫最后一个 commit**，前面几个提交夹带的 PII 全被漏掉
+          # （另一智能体那次 6 个提交、其中 4 个含机型名，就是这么漏过去的）。
+          # 现在：零 before → 扫**最近 50 个提交**（有界，避免首次推送时扫全史太慢），
+          # 并把实际扫描范围打印出来，一眼能核对。
+          zero_before = (not base) or set(base) == {"0"}
+          if zero_before:
               try:
-                  base = git("rev-parse", f"{head}^").strip()
+                  log50 = git("rev-list", "--max-count=50", head).split()
+                  if len(log50) >= 2:
+                      # base 取第 50 个提交自身 → diff 覆盖它之后的 49 个提交
+                      base = log50[-1]
+                      print(f"push 无可用 before（新分支/强推）→ 扫描最近 {len(log50)} 个提交")
+                  else:
+                      print("仓库只有一个提交，没有可扫描的父提交。")
+                      sys.exit(0)
               except subprocess.CalledProcessError:
-                  print("No parent commit; nothing to scan.")
+                  print("无法取提交列表；跳过本次扫描（请检查 checkout 是否 fetch-depth: 0）。")
                   sys.exit(0)
 
           findings = []

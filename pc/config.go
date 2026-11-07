@@ -208,6 +208,15 @@ func tcpPort() int {
 	return cfg.TCPPort
 }
 
+// udpPort：当前生效的 UDP 发现端口。
+// [L3] 与 tcpPort 同风格：统一走 cfgMu，避免其他 goroutine 裸读 cfg 字段
+// （与 saveConfig 的 marshal 形成数据竞争）。端口在启动后不再变化。
+func udpPort() int {
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+	return cfg.UDPPort
+}
+
 func setClipboardEnabled(on bool) {
 	cfgMu.Lock()
 	cfg.ClipboardEnabled = on

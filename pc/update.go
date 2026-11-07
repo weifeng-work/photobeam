@@ -197,14 +197,110 @@ func compareVersions(a, b string) int {
 		}
 		return 1
 	}
-	// 都有预发布后缀 → 比较后缀文本（"alpha" < "beta"）
-	if aPre != "" && bPre != "" && aPre != bPre {
-		if aPre > bPre {
+	// 都有预发布后缀 → 逐段比较（不能直接比字符串）
+	//
+	// [Stage 17 · 修复 M-5] 原实现是 `if aPre > bPre` —— **字典序**比较，
+	// 于是 "beta10" < "beta2"（'1' < '2'）→ 1.2.0-beta10 被判成比 1.2.0-beta2 旧。
+	// Android 端有同一个 bug（Update.kt 的 comparePrerelease），两边一起修，
+	// 否则两端的「检查更新」会给出不一致的结论。
+	if aPre != "" && bPre != "" {
+		return comparePrerelease(aPre, bPre)
+	}
+	return 0
+}
+
+// comparePrerelease：逐段比较预发布后缀。
+//
+// "beta.2" vs "beta.10"  → 段 ["beta","2"] vs ["beta","10"] → 2 < 10 → 更旧
+// "beta2"  vs "beta10"   → 拆成 ("beta",2) vs ("beta",10) → 2 < 10 → 更旧
+// "alpha"  vs "beta"     → "alpha" < "beta"
+//
+// 规则：每段先试纯数字（数值比），否则拆「字母前缀 + 数字后缀」（前缀字典序、后缀数值）。
+func comparePrerelease(a, b string) int {
+	as := splitPreSegments(a)
+	bs := splitPreSegments(b)
+	n := len(as)
+	if len(bs) > n {
+		n = len(bs)
+	}
+	for i := 0; i < n; i++ {
+		if i >= len(as) {
+			return -1 // 段数少者更旧（1.2.0-beta < 1.2.0-beta.1）
+		}
+		if i >= len(bs) {
+			return 1
+		}
+		if c := comparePreSegment(as[i], bs[i]); c != 0 {
+			return c
+		}
+	}
+	return 0
+}
+
+// splitPreSegments：按 '-' 和 '.' 拆段（与 Android 端 comparePrerelease 一致）
+func splitPreSegments(s string) []string {
+	var out []string
+	cur := ""
+	for _, r := range s {
+		if r == '-' || r == '.' {
+			if cur != "" {
+				out = append(out, cur)
+				cur = ""
+			}
+			continue
+		}
+		cur += string(r)
+	}
+	if cur != "" {
+		out = append(out, cur)
+	}
+	return out
+}
+
+// comparePreSegment：比较单个预发布段
+func comparePreSegment(a, b string) int {
+	an, aErr := strconv.ParseInt(a, 10, 64)
+	bn, bErr := strconv.ParseInt(b, 10, 64)
+	if aErr == nil && bErr == nil {
+		if an == bn {
+			return 0
+		}
+		if an > bn {
 			return 1
 		}
 		return -1
 	}
-	return 0
+	aPrefix, aNum := splitAlphaNum(a)
+	bPrefix, bNum := splitAlphaNum(b)
+	if aPrefix != bPrefix {
+		if aPrefix > bPrefix {
+			return 1
+		}
+		return -1
+	}
+	if aNum == bNum {
+		return 0
+	}
+	if aNum > bNum {
+		return 1
+	}
+	return -1
+}
+
+// splitAlphaNum：把 "beta10" 拆成 ("beta", 10)；没有数字后缀时数字为 0
+func splitAlphaNum(s string) (string, int64) {
+	i := len(s)
+	for i > 0 && s[i-1] >= '0' && s[i-1] <= '9' {
+		i--
+	}
+	prefix := s[:i]
+	var num int64
+	if i < len(s) {
+		if v, err := strconv.ParseInt(s[i:], 10, 64); err == nil {
+			num = v
+		}
+	}
+	return prefix, num
 }
 
 // parseVersion：解析版本号 → (数字段列表, 预发布后缀)。

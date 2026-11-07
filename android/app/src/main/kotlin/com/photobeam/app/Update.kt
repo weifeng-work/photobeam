@@ -186,7 +186,20 @@ object UpdateChecker {
         return 0
     }
 
-    /** [修复] 预发布后缀逐段比较（数字段按数值，其余按字典序） */
+    /**
+     * [修复] 预发布后缀逐段比较（数字段按数值，其余按字典序）
+     *
+     * [Stage 17 · 修复 M-5] 上一版"修复"其实没生效：它先 `av.toIntOrNull()`，
+     * 而 `"beta10".toIntOrNull()` 返回 **null**（带字母前缀不是纯数字）→
+     * 落进 `else if (av != bv) return if (av > bv) 1 else -1` 这条**字典序**分支。
+     * `"beta10" > "beta2"` 为 false（'1' < '2'）→ 仍判 `1.2.0-beta10` 比
+     * `1.2.0-beta2` **旧** → 更新检查照样误报「已是最新」。
+     *
+     * 现在把非纯数字段再拆成「字母前缀 + 数字后缀」：
+     *   beta10 → ("beta", 10)，beta2 → ("beta", 2)
+     *   前缀按字典序、数字按数值 → beta10 > beta2 ✓
+     * 没有数字后缀的段（如 "beta"）数字部分按 0 处理 → beta < beta10。
+     */
     private fun comparePrerelease(a: String, b: String): Int {
         val as1 = a.split('-', '.').filter { it.isNotEmpty() }
         val bs1 = b.split('-', '.').filter { it.isNotEmpty() }
@@ -194,15 +207,39 @@ object UpdateChecker {
         for (i in 0 until n) {
             val av = as1.getOrNull(i) ?: return -1 // 段数少者更旧（1.2.0-beta < 1.2.0-beta.1）
             val bv = bs1.getOrNull(i) ?: return 1
-            val an = av.toIntOrNull()
-            val bn = bv.toIntOrNull()
-            if (an != null && bn != null) {
-                if (an != bn) return if (an > bn) 1 else -1
-            } else if (av != bv) {
-                return if (av > bv) 1 else -1
-            }
+            val c = compareSegment(av, bv)
+            if (c != 0) return c
         }
         return 0
+    }
+
+    /**
+     * 比较单个预发布段。
+     *   · 两段都是纯数字 → 数值比较
+     *   · 否则拆成（字母前缀, 数字后缀）→ 前缀字典序、后缀数值
+     *     "beta10" vs "beta2" → ("beta",10) vs ("beta",2) → 10 > 2
+     *     "beta"   vs "beta10" → ("beta",0)  vs ("beta",10) → 更旧
+     *     "alpha"  vs "beta"   → "alpha" < "beta"
+     */
+    private fun compareSegment(av: String, bv: String): Int {
+        val an = av.toIntOrNull()
+        val bn = bv.toIntOrNull()
+        if (an != null && bn != null) {
+            return if (an == bn) 0 else if (an > bn) 1 else -1
+        }
+        val (aPrefix, aNum) = splitAlphaNum(av)
+        val (bPrefix, bNum) = splitAlphaNum(bv)
+        if (aPrefix != bPrefix) return if (aPrefix > bPrefix) 1 else -1
+        return if (aNum == bNum) 0 else if (aNum > bNum) 1 else -1
+    }
+
+    /** 把 "beta10" 拆成 ("beta", 10)；没有数字后缀时数字部分为 0 */
+    private fun splitAlphaNum(s: String): Pair<String, Long> {
+        var i = s.length
+        while (i > 0 && s[i - 1].isDigit()) i--
+        val prefix = s.substring(0, i)
+        val num = if (i < s.length) (s.substring(i).toLongOrNull() ?: 0L) else 0L
+        return prefix to num
     }
 
     private data class Parsed(val nums: IntArray, val pre: String)

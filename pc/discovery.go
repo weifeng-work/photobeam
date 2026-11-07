@@ -15,7 +15,7 @@ var (
 )
 
 func startDiscoveryResponder() error {
-	addr := &net.UDPAddr{Port: cfg.UDPPort}
+	addr := &net.UDPAddr{Port: udpPort()} // [L3] 走访问器，不裸读 cfg
 	conn, err := net.ListenUDP("udp4", addr)
 	if err != nil {
 		return err
@@ -53,7 +53,7 @@ func startDiscoveryResponder() error {
 			conn.WriteToUDP(resp, raddr)
 		}
 	})
-	logf("UDP 发现应答 :%d", cfg.UDPPort)
+	logf("UDP 发现应答 :%d", udpPort()) // [L3]
 	return nil
 }
 

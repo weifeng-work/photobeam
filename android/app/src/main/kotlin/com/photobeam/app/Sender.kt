@@ -147,8 +147,31 @@ object Sender {
     private val PNG_IEND = byteArrayOf('I'.code.toByte(), 'E'.code.toByte(),
         'N'.code.toByte(), 'D'.code.toByte())
 
-    /** HEIC/HEIF 顶层 ftyp brand 白名单（协议 §5.2 白名单内格式的常见 brand） */
-    private val HEIC_BRANDS = setOf("heic", "heix", "hevc", "hevx", "mif1", "msf1")
+    /**
+     * HEIC/HEIF 顶层 ftyp brand 白名单（协议 §5.2 白名单内格式的常见 brand）
+     *
+     * [Stage 17 · 修复 L-3] 补全 brand 集合。原来只有
+     * `heic/heix/hevc/hevx/mif1/msf1` —— 而各厂商实际会写：
+     *   · `heis` / `heim` / `hevm`  高通/联发科的 HEIF 变体
+     *   · `mif2`                    HEIF 第 2 版
+     *   · `avif` / `avio`           AVIF（同属 ftyp 容器，扩展名落在白名单外的会被拒，
+     *                                但有些 ROM 把 AVIF 存成 .heic/.jpg）
+     *   · `msf1` 之外还有 `mfs1`
+     * 落在白名单外的后果：`isHeic()` 返回 false → completeImage 走 else 分支判不完整
+     * → 连续 20 轮后按 unreadable **丢弃** → **用户的照片永远发不出去**。
+     *
+     * 更稳的做法：brand 只用来快速否定（防止把任意 ftyp 容器当图片），
+     * 真正的完整性判据交给 heicComplete() 的顶层 box 走查 —— 那个判据与 brand 无关，
+     * 且能可靠拦住截断文件。所以这里宁宽勿窄。
+     */
+    private val HEIC_BRANDS = setOf(
+        "heic", "heix", "hevc", "hevx",
+        "heim", "heis", "hevm", "hevs",
+        "mif1", "mif2", "msf1", "mfs1",
+        "avif", "avio",
+        // 某些 ROM 把 HEIC 写成通用 brand（不指明具体编码）
+        "mif3"
+    )
 
     // ---------- 格式魔数 ----------
 
@@ -289,20 +312,43 @@ object Sender {
 
     // ---------- GIF ----------
 
+    /**
+     * GIF 完整性：必须有一个 trailer 0x3B，且其后附加 ≤MAX_TRAILER。
+     *
+     * [Stage 17 · 修复 L-4] 原来要求「**末字节**就是 0x3B」——对截断文件有效，
+     * 但 ROM 一旦给 GIF 尾部追加元数据（vivo 对 JPEG 就是这么干的）就永久阻塞：
+     * 判不完整 → 20 轮后丢弃 → 用户照片永远发不出去。
+     * 现在与 JPEG/PNG/WebP 同口径：找最后一个 0x3B，尾部额度统一 MAX_TRAILER。
+     */
     private fun gifComplete(data: ByteArray): Boolean {
         if (!isGif(data)) return false
-        // GIF 以 trailer 0x3B 结束
-        return u8(data[data.size - 1]) == 0x3B
+        // 从尾部往前找 trailer 0x3B（GIF 的数据块理论上可能含 0x3B，
+        // 所以取**最后一个**；截断文件里根本没有 0x3B → 仍然拦住）
+        var i = data.size - 1
+        while (i >= 0) {
+            if (u8(data[i]) == 0x3B) {
+                return data.size - 1 - i <= MAX_TRAILER
+            }
+            i--
+        }
+        return false
     }
 
     // ---------- BMP ----------
 
+    /**
+     * BMP 完整性：头内 bfSize 与文件大小自洽（允许多出 ≤MAX_TRAILER 的尾部附加）。
+     *
+     * [Stage 17 · 修复 L-4] 原来要求 `bfSize == data.size` **精确相等**——ROM 追加
+     * 元数据就永久阻塞（同上）。截断文件仍被拦住，因为 bfSize 是写入时就定下的。
+     */
     private fun bmpComplete(data: ByteArray): Boolean {
         if (!isBmp(data)) return false
         // 头内 bfSize（偏移 2，小端 u32）= 文件大小
         val bfSize = readLE32(data, 2)
         if (bfSize < 0) return false
-        return bfSize == data.size.toLong()
+        val total = data.size.toLong()
+        return bfSize == total || (bfSize < total && total - bfSize <= MAX_TRAILER)
     }
 
     // ---------- HEIC/HEIF ----------

@@ -73,3 +73,45 @@ func TestSplitVersion(t *testing.T) {
 		t.Errorf("splitVersion(\"\") = %v，期望空", got)
 	}
 }
+
+// TestCompareVersionsPrerelease：预发布后缀的逐段比较
+//
+// [Stage 17] 为什么单列一组：这个 bug 的性质是「声称修了、其实没生效」——
+// 上一版只把后缀按字符串比（`aPre > bPre`），于是 "beta10" < "beta2"，
+// 1.2.0-beta10 被判成比 1.2.0-beta2 更旧 → 检查更新误报「已是最新」。
+// Android 端（Update.kt comparePrerelease）有同一个 bug，两边必须同口径。
+func TestCompareVersionsPrerelease(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want int
+	}{
+		// 带数字后缀：必须按数值比，不能按字典序（"beta10" < "beta2" 是字典序陷阱）
+		{"1.2.0-beta10", "1.2.0-beta2", 1},
+		{"1.2.0-beta2", "1.2.0-beta10", -1},
+		// 点分形式
+		{"1.2.0-beta.10", "1.2.0-beta.2", 1},
+		{"1.2.0-beta.2", "1.2.0-beta.10", -1},
+		// 纯字母：字典序
+		{"1.2.0-beta", "1.2.0-alpha", 1},
+		{"1.2.0-alpha", "1.2.0-beta", -1},
+		// 有数字后缀比没有的新
+		{"1.2.0-beta10", "1.2.0-beta", 1},
+		{"1.2.0-beta", "1.2.0-beta10", -1},
+		// 相同
+		{"1.2.0-beta2", "1.2.0-beta2", 0},
+		// 分隔符不同并不等价：按语义化版本，["beta","2"] 的首个标识符 "beta" < "beta2" → 更旧
+		{"1.2.0-beta.2", "1.2.0-beta2", -1},
+		{"1.2.0-beta2", "1.2.0-beta.2", 1},
+		// 预发布永远比同号正式版旧
+		{"1.2.0-beta10", "1.2.0", -1},
+		{"1.2.0", "1.2.0-beta10", 1},
+		// 段数不同：少者更旧
+		{"1.2.0-beta", "1.2.0-beta.1", -1},
+		{"1.2.0-beta.1", "1.2.0-beta", 1},
+	}
+	for _, c := range cases {
+		if got := compareVersions(c.a, c.b); got != c.want {
+			t.Errorf("compareVersions(%q, %q) = %d，期望 %d", c.a, c.b, got, c.want)
+		}
+	}
+}

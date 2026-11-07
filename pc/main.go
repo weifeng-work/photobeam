@@ -424,7 +424,7 @@ func buildDiagnostics() string {
 	fmt.Fprintf(&b, "生成时间: %s\r\n", timeNow().Format("2006-01-02 15:04:05"))
 	fmt.Fprintf(&b, "协议版本: %d\r\n", ProtoVer)
 	fmt.Fprintf(&b, "指纹: %s\r\n", identity.FP())
-	fmt.Fprintf(&b, "TCP 监听: %d\r\nUDP 发现: %d\r\n", tcpPort(), cfg.UDPPort)
+	fmt.Fprintf(&b, "TCP 监听: %d\r\nUDP 发现: %d\r\n", tcpPort(), udpPort()) // [L3]
 	fmt.Fprintf(&b, "保存目录: %s\r\n", getSaveDir())
 	fmt.Fprintf(&b, "防火墙规则: %s\r\n", firewallRuleState())
 	devs := devicesSnapshot()
@@ -527,8 +527,31 @@ func firewallRuleState() string {
 	return "存在（PhotoBeam-TCP / UDP）"
 }
 
+// ensureFirewall：防火墙规则的「一次性 UAC 预置」+「每次启动路径自检」。
+//
+// [M1 修复] 旧实现开头是 `if firewallAttempted() { return }` —— 而 cfg.FWDone
+// 一旦预置成功就写进 config.json 且**永远只置 true**，ensureFirewall 又是
+// **启动时只调一次** ⇒ 第二次及以后启动，连路径一致性自检都不会执行，
+// 「升级/移动 exe 后规则绑旧路径 → 自动重建」在真实使用中永远不会自愈。
+// 现在把两件事拆开：
+//   · 每次启动都跑路径自检（firewallPathVerdict）；
+//   · 只有「从未成功预置过」才走 UAC 预置（避免每次启动弹 UAC 骚扰）；
+//   · 已预置过但路径对不上 → 只提示用户去托盘『修复防火墙规则』重建。
 func ensureFirewall() {
+	verdict := firewallPathVerdict()
+	if !strings.Contains(verdict, "未找到") && !strings.Contains(verdict, "不一致") {
+		// 规则齐全且按当前 exe 路径绑定 → 无需 UAC
+		if !firewallAttempted() {
+			setFirewallAttempted(true)
+			saveConfig(cfg)
+		}
+		return
+	}
 	if firewallAttempted() {
+		// 已经预置过一次 → 不再每次启动弹 UAC，只提示用户手动重建。
+		logWarn("防火墙规则与当前 exe 不一致: %s", verdict)
+		trayWarn("防火墙规则与当前程序路径不一致，手机可能连不上本机。\n" +
+			"请从托盘菜单『修复防火墙规则』重建。\n\n" + verdict)
 		return
 	}
 	// [修复] 协议 §8 要求「启动自检规则存在 + 路径一致，失效自动重建」。
@@ -536,19 +559,13 @@ func ensureFirewall() {
 	// 但自愈逻辑永远不触发（路径比对只在诊断文本里展示给人看）。
 	// 现在把「路径不一致」也纳入自动重建条件（verdict 由 firewallPathVerdict 给出，
 	// 它对两条规则分别判「未找到 / 不一致（未按程序绑定）/ 不一致（绑的是别的路径）/ 一致」）。
-	verdict := firewallPathVerdict()
-	if strings.Contains(verdict, "未找到") || strings.Contains(verdict, "不一致") {
-		if r := addFirewallRulesElevated(); r > 32 {
-			setFirewallAttempted(true)
-			saveConfig(cfg)
-			logf("防火墙规则已预置/重建（自检：%s）", verdict)
-		} else {
-			logf("防火墙规则预置被取消（UAC 拒绝），可稍后从托盘修复")
-			trayWarn("防火墙规则未创建（UAC 被取消）。\n手机可能连不上本机。\n可稍后从托盘菜单『修复防火墙规则』重试。")
-		}
-	} else {
+	if r := addFirewallRulesElevated(); r > 32 {
 		setFirewallAttempted(true)
 		saveConfig(cfg)
+		logf("防火墙规则已预置/重建（自检：%s）", verdict)
+	} else {
+		logf("防火墙规则预置被取消（UAC 拒绝），可稍后从托盘修复")
+		trayWarn("防火墙规则未创建（UAC 被取消）。\n手机可能连不上本机。\n可稍后从托盘菜单『修复防火墙规则』重试。")
 	}
 }
 

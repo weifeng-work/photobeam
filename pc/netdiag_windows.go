@@ -226,12 +226,20 @@ func bufAt[T any](buf []byte, off uintptr) *T {
 
 // bufPtrAt：取缓冲区内的 uintptr 字段（按偏移）
 func bufPtrAt(buf []byte, off uintptr) uintptr {
+	if off+unsafe.Sizeof(uintptr(0)) > uintptr(len(buf)) {
+		// [L4] 越界兜底：当前唯一调用点被 `a.Length >= 216` 兜住，但 helper 将来
+		// 换偏移就可能越界读（unsafe 越界读不 panic，只会读到垃圾或崩进程）。
+		return 0
+	}
 	return *(*uintptr)(unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + off))
 }
 
 // bufU32At：取缓冲区内的 uint32 字段（按偏移）—— 用于按**真实结构偏移**读字段，
 // 不必在 Go 结构体里逐字段复刻（漏一个字段后面全体错位）。
 func bufU32At(buf []byte, off uintptr) uint32 {
+	if off+unsafe.Sizeof(uint32(0)) > uintptr(len(buf)) {
+		return 0 // [L4] 越界兜底，理由同 bufPtrAt
+	}
 	return *(*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&buf[0])) + off))
 }
 

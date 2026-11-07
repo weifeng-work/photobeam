@@ -451,7 +451,7 @@ D PhotoBeam: 状态通知已发 mode=fgs（正规前台服务）
 **本轮刻意未删**（如实说明理由）：
 
 - 根目录 `delivery_*.png` / `v_*.png` / `nodialog_check.png` / `pc_sas.png` / `enum_tray.py` → 被 `docs\stage2-evidence.md`、`stage3-evidence.md`、`.lam\` 交接件引用，是**前序阶段证据**，不是本轮产物。
-- 设备 `/sdcard/Pictures/<USER-DIR>/`、`<USER-DIR>B/`（本轮端到端测试图各 3 张）→ 删掉后 MediaStore 仍会列出这些条目，App 对账会重新入队但文件已不存在 → 队列留下永久「文件未就绪」的 pending 项，污染运行状态。
+- 设备 `/sdcard/Pictures/<USER-DIR>/`、`<USER-DIR>b/`（本轮端到端测试图各 3 张）→ 删掉后 MediaStore 仍会列出这些条目，App 对账会重新入队但文件已不存在 → 队列留下永久「文件未就绪」的 pending 项，污染运行状态。
 
 ---
 
@@ -483,7 +483,7 @@ adb shell dumpsys notification --noredact | Select-String 'NotificationRecord\(.
 
 # 4) 端到端同步（后台状态下也要跑通）
 python tools\gen-test-images.py docs\stage4-screenshots\probeimgs_fgs2 3 1080 2340 92 2026110909
-adb push docs\stage4-screenshots\probeimgs_fgs2 /sdcard/Pictures/<USER-DIR>B/
+adb push docs\stage4-screenshots\probeimgs_fgs2 /sdcard/Pictures/<USER-DIR>b/
 adb shell content call --uri content://media/external/images/media --method scan_volume --arg external_primary
 #    等 ~30s 对账（MediaStore 扫描入库有延迟），手机日志应出现
 #      「对账新增 3」「冲刷队列: 待发 3 张 → <PC-NAME>」+ 3 次「落盘确认」

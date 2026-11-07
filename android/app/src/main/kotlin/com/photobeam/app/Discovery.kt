@@ -75,13 +75,31 @@ object Discovery {
     /** 网络指纹（配对成功时记录，发送前比对）[N-06][S-01] */
     fun currentFingerprint(ctx: Context): String {
         // 判据降级：SSID 需要定位权限 [S-01]——不用 SSID，用网关 IP + 子网（无需危险权限）
-        val gw = gatewayIP(ctx) ?: return "unknown"
+        val gw = gatewayIP(ctx) ?: return FP_UNKNOWN
         val nif = activeInterfaces().firstOrNull { n ->
             n.interfaceAddresses.any { it.address.hostAddress == ownIP() }
         }
         val prefix = nif?.interfaceAddresses?.firstOrNull { it.address.address.size == 4 }?.networkPrefixLength ?: 0
         return "$gw/$prefix"
     }
+
+    /** [Stage 17 · 修复 S-1] 「判不出网络指纹」的占位值 */
+    const val FP_UNKNOWN = "unknown"
+
+    /**
+     * [Stage 17 · 修复 S-1] 指纹是否**可判定**。
+     *
+     * 为什么要有这个：协议 §2 明确要求「读不到 → 判据降级，**不得阻断**」。
+     * 但 `currentFingerprint()` 在读不到网关时返回 [FP_UNKNOWN]，
+     * 而发送前的比对是 `fpNow != fpPaired` —— 一旦把配对时的指纹写入端接上，
+     * **任何一次读不到网关**（部分 ROM 的 dhcpInfo 不可读、以太网、
+     * VPN 虚拟网卡、WiFi 刚连上的瞬间）都会被判成「网络已切换」→
+     * 永久跳过发送，比不接线更糟。
+     *
+     * 所以比对前必须先问一句「这次判得出来吗」：判不出来就放行。
+     */
+    fun isFingerprintUsable(fp: String?): Boolean =
+        fp != null && fp.isNotEmpty() && fp != FP_UNKNOWN
 
     fun ownIP(): String? {
         for (nif in activeInterfaces()) {

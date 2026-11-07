@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/sys/windows"
 )
@@ -36,33 +37,45 @@ const (
 // 冷却期内该 IP 的配对请求一律以 MODE err{reason:"pairing_cooldown"} 明确拒绝
 // （不静默断链，让手机知道要等）。
 //
-// 计数口径（实现约定）：
-//   · 只统计 pairing 分支的**异常失败**——未展示向导窗却收到 pair_confirm、
-//     PC 用户未确认（点不一致/超时/被新会话取代）、SAS 或签名校验失败。
-//   · 手机端主动发 pair_reject（人眼核对后决定拒绝）**不计失败**——那是协议
-//     设计的正常工作路径，用户核对数字不一致不该被惩罚成「攻击」。
+// 计数口径（协议 §3.4 原文：「计数点 = 收到 PAIR_CONFIRM 且校验失败时」）：
+//   · **计入冷却**的只有两类异常：① 未展示向导窗却收到 pair_confirm；
+//     ② SAS 或签名校验失败。
+//   · **不计入冷却**：PC 用户点「不一致」、PC 端等待确认超时、手机端主动 pair_reject。
+//     这三条都是协议 §3.2 的**正常工作路径**（用户人眼核对后主动终止），不是攻击。
+//     旧实现把前两条也计了进去，且与手机端**口径不对称**（提交注释特意声明
+//     「手机端主动 pair_reject 不计」）→ 用户连续 5 次没看/没点配对对话框
+//     （或看错数字点了「不一致」）就被锁 60 秒；
+//     而手机端没有 pairing_cooldown 分支 → 用户只看到「对方电脑已经拒绝或断开了配对」，
+//     完全不知道自己被限流 —— 限流变成玄学失败。
+//   · 用户拒绝/超时**单独计数**（pairingUserFail，阈值更高），只记日志，不触发冷却。
 //   · 已配对设备的重连失败不进这里（诊断计数 authStats 与之分离）。
 //   · 配对成功 → 清空该 IP 的全部失败记录。
 // 内存安全：按需回收 24 小时无活动的条目，防恶意刷 IP 撑爆 map。
 
 const (
-	pairFailWindow     = 60 * time.Second  // 失败计数窗口
-	pairFailMax        = 5                 // 窗口内允许的失败次数上限
-	pairCooldown       = 60 * time.Second  // 触发后的冷却时长
-	pairStatRetention  = 24 * time.Hour    // 条目保留时长
-	pairStatGCInterval = 5 * time.Minute   // 回收检查间隔
+	pairFailWindow     = 60 * time.Second // 失败计数窗口
+	pairFailMax        = 5                // 窗口内允许的失败次数上限
+	pairCooldown       = 60 * time.Second // 触发后的冷却时长
+	pairStatRetention  = 24 * time.Hour   // 条目保留时长
+	pairStatGCInterval = 5 * time.Minute  // 回收检查间隔
+	// [F2] 用户拒绝/确认超时的**单独统计**参数：属正常工作路径，
+	// 阈值远高于异常失败（5 次），只用于诊断留痕，**绝不触发冷却**。
+	pairUserFailWindow = 10 * time.Minute
+	pairUserFailMax    = 20
 )
 
 type pairFailStat struct {
 	times         []time.Time // 窗口内的失败时刻
 	cooldownUntil time.Time   // 冷却截止时刻（零值 = 不在冷却期）
 	lastSeen      time.Time   // 最近一次活动（GC 用）
+	lastNotify    time.Time   // 最近一次「限流原因」提示时间（防刷屏）
 }
 
 var (
-	pairStatMu    sync.Mutex
-	pairStatByIP  = map[string]*pairFailStat{}
-	pairStatGCLas = time.Time{}
+	pairStatMu       sync.Mutex
+	pairStatByIP     = map[string]*pairFailStat{}
+	pairUserFailByIP = map[string][]time.Time{} // [F2] 用户拒绝/超时单独统计
+	pairStatGCLas    = time.Time{}
 )
 
 // pairingCooldownRemaining：该 IP 剩余冷却时长（0 = 不在冷却期）。
@@ -110,7 +123,60 @@ func pairingCooldownFail(ip string) {
 func pairingCooldownReset(ip string) {
 	pairStatMu.Lock()
 	delete(pairStatByIP, ip)
+	delete(pairUserFailByIP, ip)
 	pairStatMu.Unlock()
+}
+
+// pairingUserFail：记录一次「用户主动拒绝 / 等待确认超时」这类**正常工作路径**的失败。
+//
+// [F2] 与 pairingCooldownFail **分开统计**：协议 §3.4 的计数点只有
+// 「收到 PAIR_CONFIRM 且校验失败」，用户没看对话框、看错数字点了「不一致」
+// 都不该被当成攻击而锁 60 秒。这里只做诊断留痕，达到更高阈值时记一条日志，
+// **绝不触发冷却**。
+func pairingUserFail(ip, reason string) {
+	now := time.Now()
+	pairStatMu.Lock()
+	defer pairStatMu.Unlock()
+	times := pairUserFailByIP[ip]
+	keep := times[:0]
+	for _, t := range times {
+		if now.Sub(t) < pairUserFailWindow {
+			keep = append(keep, t)
+		}
+	}
+	keep = append(keep, now)
+	pairUserFailByIP[ip] = keep
+	if len(keep) >= pairUserFailMax {
+		logWarn("IP %s 在 %v 内多次拒绝/超时配对（%d 次，最近：%s）—— 属正常工作路径，不触发冷却",
+			ip, pairUserFailWindow, len(keep), reason)
+	}
+}
+
+// notifyPairingCooldown：PC 端把「为什么被限流」明确告诉用户。
+//
+// [F2] 背景：手机端没有 pairing_cooldown 的文案分支，用户只会看到
+// 「对方电脑已经拒绝或断开了配对（连接已关闭）」，完全不知道自己被限流 ——
+// 限流变成了一种「玄学失败」。PC 端在这里补上明确原因。
+// 同一个 IP 的一次冷却期内只提示一次（冷却 60 秒，期间手机可能反复重试）。
+func notifyPairingCooldown(ip string, left time.Duration) {
+	pairStatMu.Lock()
+	s := pairStatByIP[ip]
+	if s == nil {
+		pairStatMu.Unlock()
+		return
+	}
+	if !s.lastNotify.IsZero() && time.Since(s.lastNotify) < pairCooldown {
+		pairStatMu.Unlock()
+		return // 本次冷却已提示过 → 不重复打扰用户
+	}
+	s.lastNotify = time.Now()
+	pairStatMu.Unlock()
+	messageBox(fmt.Sprintf(
+		"来自 %s 的配对请求被暂时限流，约 %d 秒后才能重试。\n\n"+
+			"原因：短时间内多次配对校验未通过（协议 §3.4 的速率限制）。\n"+
+			"如果这不是你在操作，请检查局域网内是否有陌生设备在反复尝试配对。",
+		ip, int(left.Seconds())+1),
+		"PhotoBeam 配对被限流")
 }
 
 // pairStatGC：回收长期不活跃的条目。调用方必须已持有 pairStatMu。
@@ -122,6 +188,12 @@ func pairStatGC(now time.Time) {
 	for ip, s := range pairStatByIP {
 		if now.Sub(s.lastSeen) > pairStatRetention {
 			delete(pairStatByIP, ip)
+		}
+	}
+	// [F2] 用户拒绝/超时的单独统计同样要回收（否则 map 会被恶意 IP 撑爆）
+	for ip, times := range pairUserFailByIP {
+		if len(times) == 0 || now.Sub(times[len(times)-1]) > pairStatRetention {
+			delete(pairUserFailByIP, ip)
 		}
 	}
 }
@@ -323,9 +395,16 @@ func handleConn(conn net.Conn) {
 			logf("IP %s 处于配对冷却期（剩余 %v），拒绝配对请求", peerIP, left.Round(time.Second))
 			cooldownFrame, _ := jsonMarshalIndent(map[string]any{
 				"pb": 1, "type": "mode", "mode": "pairing", "fp": identity.FP(), "reset": false,
-				"err": map[string]any{"reason": "pairing_cooldown"},
+				// [F2] retry_after：告诉手机还要等多久（旧版手机忽略未知字段，向后兼容）
+				"err": map[string]any{"reason": "pairing_cooldown", "retry_after": int(left.Seconds()) + 1},
 			})
 			_ = writePlainFrame(conn, cooldownFrame)
+			// [F2] PC 端给出明确原因：手机端没有 pairing_cooldown 文案分支，
+			// 用户只看到「对方电脑已经拒绝或断开了配对」，不知道自己被限流。
+			// 放 goroutine 里弹窗：不阻塞连接收尾，也不拖住本连接。
+			go goroutineSafe("pairing-cooldown", func() {
+				notifyPairingCooldown(peerIP, left)
+			})
 			return
 		}
 	}
@@ -559,7 +638,7 @@ func handleConn(conn net.Conn) {
 		if pw == nil {
 			logf("收到 pair_confirm 但本端未展示 SAS 向导窗（pair_intent=false），拒绝配对")
 			authStats.fail("未展示 SAS 向导窗却收到 pair_confirm")
-			pairingCooldownFail(peerIP) // 协议 §3.4：异常失败计入速率限制
+			pairingCooldownFail(peerIP) // [F2] 协议 §3.4 计数点之一：收到 pair_confirm 却校验不成立 → 计入冷却
 			finish()
 			return
 		}
@@ -572,14 +651,17 @@ func handleConn(conn net.Conn) {
 			if !agreed {
 				logf("PC 用户未确认（点不一致 / 超时 / 被取代）→ 不接受配对")
 				authStats.fail("PC 用户未确认，拒绝配对")
-				pairingCooldownFail(peerIP) // 协议 §3.4：异常失败计入速率限制
+				// [F2] 用户主动拒绝是协议 §3.2 的正常工作路径，**不计入冷却**
+				// （与手机端主动 pair_reject 口径对称）→ 单独统计，只留痕。
+				pairingUserFail(peerIP, "PC 用户未确认（点不一致/超时/被新会话取代）")
 				finish()
 				return
 			}
 		case <-time.After(time.Duration(pairTimeoutMs+5) * time.Millisecond):
 			logf("等待 PC 用户确认超时 → 不接受配对")
 			authStats.fail("等待 PC 用户确认超时")
-			pairingCooldownFail(peerIP) // 协议 §3.4：异常失败计入速率限制
+			// [F2] 同上：用户一直没点确认不是攻击，不触发 60 秒冷却。
+			pairingUserFail(peerIP, "等待 PC 用户确认超时")
 			finish()
 			return
 		}
@@ -587,7 +669,7 @@ func handleConn(conn net.Conn) {
 		if !ctEqual(m.SAS, keys.SAS) || !ed25519.Verify(ed25519.PublicKey(edRaw), th, mustDecode(m.Sig)) {
 			logf("配对校验失败（SAS 或签名），静默断开")
 			authStats.fail("配对校验失败（SAS 或签名不一致）")
-			pairingCooldownFail(peerIP) // 协议 §3.4：异常失败计入速率限制
+			pairingCooldownFail(peerIP) // [F2] 协议 §3.4 计数点之一：SAS/签名校验失败 → 计入冷却
 			return
 		}
 		authStats.ok()
@@ -625,10 +707,21 @@ func handleConn(conn net.Conn) {
 			// [Stage 6 · 延迟优化] 只做关键路径：解码 + DIB（约 100ms）。
 			// PNG 重编码（846ms）由 writeClipboardWithRestore 的后台阶段完成——
 			// CF_DIB 写入后用户立刻就能 Ctrl+V。
+			name := origName
+			if name == "" {
+				name = filepath.Base(destPath)
+			}
+			saved := "已保存到 " + ellipsisTail(saveDir, 34) // [PC-4] 路径过长时保留尾部
 			t0 := timeNow()
 			dib, imgW, imgH, err := prepareImageDataFast(destPath)
 			if err != nil {
 				logf("图片解码失败: %v", err)
+				// [M2] 解码失败（gif/bmp/webp/heic 等未注册解码器的格式）时，
+				// 图片**已经落盘**（用户在接收文件夹里能看到），只是没进剪贴板。
+				// 旧实现只 logf 就 return —— 用户零反馈，以为「同步失败了」，
+				// 实际图就在硬盘上，白白重传。这里明确告诉用户「已保存，但格式不支持写剪贴板」。
+				showPopup4("已保存，但不支持写入剪贴板", name,
+					"该格式暂不支持写入剪贴板（仅 JPG/PNG 可写）", saved, 8000)
 				return
 			}
 			tDIB := timeNow()
@@ -641,11 +734,6 @@ func handleConn(conn net.Conn) {
 			tClip := timeNow()
 			logf("剪贴板关键路径: 解码+DIB=%v 写入=%v（PNG 后台补写）",
 				tDIB.Sub(t0), tClip.Sub(tDIB))
-			name := origName
-			if name == "" {
-				name = filepath.Base(destPath)
-			}
-			saved := "已保存到 " + ellipsisTail(saveDir, 34) // [PC-4] 路径过长时保留尾部
 			if ok {
 				hint := "Ctrl+V 可粘贴 · " + fmt.Sprint(clipboardSeconds()) + " 秒后还原"
 				if snapNil {
@@ -772,6 +860,23 @@ func messageLoop(conn net.Conn, key []byte, senderFP string, devDir string, onFi
 			case "file_end":
 				if rx == nil {
 					return
+				}
+				// [L1] 协议 §5.1：file_end 带 file_id —— 必须与当前接收中的文件比对。
+				// 此前 PC 完全忽略它：手机在「未 file_end 又来 file_meta」被 PC 收掉旧 part 之后，
+				// 再补发**旧文件**的 file_end → 会把**新文件**的 rx.part 关掉并 finalize
+				// （哈希不匹配 → 新图被删）。不一致就丢弃这条 file_end 并记违规日志。
+				var fe struct {
+					Type   string `json:"type"`
+					FileID string `json:"file_id"`
+				}
+				if parseJSONInto(pt, &fe) != nil {
+					return
+				}
+				// rx.fileID 为空 = 该文件已在 file_meta 阶段被拒（file_id 非法）→ 没有可比对的基准
+				if rx.fileID != "" && fe.FileID != "" && !strings.EqualFold(fe.FileID, rx.fileID) {
+					logWarn("协议违规：file_end 的 file_id 与当前文件不一致（收到 %s，期望 %s）→ 丢弃该 file_end",
+						fe.FileID, rx.fileID)
+					continue
 				}
 				rx.part.Close()
 				if rx.skip {
@@ -1055,7 +1160,10 @@ func sanitizeName(name string) (string, error) {
 	if reservedNames[strings.ToUpper(base)] {
 		return "", fmt.Errorf("%q 是 Windows 保留设备名", base)
 	}
-	if len(base) > 200 {
+	// [L2] 上限按**字符（rune）**计，不是字节：文案写的是「200 字符」，
+	// 旧实现用 len()（字节数）→ 中文文件名约 66 字就被拒，与文案口径不符；
+	// 也与 relpath.go 的 maxPathSegment（已改成 rune 计数）不一致。
+	if utf8.RuneCountInString(base) > 200 {
 		return "", errors.New("文件名超过 200 字符上限")
 	}
 	ext := strings.ToLower(filepath.Ext(base))

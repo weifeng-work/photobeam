@@ -309,7 +309,17 @@ class PairingEngine(
     }
 
     fun savePairedPC(pc: PairedPC) {
-        android.util.Log.d("PhotoBeam", "savePairedPC: fp=${pc.fp} name=${pc.name} devDir=${pc.devDir} prefs=$prefs")
+        // [Stage 17 · 修复 S-2] **绝不能**把 prefs 整个打进日志。
+        //
+        // 原实现末尾带 `prefs=$prefs`：SharedPreferencesImpl.toString() 会打印
+        // map 里**全部** key=value —— 其中含 `ed_seed`（Ed25519 私钥种子）与
+        // `x_priv`（X25519 私钥）。而 savePairedPC 在**每次重连**都会调用
+        // （:527），正常同步时等于**每 30 秒把两把长期身份私钥原文写进 logcat**。
+        //
+        // 后果：私钥进日志环形缓冲 → adb logcat、厂商自动上传的日志收集、
+        // 任何崩溃上报 SDK 都能拿到 → 可冒充本机。这与本项目
+        // 「数据不出局域网、不上云」的隐私承诺直接冲突。
+        android.util.Log.d("PhotoBeam", "savePairedPC: fp=${pc.fp} name=${pc.name} devDir=${pc.devDir}")
         // [A4] 记录配对时间（诊断信息用）：只在**首次**配对时写入，
         // 之后 updateLastConnection 的重写不能覆盖它。
         val pairedAt = try {
@@ -459,9 +469,15 @@ class PairingEngine(
             //
             // [协议 §3.2 [R-13][R-14]] 第三个参数 wasPinned = 本端**已 pin 过这台 PC**，
             // 但 PC 却回 pairing（= 它的配对记录被重置了）→ 对话框要追加确认文案。
-            // 首次配对（known==null）不提示。reset 字段无论真假都以 known 为准（协议原文
-            // 「Sender 已 pin 该 PC 但 mode=pairing（无论 reset）」）。
-            when (sasConfirm(sas, peerHello.optString("dev_name", ""), known != null)) {
+            //
+            // [Stage 17 · 修复 M-6] 判定必须带上 fp 比对：`known != null` 只能说明
+            // 「本机存过**某一台**电脑」，不能说明「存的就是**这次握手对面这台**」。
+            // 协议原文（docs/protocol-v1.md:210）写的是「Sender 已 pin **该 PC** 但
+            // mode=pairing」。用 known != null 的后果：先配了 PC-A，之后改配同网段的
+            // PC-B → PC-B 回 pairing → wasPinned=true → 弹「该电脑的配对记录已被重置」，
+            // 而 PC-B 从来没配过；用户确认后还会静默覆盖 PC-A 的信任记录。
+            when (sasConfirm(sas, peerHello.optString("dev_name", ""),
+                known != null && known.fp == peerFP)) {
                 SAS_CONFIRM -> {
                     ch.writeFrame(out, FRAME_CTRL, org.json.JSONObject()
                         .put("type", "pair_confirm")

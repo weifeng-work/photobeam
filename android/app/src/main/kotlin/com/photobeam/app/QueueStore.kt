@@ -32,7 +32,14 @@ class QueueItem(
      * 0 = 无退避，随时可发。**放在带默认值的末尾**：旧 queue.json 没有这个字段
      * → parse 用 optLong 默认 0 → 老数据照常工作。
      */
-    var nextAttemptAt: Long = 0
+    var nextAttemptAt: Long = 0,
+    /**
+     * [Stage 17 · 修复 L-5] 被标记 dropped 的时刻（秒）。
+     * prune 用它清理，而不是 capturedAt —— 否则补传时丢弃的**老照片**
+     * （capturedAt 早就过了 7 天门槛）下一轮就被删，诊断记录瞬间消失。
+     * 0 = 未知（旧数据）→ 回退到 capturedAt，行为与升级前一致。
+     */
+    var droppedAt: Long = 0
 )
 
 class QueueStore(private val ctx: Context) {
@@ -76,7 +83,7 @@ class QueueStore(private val ctx: Context) {
                 e.optString("batch_id"), e.optBoolean("is_latest"),
                 e.optInt("batch_size", 1), e.optString("state", "pending"),
                 e.optInt("unready_tries"), e.optInt("tries"), e.optString("drop_reason"),
-                e.optLong("next_attempt_at", 0L)))
+                e.optLong("next_attempt_at", 0L), e.optLong("dropped_at", 0L)))
         }
         lastMaxId = o.optLong("last_max_id", 0)
         batchSeq = o.optInt("batch_seq", 0)
@@ -100,7 +107,8 @@ class QueueStore(private val ctx: Context) {
             .put("state", it.state)
             .put("unready_tries", it.unreadyTries)
             .put("tries", it.tries).put("drop_reason", it.dropReason)
-            .put("next_attempt_at", it.nextAttemptAt))
+            .put("next_attempt_at", it.nextAttemptAt)
+            .put("dropped_at", it.droppedAt))
         o.put("items", arr)
         o.put("last_max_id", lastMaxId)
         o.put("batch_seq", batchSeq)
@@ -118,11 +126,26 @@ class QueueStore(private val ctx: Context) {
             fos.fd.sync()
         }
         // 保留上一版快照 [P0-10]
+        //
+        // [Stage 17 · 修复 L-7] 不能用 copyTo：`File.copyTo` 是**非原子**的流复制，
+        // 进程在拷贝中途被杀 → queue.json.bak 变成**半截 JSON**。
+        // 而 .bak 正是 load() 在 parse(file) 失败时的**唯一退路** → 退路也坏了。
+        // 改成「写 .bak.tmp → fsync → rename」，与主文件同样的原子语义。
         if (file.exists()) {
+            val bak = File(file.parentFile, "queue.json.bak")
+            val bakTmp = File(file.parentFile, "queue.json.bak.tmp")
             try {
-                file.copyTo(File(file.parentFile, "queue.json.bak"), overwrite = true)
+                java.io.FileOutputStream(bakTmp).use { fos ->
+                    file.inputStream().use { ins -> ins.copyTo(fos) }
+                    fos.flush()
+                    fos.fd.sync()
+                }
+                if (!bakTmp.renameTo(bak)) {
+                    android.util.Log.w("PhotoBeam", "写队列 .bak rename 失败（保留旧 .bak）")
+                }
             } catch (e: Exception) {
                 android.util.Log.w("PhotoBeam", "写队列 .bak 失败: ${e.message}")
+                try { bakTmp.delete() } catch (e2: Exception) { }
             }
         }
         // Android File.rename = rename(2) 同目录原子。
@@ -224,13 +247,23 @@ class QueueStore(private val ctx: Context) {
         var n = 0
         for (it in items) {
             if (it.state == "pending" && it.unreadyTries >= threshold) {
-                it.state = "dropped"
-                it.dropReason = "stuck_unreadable"
+                markDropped(it, "stuck_unreadable")
                 n++
             }
         }
         if (n > 0) save()
         return n
+    }
+
+    /** [Stage 17 · 修复 L-5] 取「丢弃时刻」；旧数据没有 droppedAt → 回退 capturedAt */
+    private fun droppedTimeOf(it: QueueItem): Long =
+        if (it.droppedAt > 0L) it.droppedAt else it.capturedAt
+
+    /** [Stage 17 · 修复 L-5] 标 dropped 时统一记录丢弃时刻（所有丢弃路径都该走这里） */
+    private fun markDropped(it: QueueItem, reason: String) {
+        it.state = "dropped"
+        it.dropReason = reason
+        it.droppedAt = System.currentTimeMillis() / 1000
     }
 
     @Synchronized
@@ -243,9 +276,22 @@ class QueueStore(private val ctx: Context) {
         // [修复] dropped 项以前**永不出队列**（只有 sent 超 30 天才删）→ queue.json
         // 长期膨胀、load() 越来越慢。这里补一条清理：保留最近 20 条 + 7 天内，
         // 与 sent 的 30 天策略同构（dropped 只是诊断信息，不需要长期保留）。
-        val droppedCutoff = System.currentTimeMillis() / 1000 - 7L * 24 * 3600
-        if (items.removeAll { it.state == "dropped" && it.capturedAt < droppedCutoff }) changed = true
-        val droppedItems = items.filter { it.state == "dropped" }.sortedBy { it.capturedAt }
+        // [Stage 17 · 修复 L-5] dropped 清理按「**丢弃时刻**」而不是「拍摄时刻」。
+        //
+        // 原实现用 capturedAt：补传（用户勾了「同时补传已有照片」）时被队列上限丢掉的
+        // 可能是**两年前**的老照片 → capturedAt 早就过了 7 天门槛 →
+        // 下一轮 prune 立刻把它们删掉 → 诊断信息里「哪些图被丢了、为什么丢」瞬间消失，
+        // 用户完全没法追。改用 droppedAt 后，丢弃记录至少保留 7 天。
+        //
+        // 兼容：旧 queue.json 没有 dropped_at 字段 → 取 0；对 0 回退到 capturedAt，
+        // 这样老数据的行为与之前一致（不会因为升级而突然全留着不删）。
+        val nowSec = System.currentTimeMillis() / 1000
+        val droppedCutoff = nowSec - 7L * 24 * 3600
+        if (items.removeAll {
+                it.state == "dropped" &&
+                    droppedTimeOf(it) < droppedCutoff
+            }) changed = true
+        val droppedItems = items.filter { it.state == "dropped" }.sortedBy { droppedTimeOf(it) }
         if (droppedItems.size > 20) {
             val remove = droppedItems.take(droppedItems.size - 20).toHashSet()
             if (items.removeAll(remove)) changed = true
@@ -254,13 +300,13 @@ class QueueStore(private val ctx: Context) {
         var dropped = 0
         while (items.count { it.state == "pending" } > 200) {
             val oldest = items.filter { it.state == "pending" }.minByOrNull { it.capturedAt } ?: break
-            oldest.state = "dropped"; oldest.dropReason = "queue_overflow"; dropped++
+            markDropped(oldest, "queue_overflow"); dropped++
         }
         var bytes = items.filter { it.state == "pending" }.sumOf { maxOf(it.size, 1L) }
         while (bytes > 500L * 1024 * 1024 && items.any { it.state == "pending" }) {
             val oldest = items.filter { it.state == "pending" }.minByOrNull { it.capturedAt } ?: break
             bytes -= maxOf(oldest.size, 1L)
-            oldest.state = "dropped"; oldest.dropReason = "queue_overflow"; dropped++
+            markDropped(oldest, "queue_overflow"); dropped++
         }
         if (dropped > 0) {
             Notifier.queueOverflow(ctx, dropped)
