@@ -1959,3 +1959,15 @@ src -manifest，
 9. **PC 端的 `pair_reject` 之后连接立即关闭**，手机端若正在等待则只会等到自己超时——见 §6.7。
 10. ~~**文件夹选择器是经典对话框（不预选、无路径框）**~~ → **第五轮已换现代「选择文件夹」**
     （GetOpenFileNameW + OFN_PICKFOLDERS）：预选当前接收目录 + 底部路径输入框 + 搜索框。
+11. **`go vet` 有 3 处 `unsafeptr` 告警，是已知误报，已在 CI 显式关掉该检查**
+    （`clipboard_windows.go` 的 `globalAllocCopy` / `globalRead`、`popup_windows.go` 的
+    CreateDIBSection 像素拷贝，共 3 处）。原因：Win32 的 `GlobalLock` / DIB `bits`
+    只能先拿到 `uintptr` 再转 `unsafe.Pointer`，vet 的 `unsafeptr` 规则对此必然误报；
+    这三处从 Initial commit 就在，不是后来引入的。
+    **为什么以前没人发现**：`go test` 默认只跑 vet 的一个子集（atomic / bool / printf / …），
+    不含 `unsafeptr` —— 所以「`go test` 全绿」当年被误读成了「`go vet` 干净」
+    （v1.2.5 的审查报告里就写了「go vet ✓」，实际 `go vet ./...` 退出码是 1）。
+    **现在的口径**：CI 增加一条独立步骤 `go vet -C pc -unsafeptr=false ./...`，
+    除 `unsafeptr` 外全部规则都生效（`.github/workflows/build.yml`）。
+    若日后要接 `golangci-lint` 或别的静态检查，记得把这条豁免一起带过去，
+    否则会重复踩「以为检查过了」这个坑。

@@ -40,6 +40,16 @@ jobs:
           if (-not (Test-Path $rsrc)) { throw "rsrc 未就位：$rsrc" }
           Write-Output "rsrc 就位：$rsrc"
 
+      # 静态检查：`go test` 默认只跑 vet 的一个子集（atomic/bool/printf/…），**不含
+      # unsafeptr** —— 所以「go test 全绿」不等于「go vet 干净」。这里显式跑全量 vet。
+      # `-unsafeptr=false` 是有意关掉的：pc 里 GlobalLock / DIB bits 必须走
+      # uintptr → unsafe.Pointer，vet 对此必然误报（3 处，Initial commit 起就有）。
+      # 依据见 docs/stage5-evidence.md §6 第 11 条。
+      - name: 静态检查（go vet）
+        shell: pwsh
+        run: |
+          go vet -C pc -unsafeptr=false ./...
+
       # 单元测试（守门人）——放在构建**之前**：测试红了就别浪费时间构建产物。
       # 覆盖：目录保留/路径穿越(pc/relpath_test.go)、幂等键与设备目录(pc/devdir_*.go)、
       # 版本比对与**更新限流降级**(pc/update*_test.go)、剪贴板关键路径性能(pc/clipboard_perf_test.go)。
