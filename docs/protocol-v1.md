@@ -1,8 +1,21 @@
-# PhotoBeam 协议规范 v1.9（Stage 10 修订版 · 多机设备目录隔离）
+# PhotoBeam 协议规范 v1.11（Stage 17 修订版 · 网络指纹口径对齐实现）
 
-> 状态：v1.9（Stage 10 修订版·多机设备目录隔离）。Stage 0 已四轮签字，Stage 1~4 实现已按规范交付；
+> 状态：v1.11（Stage 17 修订版）。Stage 0 已四轮签字，Stage 1~4 实现已按规范交付；
 > **v1.4 的修订原则：以实机验证结果为准**——凡 v1.3 的条文与真机行为冲突，
 > 一律**改协议而不是回退已验证有效的实现**，每处偏离在 §11 登记（条款 / 实测 / 理由 / 证据）。
+>
+> **v1.11 变更（本次 · 纯文档勘误，不动实现）**：
+> 1. **§2 网络指纹口径改写**：由 `{SSID, 网关 IP}` 改为 **`<网关 IP>/<子网前缀长度>`**。
+>    原因：无 `ACCESS_FINE_LOCATION` 时 `WifiInfo.getSSID()` 恒为 `<unknown ssid>`，
+>    原条款里「SSID 不同 → 立即提示」在真机上永远不成立（纸面功能）；
+>    实现从 v1.9 起一直用网关 + 前缀，只是文档没跟上。详见 §11 偏离 20。
+> 2. **§2 提示文案改为实现原文**（「当前 WiFi 与配对时不同，请切回原网络」）——
+>    读不到 SSID 就报不出 WiFi 名，原条款里的「『X』与『Y』」是不可实现的文案。
+> 3. **§7.7 权限说明**：`ACCESS_WIFI_STATE` 的用途明确为「读 DHCP 网关」；
+>    删掉「`ACCESS_FINE_LOCATION` 可选增强让 SSID 提示更精确」——SSID 已不进指纹，没有任何功能依赖它。
+> 4. **§7.8 存储落点改为实际形态**：prefs 单键 `net_fp`（字符串 `"<网关IP>/<前缀>"`），
+>    配对时刻另存 `pc_paired_at`；原文的 `{ssid, gateway_ip, paired_at}` 结构从未实现。
+> 5. **§9 验收 6 / 22** 同步改写（提示文案、mesh 漫游判据）。
 >
 > **v1.5 变更（Stage 5 第二轮：用户实机反馈驱动）**：
 > 1. **§3.1 HELLO 增补 `pair_intent`**（Sender 侧字段）：显式声明本次连接是否由**用户主动发起配对**。
@@ -87,16 +100,25 @@
 
 ## 2. 发现（三通道，独立短超时，串行降级）[P0-11][R-03]
 
-**网络指纹前置判定**[N-06][S-01]：配对成功时手机记录 `{SSID, 网关 IP}`（BSSID **不进指纹**——
-mesh/多 AP 漫游会变 BSSID，误判会阻断发送）。每次发送前先比对当前网络指纹：
-- **SSID 不同** → **立即**给出人话提示（"当前 WiFi『X』与配对时的『Y』不同，请切回"，附 PC
-  上次 IP 供核对）并**跳过三通道扫描**（<1 秒出提示，不经 7.5 秒超时链）；
-- **SSID 相同或读不到（`<unknown ssid>`）→ 判据降级为"网关 IP 或子网不同"**：不同 → 同样
-  立即提示；相同（含 mesh 漫游换 AP、网关未变）→ **照常进入三通道，不得因 BSSID 变化阻断**
-  [验收 22]；
+**网络指纹前置判定**[N-06][S-01]：指纹 = **`<网关 IP>/<子网前缀长度>`**（形如 `<网关IP>/24`，
+实现见 `Discovery.currentFingerprint()`；网关读不到时为 `unknown`）。**既不含 SSID，也不含 BSSID**：
+
+- **不含 SSID**：无 `ACCESS_FINE_LOCATION` 时 `WifiInfo.getSSID()` 恒为 `<unknown ssid>`，
+  拿它做判据等于没判；而为一句提示申请位置权限不划算（§7.7 已明确不申请）。
+- **不含 BSSID**：mesh / 多 AP 漫游会变 BSSID，误判会阻断发送。
+- 前缀取「持有本机 IP 的那个活动接口」的 IPv4 `networkPrefixLength`（不是 WiFi 专属：
+  以太网 / VPN 虚拟网卡同样适用）。
+
+每次发送前比对当前指纹与配对时记录的指纹：
+- **两侧都可判定且不同** → **立即**给出人话提示（通知文案：「当前 WiFi 与配对时不同，请切回原网络」，
+  状态区回执「网络已切换 · 已跳过发送」）并**跳过三通道扫描**（<1 秒出提示，不经 7.5 秒超时链）；
+- **相同**（含 mesh 漫游换 AP、网关与子网未变）→ **照常进入三通道，不得因 BSSID 变化阻断** [验收 22]；
+- **任一侧判不出（`unknown`）→ 判据降级放行**，只记日志（理由见下一节，这条是硬要求）；
 - prefix > /24 的漏检兜底 = 指纹一致前提下接受可能漏检 + 允许手机端手工输入 PC IP [R-19]。
 
 **v1.10 明确 · 指纹「写入端」与「判不出就放行」**（Stage 17）：
+- **指纹构成以本节为准**：`<网关 IP>/<前缀>`（v1.3 曾写 `{SSID, 网关 IP}`，因 SSID 不可读
+  且需位置权限改为现口径，登记于 §11 偏离 20）。
 - **写入时机**：① 首次配对成功时写一次；② **每次重连握手成功后刷新**（§7.8
   「每次网络切换事件更新」）——只写一次的话，用户换到新 WiFi 后指纹仍是旧值，
   下一轮比对永远不等，会把自己锁死。
@@ -562,19 +584,22 @@ is_latest_in_batch, state: pending|sending|sent|dropped, tries, drop_reason}`：
 ### 7.7 权限清单 [P1-06][P1-08][S-01]
 `READ_MEDIA_IMAGES`、`READ_MEDIA_VISUAL_USER_SELECTED`（Android 14+ 三态检测：部分授权
 → 明确提示"仅能访问 N 张"并引导全选，**v1.4 已实现**）、`POST_NOTIFICATIONS`（运行时申请）、`INTERNET`、
-`ACCESS_NETWORK_STATE`、`ACCESS_WIFI_STATE`（读 SSID/网络状态）、
+`ACCESS_NETWORK_STATE`、`ACCESS_WIFI_STATE`（读 `WifiManager.dhcpInfo` 的网关与网络状态；
+**不读 SSID**）、
 `FOREGROUND_SERVICE`、`FOREGROUND_SERVICE_SPECIAL_USE`（34+）/
 `FOREGROUND_SERVICE_DATA_SYNC`（33 降级）、`RECEIVE_BOOT_COMPLETED`、
 `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`、`ACCESS_LOCAL_NETWORK`（预埋）。
-**可选增强**：`ACCESS_FINE_LOCATION`（仅让 SSID 提示更精确；**不申请也完整可用**——
-读不到 SSID 时指纹自动降级为网关 IP/子网判据，见 §2；不为一个提示申请位置权限）。
+**不申请 `ACCESS_FINE_LOCATION`**：SSID 已不进指纹（§2），没有任何功能依赖它；
+为一句提示申请位置权限不划算，也会让用户误以为本程序要定位。
 **v1.4 按实测改写**：`SCHEDULE_EXACT_ALARM`（≤API 32，需用户授权）**不申请**；API 33+ 使用
 `USE_EXACT_ALARM`（安装即授予）——MIUI 实测该权限 + 电池优化白名单是把后台 FGS 变为
 `SYSTEM_ALLOW_LISTED` 永久放行的必要条件之一（见 §11 偏离 3）。`ACTION_SEND` 分享目标：M2。
 
 ### 7.8 网络指纹（存储落点）[P2-c]
-配对成功时写入 app 私有 config：`{ssid, gateway_ip, paired_at}`；每次网络切换事件更新；
-发送前读取并按 §2 判定。不走队列，不落图库。
+配对记录落在手机 app 私有 SharedPreferences（文件 `photobeam`，与配对信息同处一组键）：
+网络指纹为**单键字符串** `net_fp = "<网关 IP>/<前缀>"`（形如 `<网关IP>/24`），配对时刻另存
+`pc_paired_at`；**不是**独立的 `{ssid, gateway_ip, paired_at}` 结构。每次网络切换事件更新；
+发送前读取并按 §2 判定。不走队列，不落图库。解绑/重新配对时 `net_fp` 与其余 `pc_*` 键一起清除。
 
 **v1.10 明确 · 实际的写入点**（Stage 17，此前只写规范没实现，`saveNetworkFingerprint`
 零调用点 → `pairedNetworkFingerprint()` 恒为 null → §2 的换网判定**从未生效**）：
@@ -666,7 +691,8 @@ is_latest_in_batch, state: pending|sending|sent|dropped, tries, drop_reason}`：
    闹钟并置 stopped；`am kill` 对 FGS 常驻进程无效**）→ 心跳拉起服务并补上期间的图；
    另 `am set-inactive <pkg> true` 模拟冻结 → 解除 → 补发；
 5. **息屏静置 30 分钟 → 期间截图 3 张 → 解锁后 ≤20 分钟内全部落盘**；
-6. 手机连另一 SSID → **网络指纹前置判定 <1 秒**出提示"当前 WiFi『X』与配对时的『Y』不同"；
+6. 手机连另一 SSID（或换网段）→ **网络指纹前置判定 <1 秒**出提示
+   「当前 WiFi 与配对时不同，请切回原网络」（状态区回执「网络已切换 · 已跳过发送」）；
 7. 同秒连拍 3 张 → 3 张共享同一 batch_id、恰 1 张 is_latest_in_batch=true、batch_size=3
    （字段见 §5.1）；
 8. 预占 TCP 5416 → PC 漂移 54xx 且 found 携带新端口，配对成功；
@@ -684,7 +710,7 @@ is_latest_in_batch, state: pending|sending|sent|dropped, tries, drop_reason}`：
 16. 6 次错误配对 → 第 6 次被拒且有提示；一次网络抖动的重连失败**不**触发冷却；
 17. `ver:2` 客户端 → PC 回**明文 MODE 携带 `err{reason:"version_unsupported"}`**（不静默断开）；
 22. **同一 SSID 的 mesh/多 AP 漫游（BSSID 变化）→ 照片仍能正常发送，不得因 BSSID 变化而阻断**；
-    读不到 SSID 时按网关/子网判据降级 [S-01]；
+    指纹只取「网关 + 子网前缀」，BSSID 与 SSID 都不参与 [S-01]；
 18. 多网卡（WiFi+有线+VPN 虚拟网卡）→ 诊断"手机可达 IP"落在手机同网段网卡，配对成功；
 19. Android 14+ 部分媒体授权：选 3 张 → 提示"仅能访问 3 张"并引导全选（**需一台 Android 14+
     真机**，vivo 日常机满足；红米 13 测不到）[R-10]；
@@ -790,3 +816,4 @@ A（目录保留）是低风险、纯 PC 端为主的小改动，值得做；B�
 | 17 | §2「三通道发现」；§2 [R-19]「允许手机端手工输入 PC IP」 | ① 代码注释写「仅当 fp 匹配已知设备时才算命中」，**但实现里根本没有做 fp 比对**（两个分支返回完全相同）→ 同一局域网里有别人的 PhotoBeam PC 时，手机可能认错机器；② 手机失败提示让用户「手动输入电脑 IP」，**但 App 里没有任何输入框** → [R-19] 兜底根本没落地，用户被指引到一个做不到的动作 | **条款细化 + 实现补齐**：① §2 增补「应答必须按指纹甄别」的明确规则（别人家的 PC 忽略、同一台换 IP 算命中）；② 手机端提供电脑 IP 输入框，填了就优先走通道①直连 | Stage 5 第四轮（`android/.../Discovery.kt`、`MainActivity.kt`） |
 | 18 | §3.2「Receiver 必须弹出向导窗显示 6 位码 + 提供一致/不一致」 | ① **同一局域网里跑着多对 PhotoBeam 用户时，手机首次配对会取「第一个应答」** → 可能连到别人的电脑，之后照片持续串到对方机器；而你的电脑会被陌生人的手机触发弹窗，你点「不一致」还会打断对方的配对；② Receiver 的「一致」**只打一行日志**，收到 `pair_confirm` 就接受 → Receiver 端的人眼核对形同虚设，真正的闸门只有 Sender 端 | **条款改写为「双方同意」**：① 新增待命闸门（§2）：Receiver 只在待命态受理新设备，否则 MODE 帧带 `err{receiver_not_ready}` 且**不弹窗**；`found` 增 `pair_ready` 供 Sender 择优；Sender 的 SAS 界面必须显示对端电脑名；② Receiver 必须等**本端用户点「一致」**才接受 `pair_confirm`，关窗时机也改为「用户点完」 | Stage 5 第五轮（`pc/pairing_state.go`、`pc/server.go`、`android/.../MainActivity.kt`） |
 | 19 | §8「计划任务看门狗」（注册系统计划任务） | 注册计划任务**需要提权 / 用户单独授权**，上一轮按决策不做 | **换实现而非放弃**：改用**隐藏监护进程**（同一 exe `--supervise`，命名互斥体保证唯一）盯主进程；主进程异常退出即拉起，**不需要任何授权**；托盘可开关；托盘「退出」正常关闭不会被拉起 | Stage 5 第五轮（`pc/supervisor_windows.go`） |
+| 20 | §2「网络指纹 = `{SSID, 网关 IP}`」；§7.8「写入 `{ssid, gateway_ip, paired_at}`」 | 实现只取 **`<网关IP>/<前缀>`**：无 `ACCESS_FINE_LOCATION` 时 `WifiInfo.getSSID()` 恒为 `<unknown ssid>`，拿它当判据等于没判；而一旦 SSID 读不到，条款里「SSID 不同 → 立即提示」那一条永远不成立，等于纸面功能 | **改写条款 + 文档对齐实现**：指纹口径改为「网关 IP + 子网前缀」，明确 SSID 与 BSSID 都不参与，也不申请位置权限；§7.8 改为实际存储形态（prefs 单键 `net_fp` 字符串，配对时刻另存 `pc_paired_at`） | Stage 17 / v1.2.5 复核；`android/.../Discovery.kt`、`Protocol.kt` |
