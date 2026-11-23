@@ -635,6 +635,13 @@ is_latest_in_batch, state: pending|sending|sent|dropped, tries, drop_reason}`：
     Windows 会为子进程建一个控制台窗口。面板每秒刷新若直接查防火墙 → 每秒 2 个 `netsh`
     → 屏幕「疯狂闪黑窗」。修法两条：① 所有 `exec.Command` 加
     `SysProcAttr{HideWindow:true, CreationFlags:CREATE_NO_WINDOW}`；② 防火墙状态 30 秒 TTL 缓存。
+  - **v1.11 修复 · 收图通知刷屏**：旧实现每落盘一张就弹一个右下角窗口，手机补传几十张时
+    整块屏幕被刷满。改为**按阵发期合并**（`pc/notice.go`）：
+    - 同一阵发期（最后一张之后静默 900ms 即视为结束）合并成**一条**：
+      「收到 N 张照片 · 共 X MB · 来自 <设备名>」；
+    - 单张仍用原样式（带缩略图，信息最全）；
+    - 连续不断（间隔始终 < 900ms）时由 15 秒硬上限兜底，最多每 15 秒一条进度；
+    - 只合并**通知**；剪贴板仍逐张写入（最终停留在最后一张），统计照常逐张累加。
   - **v1.4**：诊断项由「复制诊断信息」改为「**导出诊断信息**」——写入
     `logs\diagnostics-<时间戳>.txt` 并弹窗告知路径，**不触碰系统剪贴板**（复制语义会
     `EmptyClipboard` 且不还原，直接丢弃用户原内容）；

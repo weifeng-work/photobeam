@@ -704,9 +704,10 @@ func handleConn(conn net.Conn) {
 	// 消息循环（文件接收）；落盘成功 → 剪贴板+弹窗（异步 [MiniMax 坑 6]）
 	logf("进入消息循环")
 	// [PC-4] 弹窗显示**手机端原始文件名** + 已保存目录（落盘名带毫秒前缀，用户对不上）
+	devLabel := deviceNameOf(senderFP)
 	onFile := func(destPath, origName, saveDir string) {
 		// 状态面板统计：与剪贴板开关无关，落盘成功就要记（否则关了剪贴板面板永远显示 0）
-		statsRecordFile(senderFP, deviceNameOf(senderFP), origName)
+		statsRecordFile(senderFP, devLabel, origName)
 		go goroutineSafe("clipboard+popup", func() {
 			if !clipboardEnabled() {
 				return
@@ -727,8 +728,11 @@ func handleConn(conn net.Conn) {
 				// 图片**已经落盘**（用户在接收文件夹里能看到），只是没进剪贴板。
 				// 旧实现只 logf 就 return —— 用户零反馈，以为「同步失败了」，
 				// 实际图就在硬盘上，白白重传。这里明确告诉用户「已保存，但格式不支持写剪贴板」。
-				showPopup4("已保存，但不支持写入剪贴板", name,
-					"该格式暂不支持写入剪贴板（仅 JPG/PNG 可写）", saved, 8000)
+				pushRecvNotice(noticeItem{
+					Title: "已保存，但不支持写入剪贴板", Line1: name,
+					Line2: "该格式暂不支持写入剪贴板（仅 JPG/PNG 可写）",
+					Saved: saved, Dev: devLabel, Size: fileSize(destPath),
+				})
 				return
 			}
 			tDIB := timeNow()
@@ -746,9 +750,16 @@ func handleConn(conn net.Conn) {
 				if snapNil {
 					hint = "原内容无可还原，本次不还原" // 中性表述：真因多为上一次同步的图 [S3-13]
 				}
-				showPopupThumb4("已同步到剪贴板", name, hint, saved, 5000, dib, imgW, imgH)
+				pushRecvNotice(noticeItem{
+					Title: "已同步到剪贴板", Line1: name, Line2: hint, Saved: saved,
+					Dib: dib, ImgW: imgW, ImgH: imgH, Dev: devLabel, Size: fileSize(destPath),
+				})
 			} else {
-				showPopup4("剪贴板写入失败", name, "剪贴板被其他程序长期占用", saved, 5000)
+				pushRecvNotice(noticeItem{
+					Title: "剪贴板写入失败", Line1: name,
+					Line2: "剪贴板被其他程序长期占用", Saved: saved, Dev: devLabel,
+					Size: fileSize(destPath),
+				})
 			}
 		})
 	}
