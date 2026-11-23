@@ -1934,6 +1934,46 @@ seq0=8144  after session1(Empty+3xSet+Close)=8152  after session2(1xSet+Close)=8
 
 另加 `.github/PII-RULES.md`：只写规则的**形状**与"哪些类别必须覆盖"（不含真实值，
 真实值仍在 Secret 里），并写明验证方法（推假标识确认变红 + 推空改动确认变绿，两头都测）。
+### 5.26 第十八轮：PC 状态面板 + 一次「疯狂闪黑窗」事故（v1.2.6）
+
+**需求**：用户提出「连了几台手机、在同步哪些目录，我根本不知道」——托盘只有 tooltip 与几个开关，
+看不出一台设备是否在线、收到过多少张、哪些目录被同步过。
+
+**实现**（`pc/status_window.go` + `pc/stats.go`）：
+
+- 原生 Win32 独立窗口（纯 syscall，无 cgo，无新依赖），只读多行 EDIT（可滚动/选中复制）+ 三个按钮
+  （打开接收文件夹 / 导出诊断信息 / 刷新），1 秒刷新；关窗不影响后台同步。
+- 统计落盘 `appData\device_stats.json`：`{fp: {last_auth, last_seen, last_file, total}}`，
+  2 秒防抖 + 原子写；**只记时间与计数，不记文件名、不记 IP**。
+- **在线判据**：90 秒内有过连接。手机队列为空时每 30 秒只做 `probeLinkAlive`（TCP 连一下就关，
+  **不发 HELLO、不认证**）→ 只按认证时间判定会让面板恒显示离线。所以连接进入时按
+  「已配对设备的 `last_ip`」认领一次 `last_seen`；仅用于显示，安全判定仍一律走 §3.3 签名。
+- 目录列表 = 扫 `<save>\<设备名>-<fp8>\` 下一级子目录（5 秒 TTL 缓存），只列**已收到过图片**的目录。
+
+**事故：面板一打开，屏幕疯狂闪黑窗。**
+根因不是面板本身，而是刷新链里的外部命令：`buildStatusText()` → `firewallRuleState()` →
+`exec.Command("netsh", "advfirewall", "firewall", "show", "rule", …)`。**GUI 进程调控制台程序时，
+Windows 会先给子进程建一个控制台窗口** → 每秒 2 个 netsh = 每秒 2 个黑框。
+实测抓取（12 秒内新进程）：`netsh.exe` 由面板进程反复拉起，每个都带一个 `conhost.exe`。
+
+修法两条（都必要）：
+1. `runCapture` 统一加 `SysProcAttr{HideWindow: true, CreationFlags: CREATE_NO_WINDOW(0x08000000)}`
+   —— 子进程根本不建控制台，修的是**所有**外部命令（netsh / 未来的诊断命令）；
+2. 防火墙状态 30 秒 TTL 缓存 —— 规则只在用户点「修复防火墙」时变，没必要每秒查。
+验证：面板打开后连续 8 秒采样，新增进程 **0 个**（此前 12 秒内 6 个 netsh + 6 个 conhost）。
+
+**字体踩坑（记录，避免重犯）**：
+- 新宋体 NSimSun 13px：`tmHeight == 字号`，行距贴死，渲染出来上下行视觉重叠；
+  按「宽度反算字号」还会撞上非原生点阵字号被合成的问题。
+- 改用 **Cascadia Mono 12px**：`tmHeight=16`，行高正常；CJK 由系统回退，宽度恰好是 ASCII 的 2 倍
+  （7px vs 14px），表格按「1 格 = 半角」对齐成立。
+- `CreateFontW` 找不到字体时会**静默替换**，所以选完必须用 `GetTextFaceW` 回读字族名核对，
+  不一致就降级到 `Consolas` → `NSimSun`。
+- 换行真值用 `EM_GETLINECOUNT` 校验（= 逻辑行数即无折行），不信截图 eyeballing。
+
+**新增工具** `tools/capture_window.py`：DPI 感知地抓窗口（PerMonitorV2 + 屏幕 BitBlt）。
+注意 `PrintWindow` 抓 EDIT 会出现「漏字/行重叠」的假象，**不能**用它判断排版。
+
 ## 6. 遗留
 
 1. ~~**计划任务看门狗**未实现~~ → **第五轮已用「隐藏监护进程」实现**（不需要注册系统计划任务、不需要提权）。

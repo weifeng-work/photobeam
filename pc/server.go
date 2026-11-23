@@ -327,6 +327,10 @@ func handleConn(conn net.Conn) {
 	// 配对速率限制（协议 §3.4）按连接源 IP 统计
 	peerIP, _, _ := net.SplitHostPort(remote)
 	logf("连接进入: %s", remote)
+	// 状态面板的「在线」判据：手机每 30 秒会连一次（队列空时只做 TCP 连通探测，
+	// **不做认证**）→ 只靠认证时间会让面板永远显示离线。这里按「已配对设备的 last_ip」
+	// 认领本次连接；认领错了也不影响安全（安全判定一律走 §3.3 签名），只影响显示。
+	statsRecordSeenByIP(peerIP)
 
 	conn.SetDeadline(timeNow().Add(handshakeTimeout))
 
@@ -490,6 +494,7 @@ func handleConn(conn net.Conn) {
 				// [修复] 设备表的更新走锁内 helper，不能在锁外改切片元素（数据竞争）
 				updateDeviceNet(senderFP, ip, tcpPort()) // last_port = PC 自身监听端口 [P1-01]
 				logf("重连认证通过: %s", dev.DevName)
+				statsRecordAuth(senderFP, dev.DevName) // 状态面板：在线判定依据
 				authStats.ok()
 				break
 			}
@@ -700,6 +705,8 @@ func handleConn(conn net.Conn) {
 	logf("进入消息循环")
 	// [PC-4] 弹窗显示**手机端原始文件名** + 已保存目录（落盘名带毫秒前缀，用户对不上）
 	onFile := func(destPath, origName, saveDir string) {
+		// 状态面板统计：与剪贴板开关无关，落盘成功就要记（否则关了剪贴板面板永远显示 0）
+		statsRecordFile(senderFP, deviceNameOf(senderFP), origName)
 		go goroutineSafe("clipboard+popup", func() {
 			if !clipboardEnabled() {
 				return

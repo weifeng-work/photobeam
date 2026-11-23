@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -62,7 +63,12 @@ func execOpen(app, args string) error {
 }
 
 func runCapture(name string, args ...string) (string, error) {
-	out, err := exec.Command(name, args...).Output()
+	cmd := exec.Command(name, args...)
+	// GUI 进程（本程序）调控制台程序（netsh 等）时，Windows 会**先建一个控制台窗口**，
+	// 每次调用都会闪一下黑框。状态面板每秒刷新一次防火墙状态 → 每秒 2 个 netsh →
+	// 用户看到「疯狂弹黑窗」。CREATE_NO_WINDOW 让子进程根本不建控制台。
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+	out, err := cmd.Output()
 	return string(out), err
 }
 

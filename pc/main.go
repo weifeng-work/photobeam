@@ -49,6 +49,19 @@ func main() {
 	cfg = loadConfig()
 	identity = loadOrCreateIdentity()
 	loadSeenIDs()
+	loadDeviceStats() // 状态面板的每设备统计（device_stats.json）
+
+	// 隐藏入口：只开状态面板（不起服务/托盘）。用于不开托盘时快速查看，也方便自动化截图回归。
+	if len(os.Args) == 2 && os.Args[1] == "--status-panel" {
+		standalonePanel = true
+		showStatusWindow()
+		select {} // 保持进程存活（窗口自己的消息泵在 goroutine 里）
+	}
+	// 隐藏入口：把面板文本打到 stdout 后退出（回归测试用，不做窗口）
+	if len(os.Args) == 2 && os.Args[1] == "--dump-panel" {
+		println(buildStatusText())
+		return
+	}
 	// [修复] 协议 §9.11 要求「.tmp 崩溃后可清理」：启动时清掉接收目录下超过
 	// 24 小时的 .part 残留（崩溃/断电留下的半截临时文件）。幂等，失败只记日志。
 	cleanupStaleParts()
@@ -135,6 +148,7 @@ func onReady() {
 	systray.SetIcon(trayIconIco) // [修复] 此前漏设图标 → 托盘显示空白
 	updateTrayTooltip()
 
+	mStatus := systray.AddMenuItem("状态面板…", "查看连接状态、已同步目录与最近活动")
 	mOpen := systray.AddMenuItem("打开接收文件夹", "打开 "+getSaveDir())
 	mSetDir := systray.AddMenuItem("接收文件夹…", "更改图片保存目录（立即生效）")
 	mPairNew := systray.AddMenuItem("配对新设备", "允许一台新手机接入（2 分钟内有效；配成即失效）")
@@ -158,6 +172,8 @@ func onReady() {
 
 	for {
 		select {
+		case <-mStatus.ClickedCh:
+			showStatusWindow()
 		case <-mOpen.ClickedCh:
 			openFolder(getSaveDir())
 		case <-mSetDir.ClickedCh:
